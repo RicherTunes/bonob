@@ -603,10 +603,12 @@ function server(
       })
       .then((coverArt) => {
         if(coverArt == undefined) {
+          res.setHeader("Cache-Control", "private, max-age=60");
           return res.status(404).send();
         } else if(isValidMimeType(coverArt.contentType)) {
           res.status(200);
           res.setHeader("content-type", coverArt.contentType);
+          res.setHeader("Cache-Control", "private, max-age=86400");
           return res.send(coverArt.data);
         } else {
           logger.warn(`Invalid content type of ${coverArt.contentType}, detected for ${JSON.stringify(urn)}`);
