@@ -612,6 +612,7 @@ function server(
           return res.send(coverArt.data);
         } else {
           logger.warn(`Invalid content type of ${coverArt.contentType}, detected for ${JSON.stringify(urn)}`);
+          res.setHeader("Cache-Control", "no-store");
           return res.status(502).send();
         }
     })
@@ -619,6 +620,7 @@ function server(
         logger.error(`Failed fetching image ${JSON.stringify(urn)} (size=${size})`, {
           cause: e,
         });
+        res.setHeader("Cache-Control", "no-store");
         return res.status(500).send();
       });
   });

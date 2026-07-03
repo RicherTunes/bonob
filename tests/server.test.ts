@@ -1313,7 +1313,6 @@ describe("server", () => {
         );
 
         const serviceToken = uuid();
-        const albumId = uuid();
         let apiToken: string;
 
         const coverArtResponse = (
@@ -1434,7 +1433,7 @@ describe("server", () => {
 
                   expect(res.status).toEqual(502);
                   // upstream returned junk (e.g. an HTML hotlink page) — never cache it
-                  expect(res.header["cache-control"]).toBeUndefined();
+                  expect(res.header["cache-control"]).toMatch(/no-store/);
                 });
               });
 
@@ -1474,20 +1473,21 @@ describe("server", () => {
             });
 
             describe("when there is an error", () => {
-              it("should return a 500", async () => {
-                musicService.login.mockResolvedValue(musicLibrary);
+              it("should return a 500 when the library rejects (the real Navidrome-timeout path), and must not cache the error", async () => {
+                const coverArtURN = { system: "subsonic", resource: "art:200" };
 
+                musicService.login.mockResolvedValue(musicLibrary);
                 musicLibrary.coverArt.mockRejectedValue("Boom");
 
                 const res = await request(server)
                   .get(
-                    `/art/artist:${albumId}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+                    `/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
                   )
                   .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
 
                 expect(res.status).toEqual(500);
-                // transient error — never cache
-                expect(res.header["cache-control"]).toBeUndefined();
+                expect(musicLibrary.coverArt).toHaveBeenCalledWith(coverArtURN, 180);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
               });
             });
           });
