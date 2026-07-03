@@ -35,7 +35,7 @@ import { Icon, ICONS, festivals, features, no_festivals } from "./icon";
 import { DEFAULT_LOGIN_THEME } from './config'
 import _ from "underscore";
 import morgan from "morgan";
-import { parse } from "./burn";
+import { parse, BUrn } from "./burn";
 import { axiosImageFetcher, ImageFetcher } from "./subsonic";
 import {
   JWTSmapiLoginTokens,
@@ -559,7 +559,13 @@ function server(
         .then((data) =>
           res
             .status(200)
-            .set("Cache-Control", "public, max-age=86400")
+            // festival overlays are date-dependent, so only long-cache when they
+            // are disabled (?nofest); otherwise keep it short so a decoration
+            // doesn't stay frozen across a festival boundary for a whole day.
+            .set(
+              "Cache-Control",
+              `public, max-age=${apply_festivals ? 3600 : 86400}`
+            )
             .type(spec.mimeType)
             .send(data)
         );
@@ -587,16 +593,24 @@ function server(
     const serviceToken = apiTokens.authTokenFor(
       req.query[BONOB_ACCESS_TOKEN_HEADER] as string
     );
-    const urn = parse(req.params["burn"]!);
     const size = Number.parseInt(req.params["size"]!);
-
-    logger.debug(`Getting art '${JSON.stringify(urn)}' in size ${size}`)
 
     if (!serviceToken) {
       return res.status(401).send();
     } else if (!(size > 0)) {
       return res.status(400).send();
     }
+
+    let urn: BUrn;
+    try {
+      urn = parse(req.params["burn"]!);
+    } catch (e) {
+      logger.warn(`Invalid art burn '${req.params["burn"]}': ${e}`);
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(400).send();
+    }
+
+    logger.debug(`Getting art '${JSON.stringify(urn)}' in size ${size}`)
 
     return musicService
       .login(serviceToken)

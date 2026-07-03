@@ -1490,6 +1490,29 @@ describe("server", () => {
                 expect(res.header["cache-control"]).toMatch(/no-store/);
               });
             });
+
+            describe("when the burn is malformed", () => {
+              it("should return 400 with no-store (a client error, handled deliberately, not an Express default 500)", async () => {
+                musicService.login.mockResolvedValue(musicLibrary);
+
+                const res = await request(server)
+                  .get(
+                    `/art/not-a-valid-burn/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+                  )
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                expect(res.status).toEqual(400);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
+              });
+
+              it("should return 401 when unauthenticated (auth is checked before parsing the burn)", async () => {
+                const res = await request(server).get(
+                  `/art/not-a-valid-burn/size/180`
+                );
+
+                expect(res.status).toEqual(401);
+              });
+            });
           });
         });
       });
@@ -1746,14 +1769,24 @@ describe("server", () => {
         });
 
         describe("caching", () => {
-          it("should set a public Cache-Control so clients can cache the generated icon (unauthenticated, static)", async () => {
+          it("should long-cache a static (nofest) icon publicly so clients can store it", async () => {
             const response = await request(server()).get(
               `/icon/yyyy:someText/size/60?nofest`
             );
 
             expect(response.status).toEqual(200);
             expect(response.header["cache-control"]).toMatch(/public/);
-            expect(response.header["cache-control"]).toMatch(/max-age=\d+/);
+            expect(response.header["cache-control"]).toMatch(/max-age=86400\b/);
+          });
+
+          it("should short-cache a festival-enabled icon so date-dependent overlays are not frozen for a day", async () => {
+            const response = await request(server()).get(
+              `/icon/yyyy:someText/size/60`
+            );
+
+            expect(response.status).toEqual(200);
+            expect(response.header["cache-control"]).toMatch(/public/);
+            expect(response.header["cache-control"]).toMatch(/max-age=3600\b/);
           });
         });
       });
