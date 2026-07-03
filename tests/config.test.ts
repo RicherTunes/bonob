@@ -135,7 +135,7 @@ describe("config", () => {
 
       it(`should default to http://${hostname()}:4534`, () => {
         expect(config().bonobUrl.href()).toEqual(
-          `http://${hostname()}:4534/`
+          `http://${hostname().toLowerCase()}:4534/`
         );
       });
 
@@ -143,7 +143,7 @@ describe("config", () => {
         it(`should default to http://${hostname()}:3322`, () => {
           process.env["BNB_PORT"] = "3322";
           expect(config().bonobUrl.href()).toEqual(
-            `http://${hostname()}:3322/`
+            `http://${hostname().toLowerCase()}:3322/`
           );
         });
       });
@@ -392,12 +392,12 @@ describe("config", () => {
 
     describe("url", () => {
       it(`should default to http://${hostname()}:4533/`, () => {
-        expect(config().subsonic.url.href()).toEqual(`http://${hostname()}:4533/`);
+        expect(config().subsonic.url.href()).toEqual(`http://${hostname().toLowerCase()}:4533/`);
       });
 
       it(`should default to http://${hostname()}:4533/ when BNB_SUBSONIC_URL is ''`, () => {
         process.env["BNB_SUBSONIC_URL"] = "";
-        expect(config().subsonic.url.href()).toEqual(`http://${hostname()}:4533/`);
+        expect(config().subsonic.url.href()).toEqual(`http://${hostname().toLowerCase()}:4533/`);
       });
 
       it(`should use BNB_SUBSONIC_URL when specified`, () => {
