@@ -226,7 +226,23 @@ function server(
             },
           }),
           (success: AuthSuccess) => {
-            linkCodes.associate(linkCode, success);
+            try {
+              linkCodes.associate(linkCode, success);
+            } catch {
+              // The link code can expire between the has() check above and here
+              // (its TTL crossing during token generation); degrade to the same
+              // friendly fail page as an unknown link code rather than a 500.
+              return {
+                status: 400,
+                template: `login/${loginTheme}/login`,
+                params: {
+                  lang,
+                  status: "fail",
+                  message: lang("invalidLinkCode"),
+                  loginRoute: bonobUrl.append({ pathname: LOGIN_ROUTE }).pathname(),
+                },
+              };
+            }
             return {
               status: 200,
               template: `login/${loginTheme}/success`,
