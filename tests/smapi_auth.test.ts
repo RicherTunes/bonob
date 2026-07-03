@@ -134,6 +134,20 @@ describe("auth", () => {
           );
         });
       });
+
+      describe("due to a non-HS256 algorithm", () => {
+        it("should return an error (verify pins the algorithm to HS256)", () => {
+          const authToken = uuid();
+          const forged = jwt.sign(
+            { serviceToken: authToken, iat: clock.now().unix() },
+            secret + "." + SMAPI_TOKEN_VERSION,
+            { algorithm: "HS512", expiresIn, issuer: "bonob" }
+          );
+
+          const result = smapiLoginTokens.verify({ token: forged });
+          expect(E.isLeft(result)).toBe(true);
+        });
+      });
     });
 
     describe("when the token has expired", () => {
