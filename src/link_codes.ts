@@ -28,10 +28,13 @@ export class InMemoryLinkCodes implements LinkCodes {
   private codes: Map<string, Entry> = new Map();
   private readonly clock: Clock;
   private readonly ttlMs: number;
+  private readonly sweepIntervalMs: number;
+  private lastSweepMs = 0;
 
   constructor(clock: Clock = SystemClock, ttlMs: number = DEFAULT_LINK_CODE_TTL_MS) {
     this.clock = clock;
     this.ttlMs = ttlMs;
+    this.sweepIntervalMs = Math.min(60_000, ttlMs);
   }
 
   private nowMs = () => this.clock.now().valueOf();
@@ -41,6 +44,14 @@ export class InMemoryLinkCodes implements LinkCodes {
     for (const [code, entry] of this.codes) {
       if (entry.expiresAt <= now) this.codes.delete(code);
     }
+    this.lastSweepMs = now;
+  };
+
+  // Amortise the O(n) sweep: run it at most once per interval, so a flood of
+  // mint() calls (getAppLink is unauthenticated) can't turn every mint into a
+  // whole-map sweep. Expired codes are also evicted lazily on access via live().
+  private maybeSweep = () => {
+    if (this.nowMs() - this.lastSweepMs >= this.sweepIntervalMs) this.evictExpired();
   };
 
   // Returns a still-live entry, evicting it if it has expired.
@@ -55,9 +66,9 @@ export class InMemoryLinkCodes implements LinkCodes {
   };
 
   mint() {
-    // Evict on mint so unbounded minting (a DoS vector on getAppLink) can't grow
-    // memory without limit.
-    this.evictExpired();
+    // Bound memory: unbounded minting (a DoS vector on the unauthenticated
+    // getAppLink) can't grow the map without limit.
+    this.maybeSweep();
     // Sonos S2 browser-auth link codes are capped at 32 characters; a UUID is
     // 36. Strip the dashes to get a spec-compliant 32-char hex code.
     const linkCode = uuid().replace(/-/g, "");
