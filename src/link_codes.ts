@@ -1,4 +1,5 @@
 import { randomUUID as uuid } from 'crypto';
+import ms, { StringValue } from "ms";
 import { Clock, SystemClock } from "./clock";
 
 
@@ -22,7 +23,7 @@ type Entry = { association: Association | undefined; expiresAt: number };
 // One hour is far longer than the Sonos device-link handshake takes, so it
 // never truncates a legitimate flow, while still bounding memory: a link code
 // is only used transiently during "Add Service", so anything older is dead.
-const DEFAULT_LINK_CODE_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_LINK_CODE_TTL: StringValue = "1h";
 
 export class InMemoryLinkCodes implements LinkCodes {
   private codes: Map<string, Entry> = new Map();
@@ -31,10 +32,10 @@ export class InMemoryLinkCodes implements LinkCodes {
   private readonly sweepIntervalMs: number;
   private lastSweepMs = 0;
 
-  constructor(clock: Clock = SystemClock, ttlMs: number = DEFAULT_LINK_CODE_TTL_MS) {
+  constructor(clock: Clock = SystemClock, ttl: StringValue = DEFAULT_LINK_CODE_TTL) {
     this.clock = clock;
-    this.ttlMs = ttlMs;
-    this.sweepIntervalMs = Math.min(60_000, ttlMs);
+    this.ttlMs = ms(ttl);
+    this.sweepIntervalMs = Math.min(60_000, this.ttlMs);
   }
 
   private nowMs = () => this.clock.now().valueOf();

@@ -121,6 +121,7 @@ export default function (die: (code?: number) => never = process.exit) {
     bonobUrl: url(bonobUrl),
     secret,
     authTimeout: bnbEnvVar<StringValue>("AUTH_TIMEOUT", { default: "1h" })!,
+    linkCodeTimeout: bnbEnvVar<StringValue>("LINK_CODE_TIMEOUT", { default: "1h" })!,
     icons: {
       foregroundColor: bnbEnvVar<string>("ICON_FOREGROUND_COLOR", {
         validationPattern: COLOR,

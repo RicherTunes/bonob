@@ -88,7 +88,7 @@ const app = server(
   config.bonobUrl,
   featureFlagAwareMusicService,
   {
-    linkCodes: () => new InMemoryLinkCodes(),
+    linkCodes: () => new InMemoryLinkCodes(clock, config.linkCodeTimeout),
     apiTokens: () => new InMemoryAPITokens(clock, config.authTimeout, sha256(config.secret)),
     clock,
     iconColors: config.icons,

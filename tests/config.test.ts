@@ -288,7 +288,22 @@ describe("config", () => {
       expect(config().authTimeout).toEqual("33s");
     });
   });
-  
+
+  describe("linkCodeTimeout", () => {
+    beforeEach(() => {
+      process.env["BNB_SECRET"] = "bonob";
+    });
+
+    it("should default to 1h", () => {
+      expect(config().linkCodeTimeout).toEqual("1h");
+    });
+
+    it(`should be overridable using BNB_LINK_CODE_TIMEOUT`, () => {
+      process.env["BNB_LINK_CODE_TIMEOUT"] = "10m";
+      expect(config().linkCodeTimeout).toEqual("10m");
+    });
+  });
+
   describe("logRequests", () => {
     beforeEach(() => {
       process.env["BNB_SECRET"] = "bonob";
