@@ -80,7 +80,7 @@ export const formatForURL = (burn: BUrn) => {
   else return format(burn, { shorthand: true })
 }
 
-export const parse = (burn: string): BUrn => {
+export const parse = (burn: string, opts: { allowExternal?: boolean } = {}): BUrn => {
   const result = BURN.parse(burn)!;
   const validationErrors = BURN.validate(result) || [];
   if (validationErrors.length > 0) {
@@ -96,9 +96,15 @@ export const parse = (burn: string): BUrn => {
       encryptor.decrypt(x.resource),
       E.match(
         (err) => { throw new Error(err) },
-        (z) => parse(z)
+        // Content that arrived inside a signature-verified encrypted wrapper is
+        // trusted, so an external image URL is only honoured on this path.
+        (z) => parse(z, { allowExternal: true })
       )
     );
+  } else if (x.system == "external" && !opts.allowExternal) {
+    // A client-supplied (unsigned) external burn would let the /art handler
+    // fetch an arbitrary URL (SSRF). Only accept external via the encrypted path.
+    throw new Error(`Refusing to resolve an unsigned external burn: '${burn}'`);
   } else {
     return x;
   }
