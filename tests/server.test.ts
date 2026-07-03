@@ -778,6 +778,34 @@ describe("server", () => {
               });
             });
 
+            describe("when the linkCode expires during token generation", () => {
+              it("should render the invalid-linkCode page, not a 500", async () => {
+                const username = "jane";
+                const password = "password100";
+                const linkCode = `linkCode-${uuid()}`;
+                const authSuccess = {
+                  serviceToken: `serviceToken-${uuid()}`,
+                  userId: `${username}-uid`,
+                  nickname: `${username}-nickname`,
+                };
+
+                linkCodes.has.mockReturnValue(true);
+                musicService.generateToken.mockReturnValue(TE.right(authSuccess));
+                linkCodes.associate.mockImplementation(() => {
+                  throw `Invalid linkCode ${linkCode}`;
+                });
+
+                const res = await request(server)
+                  .post(bonobUrl.append({ pathname: "/login" }).pathname())
+                  .set("accept-language", acceptLanguage)
+                  .type("form")
+                  .send({ username, password, linkCode });
+
+                expect(res.status).toEqual(400);
+                expect(res.text).toContain(lang("invalidLinkCode"));
+              });
+            });
+
             describe("when credentials are invalid", () => {
               it("should return 403 with message", async () => {
                 const username = "userDoesntExist";
