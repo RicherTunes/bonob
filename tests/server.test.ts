@@ -1744,6 +1744,18 @@ describe("server", () => {
             });
           });
         });
+
+        describe("caching", () => {
+          it("should set a public Cache-Control so clients can cache the generated icon (unauthenticated, static)", async () => {
+            const response = await request(server()).get(
+              `/icon/yyyy:someText/size/60?nofest`
+            );
+
+            expect(response.status).toEqual(200);
+            expect(response.header["cache-control"]).toMatch(/public/);
+            expect(response.header["cache-control"]).toMatch(/max-age=\d+/);
+          });
+        });
       });
 
       describe("/report/timePlayed", () => {
