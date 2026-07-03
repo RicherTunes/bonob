@@ -139,7 +139,8 @@ export class JWTSmapiLoginTokens implements SmapiAuthTokens {
         (
           jwt.verify(
             smapiToken.token,
-            this.secret
+            this.secret,
+            { algorithms: ["HS256"] }
           ) as any
         ).serviceToken
       );
@@ -149,7 +150,7 @@ export class JWTSmapiLoginTokens implements SmapiAuthTokens {
           jwt.verify(
             smapiToken.token,
             this.secret,
-            { ignoreExpiration: true }
+            { ignoreExpiration: true, algorithms: ["HS256"] }
           ) as any
         ).serviceToken;
         return E.left(new ExpiredTokenError(serviceToken));
