@@ -556,7 +556,13 @@ function server(
           .toString()
       )
         .then(spec.responseFormatter)
-        .then((data) => res.status(200).type(spec.mimeType).send(data));
+        .then((data) =>
+          res
+            .status(200)
+            .set("Cache-Control", "public, max-age=86400")
+            .type(spec.mimeType)
+            .send(data)
+        );
     }
   });
 
