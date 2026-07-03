@@ -1,4 +1,6 @@
 import { InMemoryLinkCodes } from "../src/link_codes"
+import { FixedClock } from "../src/clock"
+import dayjs from "dayjs"
 
 describe("InMemoryLinkCodes", () => {
   const linkCodes = new InMemoryLinkCodes()
@@ -49,5 +51,46 @@ describe("InMemoryLinkCodes", () => {
         expect(linkCodes.associationFor(missingLinkCode)).toBeUndefined()
       });
     })
+  });
+
+  describe('expiry (TTL)', () => {
+    const association = { serviceToken: "t", nickname: "n", userId: "1" };
+
+    it('should evict a link code once its TTL has elapsed', () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+
+      const code = codes.mint();
+      expect(codes.has(code)).toBe(true);
+
+      clock.add(61, "m");
+
+      expect(codes.has(code)).toBe(false);
+      expect(codes.associationFor(code)).toBeUndefined();
+      expect(codes.count()).toEqual(0);
+      expect(() => codes.associate(code, association)).toThrow();
+    });
+
+    it('should keep a link code valid within its TTL', () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+
+      const code = codes.mint();
+      clock.add(59, "m");
+      codes.associate(code, association);
+
+      expect(codes.associationFor(code)).toEqual(association);
+    });
+
+    it('should evict expired codes when minting so memory stays bounded', () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+
+      codes.mint();
+      clock.add(61, "m");
+      codes.mint();
+
+      expect(codes.count()).toEqual(1);
+    });
   });
 })
