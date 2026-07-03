@@ -58,7 +58,7 @@ describe("InMemoryLinkCodes", () => {
 
     it('should evict a link code once its TTL has elapsed', () => {
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
-      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+      const codes = new InMemoryLinkCodes(clock, "1h");
 
       const code = codes.mint();
       expect(codes.has(code)).toBe(true);
@@ -73,7 +73,7 @@ describe("InMemoryLinkCodes", () => {
 
     it('should keep a link code valid within its TTL', () => {
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
-      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+      const codes = new InMemoryLinkCodes(clock, "1h");
 
       const code = codes.mint();
       clock.add(59, "m");
@@ -84,7 +84,7 @@ describe("InMemoryLinkCodes", () => {
 
     it('should evict expired codes when minting so memory stays bounded', () => {
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
-      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+      const codes = new InMemoryLinkCodes(clock, "1h");
 
       codes.mint();
       clock.add(61, "m");
@@ -95,7 +95,7 @@ describe("InMemoryLinkCodes", () => {
 
     it('should treat a code as expired exactly at the TTL boundary', () => {
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
-      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+      const codes = new InMemoryLinkCodes(clock, "1h");
 
       const code = codes.mint();
       clock.add(60, "m"); // exactly at expiry
@@ -105,7 +105,7 @@ describe("InMemoryLinkCodes", () => {
 
     it('should evict only the expired codes when minting, keeping live ones', () => {
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
-      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+      const codes = new InMemoryLinkCodes(clock, "1h");
 
       const old1 = codes.mint();
       const old2 = codes.mint();
