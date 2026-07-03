@@ -29,15 +29,28 @@ export const jwsEncryption = (secret: string): Encryption => {
       payload: value,
       secret: secret,
     }),
-    decrypt: (value: string) => pipe(
-      jws.decode(value),
-      O.fromNullable,
-      O.map(it => it.payload),
-      O.match(
-        () => left("Failed to decrypt jws"),
-        (payload) => right(payload)
-      )
-    )
+    decrypt: (value: string) => {
+      // Verify the signature with a pinned algorithm BEFORE trusting the payload.
+      // jws.decode() alone does not verify, so without this a client could forge a
+      // token (e.g. alg:none) and have its payload accepted. Pinning HS256 also
+      // prevents algorithm-confusion attacks.
+      try {
+        if (!jws.verify(value, "HS256", secret)) {
+          return left("Invalid signature");
+        }
+      } catch {
+        return left("Invalid signature");
+      }
+      return pipe(
+        jws.decode(value),
+        O.fromNullable,
+        O.map(it => it.payload),
+        O.match(
+          () => left("Failed to decrypt jws"),
+          (payload) => right(payload)
+        )
+      );
+    }
   }
 }
 

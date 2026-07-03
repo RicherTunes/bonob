@@ -47,7 +47,9 @@ if(SHORTHAND_MAPPINGS.length != REVERSE_SHORTHAND_MAPPINGS.length) {
   throw `Invalid SHORTHAND_MAPPINGS, must be duplicate!`
 }
 
-export const BURN_SALT = generateRandomString(5);
+// 32 chars (~192 bits). A short salt would be brute-forceable offline from any
+// burn we hand out, which would defeat the signature verification in decrypt().
+export const BURN_SALT = generateRandomString(32);
 const encryptor = jwsEncryption(BURN_SALT);
 
 export const format = (
