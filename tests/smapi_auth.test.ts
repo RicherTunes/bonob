@@ -145,7 +145,7 @@ describe("auth", () => {
           );
 
           const result = smapiLoginTokens.verify({ token: forged });
-          expect(E.isLeft(result)).toBe(true);
+          expect(result).toEqual(E.left(new InvalidTokenError("invalid algorithm")));
         });
       });
     });

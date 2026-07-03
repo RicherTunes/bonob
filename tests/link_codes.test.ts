@@ -92,5 +92,30 @@ describe("InMemoryLinkCodes", () => {
 
       expect(codes.count()).toEqual(1);
     });
+
+    it('should treat a code as expired exactly at the TTL boundary', () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+
+      const code = codes.mint();
+      clock.add(60, "m"); // exactly at expiry
+
+      expect(codes.has(code)).toBe(false);
+    });
+
+    it('should evict only the expired codes when minting, keeping live ones', () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const codes = new InMemoryLinkCodes(clock, 60 * 60 * 1000);
+
+      const old1 = codes.mint();
+      const old2 = codes.mint();
+      clock.add(61, "m");
+      const fresh = codes.mint();
+
+      expect(codes.count()).toEqual(1);
+      expect(codes.has(fresh)).toBe(true);
+      expect(codes.has(old1)).toBe(false);
+      expect(codes.has(old2)).toBe(false);
+    });
   });
 })
