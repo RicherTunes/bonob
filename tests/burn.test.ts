@@ -4,6 +4,7 @@ type BUrnSpec = {
   burn: BUrn;
   asString: string;
   shorthand: string;
+  parseableTopLevel?: boolean;
 };
 
 describe("BUrn", () => {
@@ -22,6 +23,7 @@ describe("BUrn", () => {
           },
           asString: "bnb:external:http://example.com/widget.jpg",
           shorthand: "bnb:e:http://example.com/widget.jpg",
+          parseableTopLevel: false,
         },
         {
           burn: { system: "subsonic", resource: "art:1234" },
@@ -34,18 +36,24 @@ describe("BUrn", () => {
           shorthand: "bnb:n:art:1234",
         },
       ] as BUrnSpec[]
-    ).forEach(({ burn, asString, shorthand }) => {
+    ).forEach(({ burn, asString, shorthand, parseableTopLevel }) => {
+      // external burns are only valid via the signed encrypted wrapper; parsing
+      // them at the top level is refused (SSRF guard), so assert accordingly.
+      const expectParsed = (stringValue: string) =>
+        parseableTopLevel === false
+          ? expect(() => parse(stringValue)).toThrow()
+          : expect(parse(stringValue)).toEqual(burn);
       describe(asString, () => {
         it("can be formatted as string and then roundtripped back into BUrn", () => {
           const stringValue = format(burn);
           expect(stringValue).toEqual(asString);
-          expect(parse(stringValue)).toEqual(burn);
+          expectParsed(stringValue);
         });
 
         it("can be formatted as shorthand string and then roundtripped back into BUrn", () => {
           const stringValue = format(burn, { shorthand: true });
           expect(stringValue).toEqual(shorthand);
-          expect(parse(stringValue)).toEqual(burn);
+          expectParsed(stringValue);
         });
 
         describe(`encrypted ${asString}`, () => {
@@ -108,6 +116,22 @@ describe("BUrn", () => {
     it("should pass if the system is equal", () => {
       const burn = { system: "external", resource: "something"};
       expect(assertSystem(burn, "external")).toEqual(burn);
+    });
+  });
+
+  describe("security: untrusted external burns", () => {
+    it("refuses to parse a top-level external burn (SSRF guard)", () => {
+      expect(() =>
+        parse("bnb:external:http://169.254.169.254/latest/meta-data")
+      ).toThrow();
+      expect(() =>
+        parse("bnb:e:http://169.254.169.254/latest/meta-data")
+      ).toThrow();
+    });
+
+    it("still round-trips an external burn that arrived via the signed encrypted wrapper", () => {
+      const burn = { system: "external", resource: "http://cdn.example/a.jpg" };
+      expect(parse(formatForURL(burn))).toEqual(burn);
     });
   });
 });

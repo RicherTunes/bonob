@@ -677,6 +677,12 @@ export const axiosImageFetcher = (url: string): Promise<CoverArt | undefined> =>
     .get(url, {
       headers: BROWSER_HEADERS,
       responseType: "arraybuffer",
+      // Bound external image fetches: a hung/slow upstream must not tie up the
+      // process, and a huge response must not exhaust memory. (Defence in depth
+      // alongside refusing unsigned external burns in burn.parse.)
+      timeout: 10000,
+      maxContentLength: 25 * 1024 * 1024,
+      maxBodyLength: 25 * 1024 * 1024,
     })
     .then((res) => ({
       contentType: res.headers["content-type"],
