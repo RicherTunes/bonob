@@ -22,6 +22,24 @@ describe("jwsEncryption", () => {
 
     expect(h1).not.toEqual(h2);
   });
+
+  it("rejects a token that was not signed with this secret (no decode-without-verify bypass)", () => {
+    const attacker = jwsEncryption("attacker-secret");
+    const server = jwsEncryption("real-secret");
+
+    const forged = attacker.encrypt("bnb:external:http://169.254.169.254/latest/meta-data");
+
+    expect(server.decrypt(forged)).toEqual(left("Invalid signature"));
+  });
+
+  it("rejects an alg:none forged token", () => {
+    const server = jwsEncryption("real-secret");
+    const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+    const payload = Buffer.from("bnb:external:http://evil.example/x").toString("base64url");
+    const forged = `${header}.${payload}.`;
+
+    expect(server.decrypt(forged)).toEqual(left("Invalid signature"));
+  });
 })
 
 describe("cryptoEncryption", () => {
