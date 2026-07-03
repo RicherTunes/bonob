@@ -1393,6 +1393,27 @@ describe("server", () => {
                 });
               });
 
+              describe("caching headers on a successful image", () => {
+                it("should set a private, client-cacheable Cache-Control so Sonos (not shared caches) can store the art", async () => {
+                  const coverArtURN = { system: "subsonic", resource: "art:200" };
+
+                  musicService.login.mockResolvedValue(musicLibrary);
+                  musicLibrary.coverArt.mockResolvedValue(coverArtResponse({}));
+
+                  const res = await request(server)
+                    .get(
+                      `/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+                    )
+                    .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                  expect(res.status).toEqual(200);
+                  // token-gated endpoint: only the client may cache, never a shared cache
+                  expect(res.header["cache-control"]).toMatch(/private/);
+                  expect(res.header["cache-control"]).not.toMatch(/public/);
+                  expect(res.header["cache-control"]).toMatch(/max-age=86400\b/);
+                });
+              });
+
               describe("when the images is available however it has an invalid content type", () => {
                 it("should return a 502", async () => {
                   const coverArtURN = { system: "subsonic", resource: "art:200" };
@@ -1412,6 +1433,8 @@ describe("server", () => {
                     .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
 
                   expect(res.status).toEqual(502);
+                  // upstream returned junk (e.g. an HTML hotlink page) — never cache it
+                  expect(res.header["cache-control"]).toBeUndefined();
                 });
               });
 
@@ -1430,6 +1453,23 @@ describe("server", () => {
 
                   expect(res.status).toEqual(404);
                 });
+
+                it("should set a short negative Cache-Control so missing art is retried soon (not cached long)", async () => {
+                  const coverArtURN = { system: "subsonic", resource: "art:404" };
+
+                  musicService.login.mockResolvedValue(musicLibrary);
+                  musicLibrary.coverArt.mockResolvedValue(undefined);
+
+                  const res = await request(server)
+                    .get(
+                      `/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+                    )
+                    .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                  expect(res.status).toEqual(404);
+                  expect(res.header["cache-control"]).toMatch(/private/);
+                  expect(res.header["cache-control"]).toMatch(/max-age=60\b/);
+                });
               });
             });
 
@@ -1446,6 +1486,8 @@ describe("server", () => {
                   .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
 
                 expect(res.status).toEqual(500);
+                // transient error — never cache
+                expect(res.header["cache-control"]).toBeUndefined();
               });
             });
           });
