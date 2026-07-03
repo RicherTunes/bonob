@@ -40,6 +40,22 @@ describe("jwsEncryption", () => {
 
     expect(server.decrypt(forged)).toEqual(left("Invalid signature"));
   });
+
+  it("rejects a token whose signature has been tampered with", () => {
+    const e = jwsEncryption("real-secret");
+    const token = e.encrypt("bnb:subsonic:art:1");
+    const tampered = token.slice(0, -1) + (token.slice(-1) === "A" ? "B" : "A");
+
+    expect(e.decrypt(tampered)).toEqual(left("Invalid signature"));
+  });
+
+  it("rejects garbage / malformed input without throwing", () => {
+    const e = jwsEncryption("real-secret");
+
+    expect(e.decrypt("not-a-jws")).toEqual(left("Invalid signature"));
+    expect(e.decrypt("")).toEqual(left("Invalid signature"));
+    expect(e.decrypt("a.b")).toEqual(left("Invalid signature"));
+  });
 })
 
 describe("cryptoEncryption", () => {
