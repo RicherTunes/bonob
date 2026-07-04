@@ -1,9 +1,10 @@
 import { Clock, SystemClock } from "./clock";
 
 type Entry = {
-  at: number; // completion time of the most recent successful fetch
+  at: number; // completion time of the most recent successful fetch (start time until settled)
   value: Promise<unknown>;
   inFlight: boolean; // a fetch (cold OR refresh) is currently running for this key
+  settled: boolean; // has a fetch ever successfully resolved a value for this entry?
 };
 
 /**
@@ -59,9 +60,11 @@ export class SwrCache {
     const entry = this.entries.get(key);
     if (entry) {
       const age = now - entry.at;
-      // Past the hard stale cap with nothing in flight: treat as absent, so we never
-      // serve ancient data and a revoked credential can't browse cached lists forever.
-      if (age >= this.maxStaleMs && !entry.inFlight) {
+      // Hard stale cap, but only once we actually HAVE a resolved (stale) value: past
+      // maxStale we never serve it, even mid-refresh (a hung refresh must not extend the
+      // cap, and a revoked credential must not keep browsing). A cold fetch still in flight
+      // has no value yet, so leave it to coalesce rather than delete + double-fetch.
+      if (age >= this.maxStaleMs && entry.settled) {
         this.entries.delete(key);
       } else {
         this.touch(key, entry);
@@ -75,15 +78,32 @@ export class SwrCache {
     return this.coldFetch(key, fetch);
   }
 
+  // Call the fetcher, turning a synchronous throw into a rejection so it never escapes
+  // (a sync throw from a refresh would otherwise leave inFlight=true and wedge the key).
+  // Kept synchronous (no extra microtask) to preserve coalescing of concurrent misses.
+  private invoke<T>(fetch: () => Promise<T>): Promise<T> {
+    try {
+      return fetch();
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
   private coldFetch<T>(key: string, fetch: () => Promise<T>): Promise<T> {
-    const value = this.withBackstop(fetch());
-    const entry: Entry = { at: this.clock.now().valueOf(), value, inFlight: true };
+    const value = this.withBackstop(this.invoke(fetch));
+    const entry: Entry = {
+      at: this.clock.now().valueOf(),
+      value,
+      inFlight: true,
+      settled: false,
+    };
     this.entries.set(key, entry);
     this.evictOverCap();
     value
       .then(() => {
         entry.at = this.clock.now().valueOf(); // stamp completion, not start
         entry.inFlight = false;
+        entry.settled = true;
       })
       .catch(() => {
         if (this.entries.get(key) === entry) this.entries.delete(key);
@@ -92,7 +112,7 @@ export class SwrCache {
   }
 
   private refresh<T>(key: string, fetch: () => Promise<T>, stale: Entry): void {
-    this.withBackstop(fetch())
+    this.withBackstop(this.invoke(fetch))
       .then((v) => {
         // Only replace if the stale entry is still current — an LRU eviction or an
         // invalidate() in the meantime must not be resurrected by a late refresh.
@@ -101,6 +121,7 @@ export class SwrCache {
             at: this.clock.now().valueOf(),
             value: Promise.resolve(v),
             inFlight: false,
+            settled: true,
           });
         }
       })

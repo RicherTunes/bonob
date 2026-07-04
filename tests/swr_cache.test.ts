@@ -171,6 +171,43 @@ describe("SwrCache", () => {
     expect(f.calls).toBe(2);
   });
 
+  it("enforces maxStale even while a refresh is in flight (a hung refresh can't extend it)", async () => {
+    const clock = new FixedClock(at);
+    const cache = new SwrCache(clock, 60_000, { maxStaleMs: 5 * 60_000 });
+    const f = deferredFetcher<string>();
+    const p1 = cache.get("k", f.fetch);
+    f.resolve(0, "old");
+    await p1;
+
+    clock.add(2, "m"); // stale -> serve stale + kick a refresh (index 1) we leave hanging
+    expect(await cache.get("k", f.fetch)).toBe("old");
+    expect(f.calls).toBe(2);
+
+    clock.add(10, "m"); // 12m total, past maxStale 5m, refresh still in flight
+    const p3 = cache.get("k", f.fetch); // must cold-fetch (index 2), NOT serve stale
+    let served: string | undefined;
+    p3.then((v) => (served = v));
+    await flush();
+    expect(served).toBeUndefined();
+    expect(f.calls).toBe(3);
+    f.resolve(2, "fresh");
+    expect(await p3).toBe("fresh");
+    f.resolve(1, "orphan"); // settle the orphaned refresh (discarded by identity guard)
+    await flush();
+  });
+
+  it("does not wedge if the fetcher throws synchronously (rejects, then retries)", async () => {
+    const cache = new SwrCache(new FixedClock(at), 60_000);
+    let boom = true;
+    const fetch = () => {
+      if (boom) throw new Error("sync boom");
+      return Promise.resolve("v");
+    };
+    await expect(cache.get("k", fetch)).rejects.toThrow(/sync boom/);
+    boom = false;
+    expect(await cache.get("k", fetch)).toBe("v");
+  });
+
   it("backstop: a hung fetch rejects after backstopMs (and frees the key)", async () => {
     jest.useFakeTimers();
     try {
