@@ -1,4 +1,5 @@
 import _ from "underscore";
+import { createHash } from "crypto";
 import { generateRandomString } from "./random";
 import { pipe } from "fp-ts/lib/function";
 import { either as E } from "fp-ts";
@@ -47,9 +48,18 @@ if(SHORTHAND_MAPPINGS.length != REVERSE_SHORTHAND_MAPPINGS.length) {
   throw `Invalid SHORTHAND_MAPPINGS, must be duplicate!`
 }
 
-// 32 chars (~192 bits). A short salt would be brute-forceable offline from any
-// burn we hand out, which would defeat the signature verification in decrypt().
-export const BURN_SALT = generateRandomString(32);
+// Derive a STABLE art-burn signing key from the app secret (with domain separation), so that
+// signed art URLs survive a bonob restart. This was previously random per process, which meant
+// every restart invalidated every art URL Sonos had cached -> "Invalid signature" -> blank
+// artwork after every redeploy. sha256 gives 256 bits of key material. Falls back to a random
+// 32-char salt (~192 bits) when no secret is configured (tests / local dev); art then simply
+// won't survive a restart, as before.
+export const deriveBurnSalt = (secret: string | undefined): string =>
+  secret
+    ? createHash("sha256").update(`bonob:art-burn-salt:${secret}`).digest("hex")
+    : generateRandomString(32);
+
+export const BURN_SALT = deriveBurnSalt(process.env["BNB_SECRET"]);
 const encryptor = jwsEncryption(BURN_SALT);
 
 export const format = (

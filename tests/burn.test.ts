@@ -1,4 +1,13 @@
-import { assertSystem, BUrn, format, formatForURL, parse } from "../src/burn";
+import {
+  assertSystem,
+  BUrn,
+  deriveBurnSalt,
+  format,
+  formatForURL,
+  parse,
+} from "../src/burn";
+import { jwsEncryption } from "../src/encryption";
+import { right } from "fp-ts/Either";
 
 type BUrnSpec = {
   burn: BUrn;
@@ -6,6 +15,38 @@ type BUrnSpec = {
   shorthand: string;
   parseableTopLevel?: boolean;
 };
+
+describe("deriveBurnSalt", () => {
+  it("is stable for the same secret (so signed art burns survive a restart)", () => {
+    expect(deriveBurnSalt("a-long-stable-secret")).toEqual(
+      deriveBurnSalt("a-long-stable-secret")
+    );
+  });
+
+  it("differs for different secrets", () => {
+    expect(deriveBurnSalt("secret-a")).not.toEqual(deriveBurnSalt("secret-b"));
+  });
+
+  it("produces at least 32 chars of key material", () => {
+    expect(deriveBurnSalt("x").length).toBeGreaterThanOrEqual(32);
+  });
+
+  it("falls back (does not derive from a secret) when none is configured", () => {
+    // The no-secret path must not reuse a secret's stable derivation. (It uses
+    // generateRandomString, which other suites auto-mock, so we don't assert on its output.)
+    expect(deriveBurnSalt(undefined)).not.toEqual(deriveBurnSalt("some-secret"));
+  });
+
+  it("a burn signed before a restart still verifies after (same secret)", () => {
+    // two independent encryptors derived from the same secret = process A and process B
+    const encA = jwsEncryption(deriveBurnSalt("stable-secret"));
+    const encB = jwsEncryption(deriveBurnSalt("stable-secret"));
+    const signed = encA.encrypt("bnb:e:http://navidrome:4533/share/img/abc");
+    expect(encB.decrypt(signed)).toStrictEqual(
+      right("bnb:e:http://navidrome:4533/share/img/abc")
+    );
+  });
+});
 
 describe("BUrn", () => {
   describe("format", () => {
