@@ -19,6 +19,7 @@ import { MusicService } from "./music_library";
 import { SystemClock } from "./clock";
 import { JWTSmapiLoginTokens } from "./smapi_auth";
 import { SwrCache } from "./swr_cache";
+import { fileStore } from "./swr_cache_file_store";
 import ms from "ms";
 
 const config = readConfig();
@@ -43,10 +44,28 @@ const artistImageFetcher = config.subsonic.artistImageCache
   ? cachingImageFetcher(config.subsonic.artistImageCache, axiosImageFetcher)
   : axiosImageFetcher;
 
-// Bounded stale-while-revalidate cache for the large browse lists (getArtists). Parse the
-// TTL at the config boundary; an invalid duration coerces to 0 = disabled.
+// Freeze a loaded value and everything nested in it, matching how fetched summaries are
+// frozen — a persisted entry restored from disk must be just as immutable as a live one.
+const deepFreeze = (v: unknown): unknown => {
+  if (v && typeof v === "object") {
+    Object.values(v as Record<string, unknown>).forEach(deepFreeze);
+    Object.freeze(v);
+  }
+  return v;
+};
+
+// Bounded stale-while-revalidate cache for the large browse lists (getArtists, album pages).
+// Parse the TTL at the config boundary; an invalid duration coerces to 0 = disabled. When a
+// cache dir is configured, back it with a disk store so it survives restarts (no cold first
+// browse after a redeploy).
 const browseCacheTTLms = Number(ms(config.subsonic.cacheTTL)) || 0;
-const browseCache = new SwrCache(clock, browseCacheTTLms);
+const browseCacheStore = config.subsonic.cacheDir
+  ? fileStore(config.subsonic.cacheDir)
+  : undefined;
+const browseCache = new SwrCache(clock, browseCacheTTLms, {
+  store: browseCacheStore,
+  revive: deepFreeze,
+});
 
 const subsonic = new SubsonicMusicService(
   new Subsonic(

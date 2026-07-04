@@ -138,6 +138,7 @@ export default function (die: (code?: number) => never = process.exit) {
       artistImageCache: bnbEnvVar<string>("SUBSONIC_ARTIST_IMAGE_CACHE"),
       transcode: bnbEnvVar<boolean>("SUBSONIC_TRANSCODE", { default: true, parser: asBoolean }),
       cacheTTL: bnbEnvVar<StringValue>("SUBSONIC_CACHE_TTL", { default: "5m" })!,
+      cacheDir: bnbEnvVar<string>("SUBSONIC_CACHE_DIR"),
     },
     scrobbleTracks: bnbEnvVar<boolean>("SCROBBLE_TRACKS", { default: true, parser: asBoolean }),
     reportNowPlaying:
