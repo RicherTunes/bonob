@@ -49,6 +49,7 @@ import { getArtistJson, getArtistInfoJson, asArtistsJson } from "./subsonic_musi
 import { b64Encode } from "../src/b64";
 import dayjs from "dayjs";
 import { FixedClock } from "../src/clock";
+import { SwrCache } from "../src/swr_cache";
 
 import { Album, Artist, Track, AlbumSummary, AuthFailure } from "../src/music_library";
 import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
@@ -830,18 +831,23 @@ describe("Subsonic", () => {
       });
     });
 
-    describe("caching (artistsCacheTTL > 0)", () => {
+    describe("caching (getArtists via SwrCache)", () => {
       const cached = [anArtist({ name: "A Artist", albums: [anAlbum()] })];
       const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
       let cachingSubsonic: Subsonic;
 
       beforeEach(() => {
         clock.time = dayjs("2024-01-01T00:00:00Z");
-        cachingSubsonic = new Subsonic(url, customPlayers, axiosImageFetcher, clock, "5m");
+        cachingSubsonic = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          new SwrCache(clock, 5 * 60_000)
+        );
         mockGET.mockImplementation(() => Promise.resolve(ok(asArtistsJson(cached))));
       });
 
-      it("fetches once and serves later calls from cache within the TTL", async () => {
+      it("caches getArtists (one upstream fetch for repeated browses)", async () => {
         const first = await cachingSubsonic.getArtists(credentials);
         const second = await cachingSubsonic.getArtists(credentials);
 
@@ -849,26 +855,14 @@ describe("Subsonic", () => {
         expect(mockGET).toHaveBeenCalledTimes(1);
       });
 
-      it("re-fetches once the TTL has elapsed", async () => {
+      it("keys the cache per user (Navidrome has per-user library ACLs)", async () => {
         await cachingSubsonic.getArtists(credentials);
-        clock.add(6, "m");
-        await cachingSubsonic.getArtists(credentials);
+        await cachingSubsonic.getArtists({ username: "someone-else", password: "x" });
 
         expect(mockGET).toHaveBeenCalledTimes(2);
       });
 
-      it("serves stale instantly while refreshing in the background (stale-while-revalidate)", async () => {
-        const first = await cachingSubsonic.getArtists(credentials);
-        expect(mockGET).toHaveBeenCalledTimes(1);
-
-        clock.add(6, "m"); // now stale
-
-        const stale = await cachingSubsonic.getArtists(credentials);
-        expect(stale).toBe(first); // same cached value, served instantly (not a fresh fetch)
-        expect(mockGET).toHaveBeenCalledTimes(2); // a single background refresh was kicked
-      });
-
-      it("coalesces concurrent calls into a single fetch", async () => {
+      it("coalesces concurrent Sonos page requests into one fetch", async () => {
         await Promise.all([
           cachingSubsonic.getArtists(credentials),
           cachingSubsonic.getArtists(credentials),
@@ -878,56 +872,22 @@ describe("Subsonic", () => {
         expect(mockGET).toHaveBeenCalledTimes(1);
       });
 
-      it("evicts a failed fetch so the next call retries (no poisoned cache)", async () => {
-        mockGET.mockImplementationOnce(() => Promise.reject(new Error("boom")));
+      it("serves stale instantly and refreshes in the background", async () => {
+        const first = await cachingSubsonic.getArtists(credentials);
+        expect(mockGET).toHaveBeenCalledTimes(1);
 
-        await expect(cachingSubsonic.getArtists(credentials)).rejects.toBeDefined();
-        const second = await cachingSubsonic.getArtists(credentials);
+        clock.add(6, "m"); // now stale
+        const stale = await cachingSubsonic.getArtists(credentials);
 
-        expect(second).toHaveLength(cached.length);
-        expect(mockGET).toHaveBeenCalledTimes(2);
+        expect(stale).toEqual(first); // served instantly from cache
+        expect(mockGET).toHaveBeenCalledTimes(2); // single background refresh kicked
       });
 
-      it("times out and evicts a hung fetch so browses don't coalesce onto it forever", async () => {
-        jest.useFakeTimers();
-        try {
-          mockGET.mockImplementation(() => new Promise(() => {})); // never resolves (hang)
-          const hung = cachingSubsonic.getArtists(credentials);
-          const rejection = expect(hung).rejects.toThrow(/timed out/);
-          jest.advanceTimersByTime(30001);
-          await rejection;
-
-          // the hung entry is evicted, so a fresh call retries instead of coalescing onto it
-          mockGET.mockImplementation(() =>
-            Promise.resolve(ok(asArtistsJson(cached)))
-          );
-          const retry = await cachingSubsonic.getArtists(credentials);
-          expect(retry).toHaveLength(cached.length);
-        } finally {
-          jest.useRealTimers();
-        }
-      });
-
-      it("returns a frozen list so a caller cannot corrupt the shared cache", async () => {
+      it("returns a deep-frozen list so callers cannot corrupt the shared cache", async () => {
         const result = await cachingSubsonic.getArtists(credentials);
 
         expect(Object.isFrozen(result)).toBe(true);
-      });
-
-      it("disables caching when the configured TTL is invalid (fetches every call)", async () => {
-        const off = new Subsonic(
-          url,
-          customPlayers,
-          axiosImageFetcher,
-          clock,
-          "notaduration" as any
-        );
-        mockGET.mockImplementation(() => Promise.resolve(ok(asArtistsJson(cached))));
-
-        await off.getArtists(credentials);
-        await off.getArtists(credentials);
-
-        expect(mockGET).toHaveBeenCalledTimes(2);
+        expect(Object.isFrozen(result[0])).toBe(true);
       });
     });
 

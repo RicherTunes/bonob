@@ -26,8 +26,7 @@ import path from "path";
 import axios, { AxiosRequestConfig } from "axios";
 import { b64Encode, b64Decode } from "./b64";
 import { BUrn } from "./burn";
-import ms, { StringValue } from "ms";
-import { Clock, SystemClock } from "./clock";
+import { SwrCache } from "./swr_cache";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
 
@@ -714,41 +713,22 @@ export const asToken = (credentials: Credentials) =>
 export const parseToken = (token: string): Credentials =>
   JSON.parse(b64Decode(token));
 
-// Cap the (cached) artist-list fetch so a hung Navidrome connection can't poison the
-// cache for the whole TTL. Generous vs the observed ~6s query; only guards against hangs.
-const ARTISTS_FETCH_TIMEOUT_MS = 30_000;
-
 export class Subsonic {
   url: URLBuilder;
   customPlayers: CustomPlayers;
   externalImageFetcher: ImageFetcher;
-  private clock: Clock;
-  private artistsCacheTTLms: number;
-  private artistsCache: Map<
-    string,
-    {
-      at: number;
-      value: Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]>;
-      refreshing?: boolean;
-    }
-  > = new Map();
+  private cache: SwrCache;
 
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
     externalImageFetcher: ImageFetcher = axiosImageFetcher,
-    clock: Clock = SystemClock,
-    artistsCacheTTL: StringValue = "0s"
+    cache: SwrCache = SwrCache.disabled()
   ) {
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
-    this.clock = clock;
-    // Coerce an invalid duration (ms() returns undefined for garbage like "5min") to 0 so a
-    // mis-set BNB_SUBSONIC_ARTIST_CACHE_TTL disables the cache rather than silently breaking
-    // the TTL comparison (now - at < undefined is always false => fetch-every-call).
-    const ttlMs = ms(artistsCacheTTL);
-    this.artistsCacheTTLms = typeof ttlMs === "number" && ttlMs > 0 ? ttlMs : 0;
+    this.cache = cache;
   }
 
   private get = async (
@@ -858,82 +838,37 @@ export class Subsonic {
     this.getJSON<GetArtistsResponse>(credentials, "/rest/getArtists")
       .then((it) => (it.artists.index || []).flatMap((it) => it.artist || []))
       .then((artists) => {
-        const mapped = artists.map((artist) => ({
-          id: `${artist.id}`,
-          name: artist.name,
-          albumCount: artist.albumCount,
-          image: artistImageURN({
-            artistId: artist.id,
-            artistImageURL: artist.artistImageUrl,
-          }),
-        }));
-        // Frozen: this array + its objects are shared across every cache hit and user, so a
-        // caller mutating in place (sort/splice/decorate) would corrupt the cache. Current
-        // callers already treat it read-only (slice2 copies, getAlbumList2 reduces).
+        // Deep-frozen: this array + its objects are shared across every cache hit and user,
+        // so a caller mutating in place (sort/splice/decorate) would corrupt the cache.
+        // Current callers treat it read-only (slice2 copies, getAlbumList2 reduces).
+        const mapped = artists.map((artist) => {
+          const summary = {
+            id: `${artist.id}`,
+            name: artist.name,
+            albumCount: artist.albumCount,
+            image: artistImageURN({
+              artistId: artist.id,
+              artistImageURL: artist.artistImageUrl,
+            }),
+          };
+          Object.freeze(summary);
+          return summary;
+        });
         Object.freeze(mapped);
         return mapped;
       });
 
-  // fetchArtists bounded by a timeout: because the result is cached + coalesced, a hung
-  // connection would otherwise sit in the cache and every browse in the household would
-  // coalesce onto a request that never completes. On timeout it rejects so callers/refresh
-  // handle it rather than hanging.
-  private fetchArtistsBounded = (
-    credentials: Credentials
-  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    return Promise.race([
-      this.fetchArtists(credentials),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error("getArtists timed out")),
-          ARTISTS_FETCH_TIMEOUT_MS
-        );
-      }),
-    ]).finally(() => clearTimeout(timer));
-  };
-
-  // The full artist list is large (10MB+ / ~8s query on big libraries) and bonob re-fetches
-  // it on every Sonos browse page. Serve it stale-while-revalidate: once warm, EVERY browse
-  // returns instantly -- a cold ~8s fetch on the browse path exceeds Sonos's SMAPI timeout,
-  // so a stale entry is served immediately and refreshed in the background. Concurrent calls
-  // coalesce onto one fetch. Disabled when the TTL is <= 0 (class default), preserving
-  // un-cached behaviour.
+  // The full artist list is large (~10MB / ~8s on big libraries) and bonob re-fetches it on
+  // every Sonos browse page (getAlbumList2 also uses it for its total). SwrCache serves it
+  // stale-while-revalidate, so once warm EVERY browse is instant (a cold ~8s fetch on the
+  // browse path exceeds Sonos's SMAPI timeout), coalesces concurrent Sonos pages onto one
+  // fetch, and is bounded/hardened. Keyed per user (Navidrome has per-user library ACLs).
   getArtists = (
     credentials: Credentials
-  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> => {
-    if (this.artistsCacheTTLms <= 0) return this.fetchArtists(credentials);
-    const key = credentials.username;
-    const now = this.clock.now().valueOf();
-    const cached = this.artistsCache.get(key);
-    if (cached) {
-      // Serve the cached value immediately, fresh or stale. If stale, kick a single
-      // background refresh (keep serving stale meanwhile, and on refresh failure).
-      if (now - cached.at >= this.artistsCacheTTLms && !cached.refreshing) {
-        cached.refreshing = true;
-        this.fetchArtistsBounded(credentials)
-          .then((v) =>
-            this.artistsCache.set(key, {
-              at: this.clock.now().valueOf(),
-              value: Promise.resolve(v),
-            })
-          )
-          .catch(() => {
-            cached.refreshing = false;
-          });
-      }
-      return cached.value;
-    }
-    // Cold miss: the only path that can be slow. Cache the in-flight promise so concurrent
-    // browses coalesce; evict on failure so the next call retries rather than caching an error.
-    const value = this.fetchArtistsBounded(credentials);
-    this.artistsCache.set(key, { at: now, value });
-    value.catch(() => {
-      const current = this.artistsCache.get(key);
-      if (current && current.value === value) this.artistsCache.delete(key);
-    });
-    return value;
-  };
+  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> =>
+    this.cache.get(`artists:${credentials.username}`, () =>
+      this.fetchArtists(credentials)
+    );
 
       // todo: should be getArtistInfo2?
   getArtistInfo = (

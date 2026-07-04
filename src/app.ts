@@ -18,6 +18,8 @@ import sonos, { bonobService } from "./sonos";
 import { MusicService } from "./music_library";
 import { SystemClock } from "./clock";
 import { JWTSmapiLoginTokens } from "./smapi_auth";
+import { SwrCache } from "./swr_cache";
+import ms from "ms";
 
 const config = readConfig();
 const clock = SystemClock;
@@ -41,13 +43,17 @@ const artistImageFetcher = config.subsonic.artistImageCache
   ? cachingImageFetcher(config.subsonic.artistImageCache, axiosImageFetcher)
   : axiosImageFetcher;
 
+// Bounded stale-while-revalidate cache for the large browse lists (getArtists). Parse the
+// TTL at the config boundary; an invalid duration coerces to 0 = disabled.
+const browseCacheTTLms = Number(ms(config.subsonic.cacheTTL)) || 0;
+const browseCache = new SwrCache(clock, browseCacheTTLms);
+
 const subsonic = new SubsonicMusicService(
   new Subsonic(
     config.subsonic.url,
     customPlayers,
     artistImageFetcher,
-    clock,
-    config.subsonic.artistCacheTTL
+    browseCache
   ),
   customPlayers,
   config.subsonic.transcode
