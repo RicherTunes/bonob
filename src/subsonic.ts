@@ -726,7 +726,11 @@ export class Subsonic {
   private artistsCacheTTLms: number;
   private artistsCache: Map<
     string,
-    { at: number; value: Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> }
+    {
+      at: number;
+      value: Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]>;
+      refreshing?: boolean;
+    }
   > = new Map();
 
   constructor(
@@ -870,26 +874,15 @@ export class Subsonic {
         return mapped;
       });
 
-  // The full artist list is large (10MB+ / multi-second query on big libraries) and
-  // bonob re-fetches it on every Sonos browse page. Cache it with a short TTL and
-  // coalesce concurrent fetches so pagination doesn't repeatedly hammer Navidrome.
-  // Disabled when the TTL is <= 0 (the class default), preserving un-cached behaviour.
-  getArtists = (
+  // fetchArtists bounded by a timeout: because the result is cached + coalesced, a hung
+  // connection would otherwise sit in the cache and every browse in the household would
+  // coalesce onto a request that never completes. On timeout it rejects so callers/refresh
+  // handle it rather than hanging.
+  private fetchArtistsBounded = (
     credentials: Credentials
   ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> => {
-    if (this.artistsCacheTTLms <= 0) return this.fetchArtists(credentials);
-    const key = credentials.username;
-    const now = this.clock.now().valueOf();
-    const cached = this.artistsCache.get(key);
-    if (cached && now - cached.at < this.artistsCacheTTLms) {
-      return cached.value;
-    }
-    // Bound the fetch with a timeout: because the result is cached + coalesced, a hung
-    // connection would otherwise sit in the cache for the whole TTL and every browse in the
-    // household would coalesce onto a request that never completes. On timeout it rejects,
-    // the eviction below fires, and the next browse retries.
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const value = Promise.race([
+    return Promise.race([
       this.fetchArtists(credentials),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
@@ -898,8 +891,43 @@ export class Subsonic {
         );
       }),
     ]).finally(() => clearTimeout(timer));
+  };
+
+  // The full artist list is large (10MB+ / ~8s query on big libraries) and bonob re-fetches
+  // it on every Sonos browse page. Serve it stale-while-revalidate: once warm, EVERY browse
+  // returns instantly -- a cold ~8s fetch on the browse path exceeds Sonos's SMAPI timeout,
+  // so a stale entry is served immediately and refreshed in the background. Concurrent calls
+  // coalesce onto one fetch. Disabled when the TTL is <= 0 (class default), preserving
+  // un-cached behaviour.
+  getArtists = (
+    credentials: Credentials
+  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> => {
+    if (this.artistsCacheTTLms <= 0) return this.fetchArtists(credentials);
+    const key = credentials.username;
+    const now = this.clock.now().valueOf();
+    const cached = this.artistsCache.get(key);
+    if (cached) {
+      // Serve the cached value immediately, fresh or stale. If stale, kick a single
+      // background refresh (keep serving stale meanwhile, and on refresh failure).
+      if (now - cached.at >= this.artistsCacheTTLms && !cached.refreshing) {
+        cached.refreshing = true;
+        this.fetchArtistsBounded(credentials)
+          .then((v) =>
+            this.artistsCache.set(key, {
+              at: this.clock.now().valueOf(),
+              value: Promise.resolve(v),
+            })
+          )
+          .catch(() => {
+            cached.refreshing = false;
+          });
+      }
+      return cached.value;
+    }
+    // Cold miss: the only path that can be slow. Cache the in-flight promise so concurrent
+    // browses coalesce; evict on failure so the next call retries rather than caching an error.
+    const value = this.fetchArtistsBounded(credentials);
     this.artistsCache.set(key, { at: now, value });
-    // Never cache a rejected/timed-out fetch: evict on failure so the next call retries.
     value.catch(() => {
       const current = this.artistsCache.get(key);
       if (current && current.value === value) this.artistsCache.delete(key);
