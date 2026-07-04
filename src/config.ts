@@ -137,6 +137,7 @@ export default function (die: (code?: number) => never = process.exit) {
       customClientsFor: bnbEnvVar<string>("SUBSONIC_CUSTOM_CLIENTS"),
       artistImageCache: bnbEnvVar<string>("SUBSONIC_ARTIST_IMAGE_CACHE"),
       transcode: bnbEnvVar<boolean>("SUBSONIC_TRANSCODE", { default: true, parser: asBoolean }),
+      artistCacheTTL: bnbEnvVar<StringValue>("SUBSONIC_ARTIST_CACHE_TTL", { default: "5m" })!,
     },
     scrobbleTracks: bnbEnvVar<boolean>("SCROBBLE_TRACKS", { default: true, parser: asBoolean }),
     reportNowPlaying:
