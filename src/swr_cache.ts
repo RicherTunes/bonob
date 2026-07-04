@@ -41,6 +41,7 @@ export class SwrCache {
   private readonly backstopMs: number;
   private readonly store?: SwrCacheStore;
   private readonly revive: (v: unknown) => unknown;
+  private readonly persistMaxAgeMs: number;
 
   constructor(
     private readonly clock: Clock,
@@ -51,6 +52,7 @@ export class SwrCache {
       backstopMs?: number;
       store?: SwrCacheStore;
       revive?: (v: unknown) => unknown;
+      persistMaxAgeMs?: number;
     } = {}
   ) {
     this.maxEntries = opts.maxEntries ?? 50;
@@ -58,6 +60,10 @@ export class SwrCache {
     this.backstopMs = opts.backstopMs ?? 60_000;
     this.store = opts.store;
     this.revive = opts.revive ?? ((v) => v);
+    // How old a persisted entry may be and still be restored on startup. Independent of the
+    // live maxStale cap: a restored value is served instantly then revalidated (see seed), so
+    // the cache survives a restart of any length up to this bound without a cold first browse.
+    this.persistMaxAgeMs = opts.persistMaxAgeMs ?? 7 * 24 * 60 * 60 * 1000; // 7 days
     // Restore a persisted cache on startup so the first browse after a restart isn't cold.
     if (this.store && ttlMs > 0) {
       for (const e of this.store.load()) this.seed(e.key, this.revive(e.value), e.at);
@@ -68,11 +74,16 @@ export class SwrCache {
   // already past the stale cap, so a long downtime never seeds ancient data.
   private seed(key: string, value: unknown, at: number): void {
     const now = this.clock.now().valueOf();
-    // Reject a bad timestamp: a future or non-finite `at` (clock skew, Infinity from a hostile
-    // file) would otherwise read as "fresh forever" and never revalidate.
-    if (!Number.isFinite(at) || at > now || now - at >= this.maxStaleMs) return;
+    // Reject a bad timestamp (a future or non-finite `at` from clock skew / a hostile file
+    // would otherwise read as "fresh forever") or an entry older than the persistence cap.
+    if (!Number.isFinite(at) || at > now || now - at >= this.persistMaxAgeMs) return;
+    // Serve the restored value instantly, but if it is already older than the TTL, clamp its
+    // timestamp to "just stale" so the first access revalidates it in the background instead
+    // of the hard maxStale cap dropping it after a long downtime. This is what lets the cache
+    // survive a restart of any length (up to persistMaxAgeMs) without a cold first browse.
+    const effectiveAt = now - at > this.ttlMs ? now - this.ttlMs : at;
     this.entries.set(key, {
-      at,
+      at: effectiveAt,
       value: Promise.resolve(value),
       inFlight: false,
       settled: true,

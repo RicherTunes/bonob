@@ -259,17 +259,33 @@ describe("SwrCache", () => {
     expect(saved).toContainEqual({ key: "k", at: at.valueOf(), value: "v" });
   });
 
-  it("does not seed a persisted entry older than maxStale", async () => {
+  it("seeds a stale persisted entry (served instantly) and revalidates on first access", async () => {
+    const clock = new FixedClock(at);
     const store = {
-      load: () => [{ key: "k", at: at.valueOf() - 100 * 60_000, value: "ancient" }],
+      load: () => [{ key: "k", at: at.valueOf() - 100 * 60_000, value: "restored" }],
+      save: () => {},
+    };
+    const cache = new SwrCache(clock, 60_000, { maxStaleMs: 5 * 60_000, store });
+    const f = deferredFetcher<string>();
+    const served = await cache.get("k", f.fetch); // stale seed served instantly...
+    expect(served).toBe("restored");
+    expect(f.calls).toBe(1); // ...and kicked a background refresh
+    f.resolve(0, "fresh");
+    await flush();
+    expect(await cache.get("k", f.fetch)).toBe("fresh");
+  });
+
+  it("does not seed a persisted entry older than persistMaxAge", async () => {
+    const store = {
+      load: () => [{ key: "k", at: at.valueOf() - 8 * 24 * 60 * 60_000, value: "ancient" }],
       save: () => {},
     };
     const cache = new SwrCache(new FixedClock(at), 60_000, {
-      maxStaleMs: 5 * 60_000,
+      persistMaxAgeMs: 7 * 24 * 60 * 60_000,
       store,
     });
     const f = deferredFetcher<string>();
-    const p = cache.get("k", f.fetch); // seed too old -> cold fetch
+    const p = cache.get("k", f.fetch); // 8 days > 7-day cap -> cold fetch
     f.resolve(0, "fresh");
     expect(await p).toBe("fresh");
     expect(f.calls).toBe(1);
