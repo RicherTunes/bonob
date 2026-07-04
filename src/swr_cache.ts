@@ -67,7 +67,10 @@ export class SwrCache {
   // Insert a resolved, settled entry (restores a persisted value on startup). Skips anything
   // already past the stale cap, so a long downtime never seeds ancient data.
   private seed(key: string, value: unknown, at: number): void {
-    if (this.clock.now().valueOf() - at >= this.maxStaleMs) return;
+    const now = this.clock.now().valueOf();
+    // Reject a bad timestamp: a future or non-finite `at` (clock skew, Infinity from a hostile
+    // file) would otherwise read as "fresh forever" and never revalidate.
+    if (!Number.isFinite(at) || at > now || now - at >= this.maxStaleMs) return;
     this.entries.set(key, {
       at,
       value: Promise.resolve(value),
@@ -152,6 +155,10 @@ export class SwrCache {
     this.evictOverCap();
     value
       .then((v) => {
+        // Only commit if this entry is still current. If it was LRU-evicted or replaced while
+        // in flight (e.g. many warm-on-login users churn the cache), don't resurrect it or
+        // persist stale data over a newer entry's file. Coalesced callers still get `value`.
+        if (this.entries.get(key) !== entry) return;
         entry.at = this.clock.now().valueOf(); // stamp completion, not start
         entry.inFlight = false;
         entry.settled = true;

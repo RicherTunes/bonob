@@ -273,7 +273,7 @@ const createPlayListJson = (playlist: PlaylistSummary) =>
   });
 
 
-const getAlbumListJson = (albums: [Artist, AlbumSummary][]) =>
+export const getAlbumListJson = (albums: [Artist, AlbumSummary][]) =>
   subsonicOK({
     albumList2: {
       album: albums.map(([artist, album]) => ({

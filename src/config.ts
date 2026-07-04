@@ -137,7 +137,12 @@ export default function (die: (code?: number) => never = process.exit) {
       customClientsFor: bnbEnvVar<string>("SUBSONIC_CUSTOM_CLIENTS"),
       artistImageCache: bnbEnvVar<string>("SUBSONIC_ARTIST_IMAGE_CACHE"),
       transcode: bnbEnvVar<boolean>("SUBSONIC_TRANSCODE", { default: true, parser: asBoolean }),
-      cacheTTL: bnbEnvVar<StringValue>("SUBSONIC_CACHE_TTL", { default: "5m" })!,
+      cacheTTL: bnbEnvVar<StringValue>("SUBSONIC_CACHE_TTL", {
+        default: "5m",
+        // Back-compat: the knob used to be artist-only. Honour the old name (a deprecation
+        // warning is logged) so an existing `...ARTIST_CACHE_TTL=0s` still disables caching.
+        legacy: ["BNB_SUBSONIC_ARTIST_CACHE_TTL"],
+      })!,
       cacheDir: bnbEnvVar<string>("SUBSONIC_CACHE_DIR"),
     },
     scrobbleTracks: bnbEnvVar<boolean>("SCROBBLE_TRACKS", { default: true, parser: asBoolean }),

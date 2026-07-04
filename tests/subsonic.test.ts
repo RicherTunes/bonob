@@ -44,14 +44,14 @@ import {
   TranscodeDecision,
 } from "../src/subsonic";
 
-import { getArtistJson, getArtistInfoJson, asArtistsJson } from "./subsonic_music_library.test";
+import { getArtistJson, getArtistInfoJson, asArtistsJson, getAlbumListJson } from "./subsonic_music_library.test";
 
 import { b64Encode } from "../src/b64";
 import dayjs from "dayjs";
 import { FixedClock } from "../src/clock";
 import { SwrCache } from "../src/swr_cache";
 
-import { Album, Artist, Track, AlbumSummary, AuthFailure } from "../src/music_library";
+import { Album, Artist, Track, AlbumSummary, AlbumQuery, AuthFailure } from "../src/music_library";
 import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
 import { BUrn } from "../src/burn";
 
@@ -870,6 +870,44 @@ describe("Subsonic", () => {
         ]);
 
         expect(mockGET).toHaveBeenCalledTimes(1);
+      });
+
+      describe("album-list page caching", () => {
+        const albumArtist = anArtist();
+        const albumsPage: [Artist, AlbumSummary][] = [
+          [albumArtist, anAlbumSummary()],
+          [albumArtist, anAlbumSummary()],
+        ];
+        const albumPageFetches = () =>
+          (mockGET.mock.calls as unknown[][]).filter((c) =>
+            String(c[0]).includes("getAlbumList2")
+          ).length;
+
+        beforeEach(() => {
+          mockGET.mockImplementation((u: string) =>
+            Promise.resolve(
+              ok(
+                u.includes("getAlbumList2")
+                  ? getAlbumListJson(albumsPage)
+                  : asArtistsJson(cached)
+              )
+            )
+          );
+        });
+
+        it("caches a stable album section (alphabeticalByName) across browses", async () => {
+          const q: AlbumQuery = { _index: 0, _count: 100, type: "alphabeticalByName" };
+          await cachingSubsonic.getAlbumList2(credentials, q);
+          await cachingSubsonic.getAlbumList2(credentials, q);
+          expect(albumPageFetches()).toBe(1);
+        });
+
+        it("never caches the random section (each browse re-fetches)", async () => {
+          const q: AlbumQuery = { _index: 0, _count: 100, type: "random" };
+          await cachingSubsonic.getAlbumList2(credentials, q);
+          await cachingSubsonic.getAlbumList2(credentials, q);
+          expect(albumPageFetches()).toBe(2);
+        });
       });
 
       it("serves stale instantly and refreshes in the background", async () => {
