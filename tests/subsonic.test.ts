@@ -857,6 +857,17 @@ describe("Subsonic", () => {
         expect(mockGET).toHaveBeenCalledTimes(2);
       });
 
+      it("serves stale instantly while refreshing in the background (stale-while-revalidate)", async () => {
+        const first = await cachingSubsonic.getArtists(credentials);
+        expect(mockGET).toHaveBeenCalledTimes(1);
+
+        clock.add(6, "m"); // now stale
+
+        const stale = await cachingSubsonic.getArtists(credentials);
+        expect(stale).toBe(first); // same cached value, served instantly (not a fresh fetch)
+        expect(mockGET).toHaveBeenCalledTimes(2); // a single background refresh was kicked
+      });
+
       it("coalesces concurrent calls into a single fetch", async () => {
         await Promise.all([
           cachingSubsonic.getArtists(credentials),
