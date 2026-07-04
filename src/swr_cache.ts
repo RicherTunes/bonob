@@ -54,6 +54,13 @@ export class SwrCache {
     this.entries.delete(key);
   }
 
+  // Warm a key in the background without waiting on it: kick a fetch (which coalesces with
+  // any in-flight one and refreshes if stale) and swallow errors. Used to pre-warm a slow
+  // list (e.g. getArtists) on connect so the first browse of a session isn't cold.
+  warm<T>(key: string, fetch: () => Promise<T>): void {
+    void this.get(key, fetch).catch(() => {});
+  }
+
   get<T>(key: string, fetch: () => Promise<T>): Promise<T> {
     if (this.ttlMs <= 0) return fetch();
     const now = this.clock.now().valueOf();

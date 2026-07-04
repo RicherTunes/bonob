@@ -878,6 +878,15 @@ export class Subsonic {
       this.fetchArtists(credentials)
     );
 
+  // Pre-warm the artist list (the ~8s cold fetch behind both the Artists browse AND the album
+  // total) in the background, so the first browse of a session isn't cold. Called on login, so
+  // the warm has a head start before the user drills into a section. Safe to call often: the
+  // cache coalesces and only re-fetches when stale.
+  warmArtists = (credentials: Credentials): void =>
+    this.cache.warm(`artists:${credentials.username}`, () =>
+      this.fetchArtists(credentials)
+    );
+
       // todo: should be getArtistInfo2?
   getArtistInfo = (
     credentials: Credentials,
