@@ -62,7 +62,13 @@ export class SubsonicMusicService implements MusicService {
   refreshToken = (serviceToken: string) =>
     this.generateToken(parseToken(serviceToken));
 
-  login = async (token: string) => this.libraryFor(parseToken(token));
+  login = async (token: string) => {
+    const credentials = parseToken(token);
+    // Pre-warm the (slow, cold) artist list for this session in the background so the first
+    // browse of a section isn't cold. Fire-and-forget; the cache coalesces + refreshes lazily.
+    this.subsonic.warmArtists(credentials);
+    return this.libraryFor(credentials);
+  };
 
   private libraryFor = (
     credentials: Credentials

@@ -208,6 +208,29 @@ describe("SwrCache", () => {
     expect(await cache.get("k", fetch)).toBe("v");
   });
 
+  it("warm() kicks a background fetch that populates the cache without waiting", async () => {
+    const cache = new SwrCache(new FixedClock(at), 60_000);
+    const f = deferredFetcher<string>();
+    cache.warm("k", f.fetch); // returns void, does not block
+    expect(f.calls).toBe(1); // fetch kicked
+    f.resolve(0, "warmed");
+    await flush();
+    const got = await cache.get("k", f.fetch); // now a cache hit
+    expect(got).toBe("warmed");
+    expect(f.calls).toBe(1); // no extra fetch
+  });
+
+  it("warm() swallows fetch errors (no unhandled rejection)", async () => {
+    const cache = new SwrCache(new FixedClock(at), 60_000);
+    const f = deferredFetcher<string>();
+    cache.warm("k", f.fetch);
+    f.reject(0, new Error("warm failed"));
+    await flush(); // must not throw / leave an unhandled rejection
+    const got = cache.get("k", f.fetch); // evicted -> refetch
+    f.resolve(1, "ok");
+    expect(await got).toBe("ok");
+  });
+
   it("backstop: a hung fetch rejects after backstopMs (and frees the key)", async () => {
     jest.useFakeTimers();
     try {
