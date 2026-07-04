@@ -132,6 +132,7 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       }),
       albums: artist.albums,
       similarArtists: artistInfo.similarArtist,
+      biography: artistInfo.biography,
     }));
 
   albums = async (q: AlbumQuery): Promise<Result<AlbumSummary>> =>

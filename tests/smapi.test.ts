@@ -2748,6 +2748,36 @@ describe("wsdl api", () => {
                 });
               });
 
+              describe("artist biography", () => {
+                const artist = anArtist({
+                  biography: "an influential dance-punk band",
+                  similarArtists: [],
+                  albums: [],
+                });
+                beforeEach(() => {
+                  musicLibrary.artist.mockResolvedValue(artist);
+                });
+
+                it("getExtendedMetadata returns an ARTIST_BIO relatedText marker", async () => {
+                  const root = await ws.getExtendedMetadataAsync({
+                    id: `artist:${artist.id}`,
+                  });
+                  expect(root[0].getExtendedMetadataResult.relatedText).toEqual([
+                    { id: `artist:${artist.id}`, type: "ARTIST_BIO" },
+                  ]);
+                });
+
+                it("getExtendedMetadataText returns the biography for ARTIST_BIO", async () => {
+                  const root = await ws.getExtendedMetadataTextAsync({
+                    id: `artist:${artist.id}`,
+                    type: "ARTIST_BIO",
+                  });
+                  expect(root[0]).toEqual({
+                    getExtendedMetadataTextResult: "an influential dance-punk band",
+                  });
+                });
+              });
+
               describe("when none of the similar artists are in the library", () => {
                 const relatedArtist1 = anArtist();
                 const relatedArtist2 = anArtist();

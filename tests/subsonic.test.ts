@@ -1089,6 +1089,15 @@ describe("Subsonic", () => {
     describe("getArtistInfo", () => {
       // todo: what happens when the artist doesnt exist?
 
+      it("returns the biography", async () => {
+        const artist = anArtist({ biography: "an influential dance-punk band" });
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(ok(getArtistInfoJson(artist)))
+        );
+        const result = await subsonic.getArtistInfo(credentials, artist.id!);
+        expect(result.biography).toEqual("an influential dance-punk band");
+      });
+
       describe("when the artist exists", () => {
         describe("and has many similar artists", () => {
           const artist = anArtist({

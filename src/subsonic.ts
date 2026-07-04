@@ -892,6 +892,7 @@ export class Subsonic {
     credentials: Credentials,
     id: string
   ): Promise<{
+    biography: string | undefined;
     similarArtist: (ArtistSummary & { inLibrary: boolean })[];
     images: {
       s: string | undefined;
@@ -906,6 +907,7 @@ export class Subsonic {
     })
       .then((it) => it.artistInfo2)
       .then((it) => ({
+        biography: it.biography,
         images: {
           s: it.smallImageUrl,
           m: it.mediumImageUrl,
