@@ -713,6 +713,16 @@ export const asToken = (credentials: Credentials) =>
 export const parseToken = (token: string): Credentials =>
   JSON.parse(b64Decode(token));
 
+// Freeze a summary AND its immediate object-valued fields (the BUrn image / coverArt,
+// the Genre) so a shared cached entry can't be mutated in place by any caller.
+function deepFreezeSummary<T extends object>(o: T): T {
+  for (const v of Object.values(o)) {
+    if (v && typeof v === "object") Object.freeze(v);
+  }
+  Object.freeze(o);
+  return o;
+}
+
 export class Subsonic {
   url: URLBuilder;
   customPlayers: CustomPlayers;
@@ -841,8 +851,8 @@ export class Subsonic {
         // Deep-frozen: this array + its objects are shared across every cache hit and user,
         // so a caller mutating in place (sort/splice/decorate) would corrupt the cache.
         // Current callers treat it read-only (slice2 copies, getAlbumList2 reduces).
-        const mapped = artists.map((artist) => {
-          const summary = {
+        const mapped = artists.map((artist) =>
+          deepFreezeSummary({
             id: `${artist.id}`,
             name: artist.name,
             albumCount: artist.albumCount,
@@ -850,10 +860,8 @@ export class Subsonic {
               artistId: artist.id,
               artistImageURL: artist.artistImageUrl,
             }),
-          };
-          Object.freeze(summary);
-          return summary;
-        });
+          })
+        );
         Object.freeze(mapped);
         return mapped;
       });
@@ -993,21 +1001,40 @@ export class Subsonic {
       songs: it.searchResult3.song || [],
     }));
 
+  private fetchAlbumListPage = (
+    credentials: Credentials,
+    q: AlbumQuery
+  ): Promise<AlbumSummary[]> =>
+    this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
+      type: AlbumQueryTypeToSubsonicType[q.type],
+      ...(q.genre ? { genre: b64Decode(q.genre) } : {}),
+      ...(q.fromYear ? { fromYear: q.fromYear } : {}),
+      ...(q.toYear ? { toYear: q.toYear } : {}),
+      size: 500,
+      offset: q._index,
+    })
+      .then((response) => response.albumList2.album || [])
+      .then(this.toAlbumSummary)
+      .then((albums) => {
+        albums.forEach(deepFreezeSummary);
+        Object.freeze(albums);
+        return albums;
+      });
+
+  // Cache each album-list page too: like getArtists it is a large, multi-second fetch that
+  // Sonos re-requests on every browse page, and deep offsets get slower (Navidrome's SQLite
+  // OFFSET scan). Keyed per user + query so sections / pages / filters cache independently;
+  // SwrCache bounds and stale-while-revalidates them. The album TOTAL still comes from the
+  // (separately cached) getArtists sum, so it stays fresh independently of the page.
   getAlbumList2 = (credentials: Credentials, q: AlbumQuery) =>
     Promise.all([
       this.getArtists(credentials).then((it) =>
         _.inject(it, (total, artist) => total + artist.albumCount, 0)
       ),
-      this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
-        type: AlbumQueryTypeToSubsonicType[q.type],
-        ...(q.genre ? { genre: b64Decode(q.genre) } : {}),
-        ...(q.fromYear ? { fromYear: q.fromYear } : {}),
-        ...(q.toYear ? { toYear: q.toYear } : {}),
-        size: 500,
-        offset: q._index,
-      })
-        .then((response) => response.albumList2.album || [])
-        .then(this.toAlbumSummary),
+      this.cache.get(
+        `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
+        () => this.fetchAlbumListPage(credentials, q)
+      ),
     ]).then(([total, albums]) => ({
       results: albums.slice(0, q._count),
       total: albums.length == 500 ? total : q._index + albums.length,
