@@ -27,7 +27,8 @@ export type SimilarArtist = ArtistSummary & { inLibrary: boolean };
 // todo: maybe is should be artist.summary rather than an artist also being a summary?
 export type Artist = Pick<ArtistSummary, "id" | "name" | "image">  & {
   albums: AlbumSummary[];
-  similarArtists: SimilarArtist[]
+  similarArtists: SimilarArtist[];
+  biography?: string;
 };
 
 export type AlbumSummary = {

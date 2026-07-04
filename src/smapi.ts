@@ -695,9 +695,14 @@ function bindSmapiSoapServiceToExpress(
                           relatedBrowse: it
                             .similarArtists
                             .filter((it) => it.inLibrary)
-                            .length > 0 
-                            ? ([{ id: `relatedArtists:${it.id}`, type: "RELATED_ARTISTS" }]) 
-                            : []
+                            .length > 0
+                            ? ([{ id: `relatedArtists:${it.id}`, type: "RELATED_ARTISTS" }])
+                            : [],
+                          // A relatedText marker tells Sonos a bio exists; it then fetches the
+                          // body via getExtendedMetadataText(id, ARTIST_BIO).
+                          ...(it.biography
+                            ? { relatedText: [{ id: `artist:${it.id}`, type: "ARTIST_BIO" }] }
+                            : {}),
                         },
                       }));
                   case "track":
@@ -736,6 +741,27 @@ function bindSmapiSoapServiceToExpress(
                       getExtendedMetadataResult: {}                      
                     };
                 }
+              }),
+          getExtendedMetadataText: async (
+            { id, type: textType }: { id: string; type: string },
+            _,
+            soapyHeaders: SoapyHeaders,
+            { headers }: Pick<Request, "headers">
+          ) =>
+            login(findLoginToken(soapyHeaders, headers))
+              .then(withSplitId(id))
+              .then(async ({ musicLibrary, type, typeId }) => {
+                if (textType === "ARTIST_BIO" && type === "artist") {
+                  return musicLibrary
+                    .artist(typeId)
+                    .then((it) => ({
+                      getExtendedMetadataTextResult: it.biography || "",
+                    }));
+                }
+                logger.info(
+                  `Sonos requested extended metadata text for currently unsupported type=${textType}, id=${id}`
+                );
+                return { getExtendedMetadataTextResult: "" };
               }),
           getMetadata: async (
             {

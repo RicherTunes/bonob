@@ -240,6 +240,7 @@ export const getArtistInfoJson = (
   subsonicOK({
     artistInfo2: {
       ...images,
+      ...(artist.biography ? { biography: artist.biography } : {}),
       similarArtist: artist.similarArtists.map(asSimilarArtistJson),
     },
   });
