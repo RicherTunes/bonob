@@ -275,6 +275,19 @@ describe("SwrCache", () => {
     expect(f.calls).toBe(1);
   });
 
+  it("does not seed a persisted entry with a future or non-finite timestamp", async () => {
+    const store = {
+      load: () => [{ key: "future", at: at.valueOf() + 1_000_000, value: "future-val" }],
+      save: () => {},
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, { store });
+    const f = deferredFetcher<string>();
+    const p = cache.get("future", f.fetch); // future timestamp not seeded -> cold fetch
+    f.resolve(0, "fresh");
+    expect(await p).toBe("fresh");
+    expect(f.calls).toBe(1);
+  });
+
   it("applies revive() to seeded values (e.g. to re-freeze)", async () => {
     const store = {
       load: () => [{ key: "k", at: at.valueOf(), value: { x: 1 } }],

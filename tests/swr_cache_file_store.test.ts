@@ -50,4 +50,32 @@ describe("fileStore", () => {
   it("load() on an empty dir returns []", () => {
     expect(fileStore(dir).load()).toEqual([]);
   });
+
+  it("never reads a file larger than maxFileBytes (a huge/hostile file can't OOM startup)", () => {
+    fileStore(dir, { maxFileBytes: 200 }).save("small", 1, "v");
+    fs.writeFileSync(
+      path.join(dir, "huge.json"),
+      JSON.stringify({ key: "huge", at: 2, value: "x".repeat(1000) })
+    );
+    const loaded = fileStore(dir, { maxFileBytes: 200 }).load();
+    expect(loaded.map((e) => e.key)).toEqual(["small"]);
+  });
+
+  it("caps the directory to maxFiles on save (bounds disk)", () => {
+    const s = fileStore(dir, { maxFiles: 2 });
+    s.save("a", 1, "A");
+    s.save("b", 2, "B");
+    s.save("c", 3, "C");
+    s.save("d", 4, "D");
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+    expect(files.length).toBeLessThanOrEqual(2);
+  });
+
+  it("skips an entry with a missing/non-finite timestamp", () => {
+    fileStore(dir).save("good", 1, "v");
+    fs.writeFileSync(path.join(dir, "noat.json"), '{"key":"noat","value":"x"}');
+    fs.writeFileSync(path.join(dir, "nullat.json"), '{"key":"nullat","at":null,"value":"x"}');
+    const loaded = fileStore(dir).load();
+    expect(loaded.map((e) => e.key)).toEqual(["good"]);
+  });
 });

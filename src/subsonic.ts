@@ -704,6 +704,18 @@ const AlbumQueryTypeToSubsonicType: Record<AlbumQueryType, string> = {
   starred: "highest",
 };
 
+// Album sections whose contents change per request or with user activity - never cache these
+// (caching "random" makes it repeat for the whole TTL; recent/frequent/starred/favourited go
+// stale as soon as the user plays or stars something). Stable sections (alphabetical, byGenre,
+// byYear, recentlyAdded) are safe to cache - they only change on a library scan.
+const VOLATILE_ALBUM_TYPES: ReadonlySet<AlbumQueryType> = new Set([
+  "random",
+  "recentlyPlayed",
+  "mostPlayed",
+  "favourited",
+  "starred",
+]);
+
 const artistIsInLibrary = (artistId: string | undefined) =>
   artistId != undefined && artistId != "-1";
 
@@ -1042,10 +1054,15 @@ export class Subsonic {
       this.getArtists(credentials).then((it) =>
         _.inject(it, (total, artist) => total + artist.albumCount, 0)
       ),
-      this.cache.get(
-        `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
-        () => this.fetchAlbumListPage(credentials, q)
-      ),
+      // Volatile sections (random / recent / frequent / starred) are never cached; stable ones
+      // go through the SwrCache. Kept inside Promise.all so the getArtists request still fires
+      // before the album-page request (call order the tests + Navidrome expect).
+      VOLATILE_ALBUM_TYPES.has(q.type)
+        ? this.fetchAlbumListPage(credentials, q)
+        : this.cache.get(
+            `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
+            () => this.fetchAlbumListPage(credentials, q)
+          ),
     ]).then(([total, albums]) => ({
       results: albums.slice(0, q._count),
       total: albums.length == 500 ? total : q._index + albums.length,
