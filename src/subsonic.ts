@@ -26,6 +26,8 @@ import path from "path";
 import axios, { AxiosRequestConfig } from "axios";
 import { b64Encode, b64Decode } from "./b64";
 import { BUrn } from "./burn";
+import ms, { StringValue } from "ms";
+import { Clock, SystemClock } from "./clock";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
 
@@ -712,19 +714,37 @@ export const asToken = (credentials: Credentials) =>
 export const parseToken = (token: string): Credentials =>
   JSON.parse(b64Decode(token));
 
+// Cap the (cached) artist-list fetch so a hung Navidrome connection can't poison the
+// cache for the whole TTL. Generous vs the observed ~6s query; only guards against hangs.
+const ARTISTS_FETCH_TIMEOUT_MS = 30_000;
+
 export class Subsonic {
   url: URLBuilder;
   customPlayers: CustomPlayers;
   externalImageFetcher: ImageFetcher;
+  private clock: Clock;
+  private artistsCacheTTLms: number;
+  private artistsCache: Map<
+    string,
+    { at: number; value: Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> }
+  > = new Map();
 
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
-    externalImageFetcher: ImageFetcher = axiosImageFetcher
+    externalImageFetcher: ImageFetcher = axiosImageFetcher,
+    clock: Clock = SystemClock,
+    artistsCacheTTL: StringValue = "0s"
   ) {
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
+    this.clock = clock;
+    // Coerce an invalid duration (ms() returns undefined for garbage like "5min") to 0 so a
+    // mis-set BNB_SUBSONIC_ARTIST_CACHE_TTL disables the cache rather than silently breaking
+    // the TTL comparison (now - at < undefined is always false => fetch-every-call).
+    const ttlMs = ms(artistsCacheTTL);
+    this.artistsCacheTTLms = typeof ttlMs === "number" && ttlMs > 0 ? ttlMs : 0;
   }
 
   private get = async (
@@ -828,13 +848,13 @@ export class Subsonic {
       )
     );
 
-  getArtists = (
+  private fetchArtists = (
     credentials: Credentials
   ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> =>
     this.getJSON<GetArtistsResponse>(credentials, "/rest/getArtists")
       .then((it) => (it.artists.index || []).flatMap((it) => it.artist || []))
-      .then((artists) =>
-        artists.map((artist) => ({
+      .then((artists) => {
+        const mapped = artists.map((artist) => ({
           id: `${artist.id}`,
           name: artist.name,
           albumCount: artist.albumCount,
@@ -842,8 +862,50 @@ export class Subsonic {
             artistId: artist.id,
             artistImageURL: artist.artistImageUrl,
           }),
-        }))
-      );
+        }));
+        // Frozen: this array + its objects are shared across every cache hit and user, so a
+        // caller mutating in place (sort/splice/decorate) would corrupt the cache. Current
+        // callers already treat it read-only (slice2 copies, getAlbumList2 reduces).
+        Object.freeze(mapped);
+        return mapped;
+      });
+
+  // The full artist list is large (10MB+ / multi-second query on big libraries) and
+  // bonob re-fetches it on every Sonos browse page. Cache it with a short TTL and
+  // coalesce concurrent fetches so pagination doesn't repeatedly hammer Navidrome.
+  // Disabled when the TTL is <= 0 (the class default), preserving un-cached behaviour.
+  getArtists = (
+    credentials: Credentials
+  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> => {
+    if (this.artistsCacheTTLms <= 0) return this.fetchArtists(credentials);
+    const key = credentials.username;
+    const now = this.clock.now().valueOf();
+    const cached = this.artistsCache.get(key);
+    if (cached && now - cached.at < this.artistsCacheTTLms) {
+      return cached.value;
+    }
+    // Bound the fetch with a timeout: because the result is cached + coalesced, a hung
+    // connection would otherwise sit in the cache for the whole TTL and every browse in the
+    // household would coalesce onto a request that never completes. On timeout it rejects,
+    // the eviction below fires, and the next browse retries.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const value = Promise.race([
+      this.fetchArtists(credentials),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("getArtists timed out")),
+          ARTISTS_FETCH_TIMEOUT_MS
+        );
+      }),
+    ]).finally(() => clearTimeout(timer));
+    this.artistsCache.set(key, { at: now, value });
+    // Never cache a rejected/timed-out fetch: evict on failure so the next call retries.
+    value.catch(() => {
+      const current = this.artistsCache.get(key);
+      if (current && current.value === value) this.artistsCache.delete(key);
+    });
+    return value;
+  };
 
       // todo: should be getArtistInfo2?
   getArtistInfo = (

@@ -45,7 +45,9 @@ const subsonic = new SubsonicMusicService(
   new Subsonic(
     config.subsonic.url,
     customPlayers,
-    artistImageFetcher
+    artistImageFetcher,
+    clock,
+    config.subsonic.artistCacheTTL
   ),
   customPlayers,
   config.subsonic.transcode

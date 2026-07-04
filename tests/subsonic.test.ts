@@ -36,6 +36,7 @@ import {
   CustomPlayers,
   NO_CUSTOM_PLAYERS,
   Subsonic,
+  axiosImageFetcher,
   asGenre,
   PingResponse,
   OpenSubsonicExtension,
@@ -46,6 +47,8 @@ import {
 import { getArtistJson, getArtistInfoJson, asArtistsJson } from "./subsonic_music_library.test";
 
 import { b64Encode } from "../src/b64";
+import dayjs from "dayjs";
+import { FixedClock } from "../src/clock";
 
 import { Album, Artist, Track, AlbumSummary, AuthFailure } from "../src/music_library";
 import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
@@ -824,6 +827,96 @@ describe("Subsonic", () => {
         const artists = await subsonic.getArtists(credentials);
 
         expect(artists).toEqual([]);
+      });
+    });
+
+    describe("caching (artistsCacheTTL > 0)", () => {
+      const cached = [anArtist({ name: "A Artist", albums: [anAlbum()] })];
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      let cachingSubsonic: Subsonic;
+
+      beforeEach(() => {
+        clock.time = dayjs("2024-01-01T00:00:00Z");
+        cachingSubsonic = new Subsonic(url, customPlayers, axiosImageFetcher, clock, "5m");
+        mockGET.mockImplementation(() => Promise.resolve(ok(asArtistsJson(cached))));
+      });
+
+      it("fetches once and serves later calls from cache within the TTL", async () => {
+        const first = await cachingSubsonic.getArtists(credentials);
+        const second = await cachingSubsonic.getArtists(credentials);
+
+        expect(second).toEqual(first);
+        expect(mockGET).toHaveBeenCalledTimes(1);
+      });
+
+      it("re-fetches once the TTL has elapsed", async () => {
+        await cachingSubsonic.getArtists(credentials);
+        clock.add(6, "m");
+        await cachingSubsonic.getArtists(credentials);
+
+        expect(mockGET).toHaveBeenCalledTimes(2);
+      });
+
+      it("coalesces concurrent calls into a single fetch", async () => {
+        await Promise.all([
+          cachingSubsonic.getArtists(credentials),
+          cachingSubsonic.getArtists(credentials),
+          cachingSubsonic.getArtists(credentials),
+        ]);
+
+        expect(mockGET).toHaveBeenCalledTimes(1);
+      });
+
+      it("evicts a failed fetch so the next call retries (no poisoned cache)", async () => {
+        mockGET.mockImplementationOnce(() => Promise.reject(new Error("boom")));
+
+        await expect(cachingSubsonic.getArtists(credentials)).rejects.toBeDefined();
+        const second = await cachingSubsonic.getArtists(credentials);
+
+        expect(second).toHaveLength(cached.length);
+        expect(mockGET).toHaveBeenCalledTimes(2);
+      });
+
+      it("times out and evicts a hung fetch so browses don't coalesce onto it forever", async () => {
+        jest.useFakeTimers();
+        try {
+          mockGET.mockImplementation(() => new Promise(() => {})); // never resolves (hang)
+          const hung = cachingSubsonic.getArtists(credentials);
+          const rejection = expect(hung).rejects.toThrow(/timed out/);
+          jest.advanceTimersByTime(30001);
+          await rejection;
+
+          // the hung entry is evicted, so a fresh call retries instead of coalescing onto it
+          mockGET.mockImplementation(() =>
+            Promise.resolve(ok(asArtistsJson(cached)))
+          );
+          const retry = await cachingSubsonic.getArtists(credentials);
+          expect(retry).toHaveLength(cached.length);
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it("returns a frozen list so a caller cannot corrupt the shared cache", async () => {
+        const result = await cachingSubsonic.getArtists(credentials);
+
+        expect(Object.isFrozen(result)).toBe(true);
+      });
+
+      it("disables caching when the configured TTL is invalid (fetches every call)", async () => {
+        const off = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          clock,
+          "notaduration" as any
+        );
+        mockGET.mockImplementation(() => Promise.resolve(ok(asArtistsJson(cached))));
+
+        await off.getArtists(credentials);
+        await off.getArtists(credentials);
+
+        expect(mockGET).toHaveBeenCalledTimes(2);
       });
     });
 
