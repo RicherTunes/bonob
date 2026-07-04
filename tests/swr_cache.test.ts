@@ -231,6 +231,75 @@ describe("SwrCache", () => {
     expect(await got).toBe("ok");
   });
 
+  it("seeds from a store on construction so a restart serves without a fetch", async () => {
+    const store = {
+      load: () => [{ key: "artists:sonos", at: at.valueOf(), value: ["a", "b"] }],
+      save: () => {},
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, { store });
+    const f = deferredFetcher<string[]>();
+    const got = await cache.get("artists:sonos", f.fetch);
+    expect(got).toEqual(["a", "b"]); // from the seeded store
+    expect(f.calls).toBe(0); // no fetch needed
+  });
+
+  it("persists each resolved value to the store", async () => {
+    const saved: Array<{ key: string; at: number; value: unknown }> = [];
+    const store = {
+      load: () => [],
+      save: (key: string, at2: number, value: unknown) =>
+        saved.push({ key, at: at2, value }),
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, { store });
+    const f = deferredFetcher<string>();
+    const p = cache.get("k", f.fetch);
+    f.resolve(0, "v");
+    await p;
+    await flush();
+    expect(saved).toContainEqual({ key: "k", at: at.valueOf(), value: "v" });
+  });
+
+  it("does not seed a persisted entry older than maxStale", async () => {
+    const store = {
+      load: () => [{ key: "k", at: at.valueOf() - 100 * 60_000, value: "ancient" }],
+      save: () => {},
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, {
+      maxStaleMs: 5 * 60_000,
+      store,
+    });
+    const f = deferredFetcher<string>();
+    const p = cache.get("k", f.fetch); // seed too old -> cold fetch
+    f.resolve(0, "fresh");
+    expect(await p).toBe("fresh");
+    expect(f.calls).toBe(1);
+  });
+
+  it("applies revive() to seeded values (e.g. to re-freeze)", async () => {
+    const store = {
+      load: () => [{ key: "k", at: at.valueOf(), value: { x: 1 } }],
+      save: () => {},
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, {
+      store,
+      revive: (v) => Object.freeze(v as object),
+    });
+    const got = await cache.get("k", async () => ({ x: 999 }));
+    expect(Object.isFrozen(got)).toBe(true);
+  });
+
+  it("does not seed from a store when disabled (ttl<=0)", async () => {
+    const store = {
+      load: () => [{ key: "k", at: at.valueOf(), value: "seeded" }],
+      save: () => {},
+    };
+    const cache = new SwrCache(new FixedClock(at), 0, { store });
+    const f = deferredFetcher<string>();
+    const p = cache.get("k", f.fetch); // disabled -> always fetch
+    f.resolve(0, "fetched");
+    expect(await p).toBe("fetched");
+  });
+
   it("backstop: a hung fetch rejects after backstopMs (and frees the key)", async () => {
     jest.useFakeTimers();
     try {

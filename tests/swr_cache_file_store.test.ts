@@ -1,0 +1,53 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { fileStore } from "../src/swr_cache_file_store";
+
+describe("fileStore", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "swrstore-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("round-trips values across a restart (save, then a fresh store loads)", () => {
+    const s1 = fileStore(dir);
+    s1.save("artists:sonos", 1000, [{ id: "1", name: "A" }]);
+    s1.save("albumPage:sonos:x:0", 2000, [{ id: "a" }]);
+    const loaded = fileStore(dir).load();
+    expect(loaded).toContainEqual({
+      key: "artists:sonos",
+      at: 1000,
+      value: [{ id: "1", name: "A" }],
+    });
+    expect(loaded).toContainEqual({
+      key: "albumPage:sonos:x:0",
+      at: 2000,
+      value: [{ id: "a" }],
+    });
+  });
+
+  it("overwrites the same key so the latest value wins", () => {
+    const s = fileStore(dir);
+    s.save("k", 1, "old");
+    s.save("k", 2, "new");
+    const loaded = fileStore(dir).load();
+    expect(loaded.filter((e) => e.key === "k")).toEqual([
+      { key: "k", at: 2, value: "new" },
+    ]);
+  });
+
+  it("load() skips a corrupt file instead of throwing", () => {
+    const s = fileStore(dir);
+    s.save("good", 1, "v");
+    fs.writeFileSync(path.join(dir, "corrupt.json"), "{ not json");
+    const loaded = fileStore(dir).load();
+    expect(loaded).toEqual([{ key: "good", at: 1, value: "v" }]);
+  });
+
+  it("load() on an empty dir returns []", () => {
+    expect(fileStore(dir).load()).toEqual([]);
+  });
+});

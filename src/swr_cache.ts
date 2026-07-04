@@ -7,6 +7,14 @@ type Entry = {
   settled: boolean; // has a fetch ever successfully resolved a value for this entry?
 };
 
+// A durable backing store so the cache can survive process restarts (e.g. a bonob
+// redeploy): load() seeds the cache on construction, save() persists each resolved
+// value. Values are whatever the fetcher returns and must be JSON-serializable.
+export interface SwrCacheStore {
+  load(): Array<{ key: string; at: number; value: unknown }>;
+  save(key: string, at: number, value: unknown): void;
+}
+
 /**
  * A small stale-while-revalidate async cache with request coalescing, a bounded
  * size (LRU) and a hard stale cap. Built for bonob's large browse lists (e.g.
@@ -31,15 +39,51 @@ export class SwrCache {
   private readonly maxEntries: number;
   private readonly maxStaleMs: number;
   private readonly backstopMs: number;
+  private readonly store?: SwrCacheStore;
+  private readonly revive: (v: unknown) => unknown;
 
   constructor(
     private readonly clock: Clock,
     private readonly ttlMs: number,
-    opts: { maxEntries?: number; maxStaleMs?: number; backstopMs?: number } = {}
+    opts: {
+      maxEntries?: number;
+      maxStaleMs?: number;
+      backstopMs?: number;
+      store?: SwrCacheStore;
+      revive?: (v: unknown) => unknown;
+    } = {}
   ) {
     this.maxEntries = opts.maxEntries ?? 50;
     this.maxStaleMs = opts.maxStaleMs ?? 4 * Math.max(ttlMs, 0);
     this.backstopMs = opts.backstopMs ?? 60_000;
+    this.store = opts.store;
+    this.revive = opts.revive ?? ((v) => v);
+    // Restore a persisted cache on startup so the first browse after a restart isn't cold.
+    if (this.store && ttlMs > 0) {
+      for (const e of this.store.load()) this.seed(e.key, this.revive(e.value), e.at);
+    }
+  }
+
+  // Insert a resolved, settled entry (restores a persisted value on startup). Skips anything
+  // already past the stale cap, so a long downtime never seeds ancient data.
+  private seed(key: string, value: unknown, at: number): void {
+    if (this.clock.now().valueOf() - at >= this.maxStaleMs) return;
+    this.entries.set(key, {
+      at,
+      value: Promise.resolve(value),
+      inFlight: false,
+      settled: true,
+    });
+    this.evictOverCap();
+  }
+
+  private persist(key: string, at: number, value: unknown): void {
+    if (!this.store) return;
+    try {
+      this.store.save(key, at, value);
+    } catch {
+      // best-effort durability; a failed write must never break serving
+    }
   }
 
   static disabled(clock: Clock = SystemClock): SwrCache {
@@ -107,10 +151,11 @@ export class SwrCache {
     this.entries.set(key, entry);
     this.evictOverCap();
     value
-      .then(() => {
+      .then((v) => {
         entry.at = this.clock.now().valueOf(); // stamp completion, not start
         entry.inFlight = false;
         entry.settled = true;
+        this.persist(key, entry.at, v);
       })
       .catch(() => {
         if (this.entries.get(key) === entry) this.entries.delete(key);
@@ -124,12 +169,14 @@ export class SwrCache {
         // Only replace if the stale entry is still current — an LRU eviction or an
         // invalidate() in the meantime must not be resurrected by a late refresh.
         if (this.entries.get(key) === stale) {
+          const at = this.clock.now().valueOf();
           this.entries.set(key, {
-            at: this.clock.now().valueOf(),
+            at,
             value: Promise.resolve(v),
             inFlight: false,
             settled: true,
           });
+          this.persist(key, at, v);
         }
       })
       .catch(() => {
