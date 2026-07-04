@@ -91,6 +91,39 @@ BNB_SONOS_SERVICE_NAME | bonob | S1 service name for Sonos, doesn't seem to appl
 BNB_SONOS_SERVICE_ID | 246 | service id for Sonos
 BNB_SONOS_AUTO_REGISTER | false | Whether or not to try and auto-register with S1 devices on startup.  **For S2 ensure that this is false.**
 
+## Browse list caching
+
+On large libraries some Subsonic browse responses are big and slow: `getArtists` on a
+23k-artist / 800k-track library is ~10MB and several seconds, and Sonos re-fetches the full
+list on **every** browse page (bonob also derives the album-list total from it). A cold fetch
+on the browse path exceeds Sonos's SMAPI timeout, so the browse fails with "something went
+wrong".
+
+bonob caches these heavy browse lists in a small in-process **stale-while-revalidate** cache
+(`src/swr_cache.ts`):
+
+- **Serve-stale + background refresh** — once warm, every browse is answered instantly and
+  refreshed in the background, so no browse waits on the slow fetch.
+- **Request coalescing** — concurrent misses for the same key share one upstream fetch.
+- **Bounded** — an LRU cap (`maxEntries`) plus a hard stale cap (`maxStaleMs`, default 4×TTL)
+  bound both memory and how long a stale/revoked value can be served.
+- **Per-user keys** — keyed by username, so per-user library ACLs are respected.
+
+Cached: the artist list (`getArtists`) and each album-list page (`getAlbumList2`, keyed per
+query: type/offset/genre/year). Mutable resources (e.g. playlists) are never cached. Cached
+values are deep-frozen so a shared entry can't be mutated in place.
+
+**Warm on connect** — on login bonob kicks a background fetch of the artist list, so the first
+browse of a session isn't cold.
+
+**Persistence (optional)** — set `BNB_SUBSONIC_CACHE_DIR` to a writable, volume-mapped
+directory and the cache is written to disk and **reloaded on startup**, so the first browse
+after a restart/redeploy is served from disk instead of a cold multi-second fetch (entries
+older than the stale cap are skipped). Without it the cache is in-memory only, rebuilt on the
+first browse after each restart.
+
+Tuning: `BNB_SUBSONIC_CACHE_TTL` (default `5m`; `0s` disables) and `BNB_SUBSONIC_CACHE_DIR`.
+
 ## Transcoding
 
 ### Automatic (OpenSubsonic Transcoding extension)
