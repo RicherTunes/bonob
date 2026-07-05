@@ -54,9 +54,15 @@ export function albumBucketKey(
       break;
     }
   }
-  const c = t.charAt(0).toUpperCase();
-  return c >= "A" && c <= "Z" ? c : "#";
+  // Test the (folded, lowercased) first char directly so the key is always a single A-Z letter or
+  // "#". Uppercasing first would turn e.g. German "ß" into the two-char "SS".
+  const first = t.charAt(0);
+  return first >= "a" && first <= "z" ? first.toUpperCase() : "#";
 }
+
+// Order bucket keys for the A-Z menu: "#" first, then A..Z.
+const compareBucketKeys = (a: string, b: string): number =>
+  a === b ? 0 : a === "#" ? -1 : b === "#" ? 1 : a < b ? -1 : 1;
 
 // Reduce the scanned album pages (in alphabeticalByName order) into contiguous runs. Pure so it
 // can be unit-tested without the Subsonic client. A new run starts whenever the bucket key changes
@@ -82,7 +88,9 @@ export function buildAlbumIndexFromPages(
   return { total: offset, buckets };
 }
 
-// The distinct letters to show in the Albums A-Z menu, each once, in first-appearance order.
+// The distinct letters to show in the Albums A-Z menu, each once, ordered "#" then A..Z. The
+// underlying runs are scattered by Navidrome's collation, but the menu always reads in order (each
+// letter's leaf still gathers all of its runs).
 export function albumIndexLetters(
   index: AlbumIndex
 ): { key: string; label: string }[] {
@@ -94,7 +102,7 @@ export function albumIndexLetters(
       letters.push({ key: b.key, label: b.label });
     }
   }
-  return letters;
+  return letters.sort((a, b) => compareBucketKeys(a.key, b.key));
 }
 
 // Every contiguous range that belongs to a letter (usually one, occasionally more for stray

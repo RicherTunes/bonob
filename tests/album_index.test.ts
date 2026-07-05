@@ -40,6 +40,12 @@ describe("albumBucketKey", () => {
     expect(albumBucketKey("")).toEqual("#");
   });
 
+  it("always returns a single-character key (German ß does not become 'SS')", () => {
+    const key = albumBucketKey("ßeta");
+    expect(key).toEqual("#");
+    expect(key.length).toEqual(1);
+  });
+
   it("exposes Navidrome's default article list", () => {
     expect(DEFAULT_IGNORED_ARTICLES).toEqual(
       expect.arrayContaining(["the", "a", "o", "os", "as", "los", "las"])
@@ -87,13 +93,16 @@ describe("buildAlbumIndexFromPages (contiguous runs)", () => {
 });
 
 describe("albumIndexLetters", () => {
-  it("returns each letter once, in first-appearance order", () => {
+  it("returns each letter once, ordered '#' then A..Z, regardless of scattered run order", () => {
     const idx = buildAlbumIndexFromPages([
-      names("Apple", "Banana", "Apex"), // runs: A, B, A
+      // runs (Navidrome's scattered order): C, A, 9(->#), B, A
+      names("Cherry", "Apple", "9 to 5", "Banana", "Apex"),
     ]);
     expect(albumIndexLetters(idx)).toEqual([
+      { key: "#", label: "#" },
       { key: "A", label: "A" },
       { key: "B", label: "B" },
+      { key: "C", label: "C" },
     ]);
   });
 });
