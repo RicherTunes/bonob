@@ -27,6 +27,7 @@ import {
   isValidImage,
   isSafeExternalImageUrl,
   resolvedExternalHostIsSafe,
+  pinnedSafeExternalLookup,
   t,
   DODGY_IMAGE_NAME,
   asURLSearchParams,
@@ -128,6 +129,21 @@ describe("isSafeExternalImageUrl (SSRF guard for server-fetched external art)", 
       expect(isSafeExternalImageUrl(url)).toBe(false);
     }
   });
+
+  it("blocks NAT64-embedded IPv4 literals (64:ff9b::/96)", () => {
+    for (const url of [
+      "http://[64:ff9b::a9fe:a9fe]/meta",
+      "http://[64:ff9b::7f00:1]/a.jpg",
+    ]) {
+      expect(isSafeExternalImageUrl(url)).toBe(false);
+    }
+  });
+
+  it("still allows a normal public IPv6 host", () => {
+    expect(isSafeExternalImageUrl("http://[2606:4700:4700::1111]/a.jpg")).toBe(
+      true
+    );
+  });
 });
 
 describe("resolvedExternalHostIsSafe (DNS-resolution SSRF guard)", () => {
@@ -161,6 +177,72 @@ describe("resolvedExternalHostIsSafe (DNS-resolution SSRF guard)", () => {
     expect(
       await resolvedExternalHostIsSafe("https://mixed.example.com/a.jpg")
     ).toBe(false);
+  });
+});
+
+describe("pinnedSafeExternalLookup (TOCTOU-safe pinned resolver for external art)", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("returns the resolved address for a public host", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }] as any);
+    await expect(
+      pinnedSafeExternalLookup("images.example.com")
+    ).resolves.toEqual({ address: "93.184.216.34", family: 4 });
+  });
+
+  it("rejects when the host resolves to a private/metadata address", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "169.254.169.254", family: 4 }] as any);
+    await expect(
+      pinnedSafeExternalLookup("metadata.rebind.example")
+    ).rejects.toThrow(/169\.254\.169\.254/);
+  });
+
+  it("rejects if ANY resolved address is unsafe", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockResolvedValue([
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ] as any);
+    await expect(pinnedSafeExternalLookup("mixed.example")).rejects.toThrow(
+      /127\.0\.0\.1/
+    );
+  });
+
+  it("returns all validated addresses when opt.all is set", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockResolvedValue([
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:4700:4700::1111", family: 6 },
+    ] as any);
+    await expect(
+      pinnedSafeExternalLookup("images.example.com", { all: true })
+    ).resolves.toEqual([
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:4700:4700::1111", family: 6 },
+    ]);
+  });
+
+  it("is actually invoked by axios (promise-style lookup is bound, not a dead hook)", async () => {
+    const realAxios = jest.requireActual("axios").default;
+    const spy = jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as any);
+    await realAxios
+      .get("http://pinned.invalid/a.jpg", {
+        lookup: pinnedSafeExternalLookup,
+        timeout: 3000,
+        maxRedirects: 0,
+      })
+      .catch(() => undefined);
+    // If axios ignored the custom lookup it would resolve "pinned.invalid" via Node's callback
+    // dns.lookup, never touching dnsPromises.lookup - so being called proves the promise-style hook
+    // is bound and used for the socket's own resolution (closing the rebind TOCTOU).
+    expect(spy).toHaveBeenCalledWith(
+      "pinned.invalid",
+      expect.objectContaining({ all: true })
+    );
   });
 });
 
