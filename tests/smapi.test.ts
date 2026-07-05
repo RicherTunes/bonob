@@ -2352,6 +2352,61 @@ describe("wsdl api", () => {
                     _count: 2,
                   });
                 });
+
+                it("pages across a letter split into non-contiguous ranges", async () => {
+                  // "P" appears in two contiguous runs (a stray title sorts between them). The
+                  // leaf must page across both and advertise only P's combined total.
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 100,
+                      buckets: [
+                        { key: "P", label: "P", offset: 0, count: 2 },
+                        { key: "Q", label: "Q", offset: 2, count: 8 },
+                        { key: "P", label: "P", offset: 10, count: 3 },
+                      ],
+                    })
+                  );
+                  musicLibrary.albums
+                    .mockResolvedValueOnce({ results: [pop2], total: 100 })
+                    .mockResolvedValueOnce({ results: [pop3, pop4], total: 100 });
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsByLetter:P",
+                    index: 1,
+                    count: 3,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: [pop2, pop3, pop4].map((it) => ({
+                        itemType: "album",
+                        id: `album:${it.id}`,
+                        title: it.name,
+                        albumArtURI: coverArtURI(
+                          bonobUrlWithAccessToken,
+                          it
+                        ).href(),
+                        canPlay: true,
+                        artistId: `artist:${it.artistId}`,
+                        artist: it.artistName,
+                      })),
+                      index: 1,
+                      total: 5, // 2 + 3 across both P ranges, never the global 100
+                    })
+                  );
+                  // window (index 1, count 3): 1 from the first run at offset 1, 2 from the
+                  // second run at offset 10
+                  expect(musicLibrary.albums).toHaveBeenNthCalledWith(1, {
+                    type: "alphabeticalByName",
+                    _index: 1,
+                    _count: 1,
+                  });
+                  expect(musicLibrary.albums).toHaveBeenNthCalledWith(2, {
+                    type: "alphabeticalByName",
+                    _index: 10,
+                    _count: 2,
+                  });
+                });
               });
 
               describe("asking for all albums for a genre", () => {
