@@ -9,13 +9,32 @@ import makeServer, {
   BONOB_ACCESS_TOKEN_HEADER,
   RangeBytesFromFilter,
   rangeFilterFor,
+  redactAccessTokenFromUrl,
 } from "../src/server";
+
+describe("redactAccessTokenFromUrl", () => {
+  it("masks the bat access token so it cannot leak through request logs", () => {
+    const redacted = redactAccessTokenFromUrl(
+      "/art/some-burn/size/180?bat=SUPERSECRETTOKEN"
+    );
+    expect(redacted).toContain(`${BONOB_ACCESS_TOKEN_HEADER}=*****`);
+    expect(redacted).not.toContain("SUPERSECRETTOKEN");
+  });
+
+  it("leaves urls without a bat token unchanged", () => {
+    expect(redactAccessTokenFromUrl("/ws/sonos")).toEqual("/ws/sonos");
+  });
+
+  it("handles an undefined url", () => {
+    expect(redactAccessTokenFromUrl(undefined)).toEqual("");
+  });
+});
 
 import { Device, Sonos, SONOS_DISABLED } from "../src/sonos";
 
 import { aDevice, aService, aTrack } from "./builders";
 import { InMemoryMusicService } from "./in_memory_music_service";
-import { APITokens, InMemoryAPITokens } from "../src/api_tokens";
+import { APITokens, InMemoryAPITokens, scopedApiTokenPayload } from "../src/api_tokens";
 import { InMemoryLinkCodes, LinkCodes } from "../src/link_codes";
 import { Response } from "express";
 import { Transform } from "stream";
@@ -898,6 +917,20 @@ describe("server", () => {
           };
           return self;
         };
+
+        it("rejects an art-scoped token on the stream route (bat scope enforcement)", async () => {
+          const artApiToken = apiTokens.mint(
+            scopedApiTokenPayload("art", serviceToken)
+          );
+          musicService.login.mockResolvedValue(musicLibrary);
+
+          const res = await request(server)
+            .get(bonobUrl.append({ pathname: `/stream/track/${trackId}` }).path())
+            .set("authorization", artApiToken);
+
+          expect(res.status).toEqual(401);
+          expect(musicService.login).not.toHaveBeenCalled();
+        });
 
         describe("HEAD requests", () => {
           describe("when there is no Bearer token", () => {

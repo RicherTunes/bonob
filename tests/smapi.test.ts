@@ -2726,6 +2726,56 @@ describe("wsdl api", () => {
                     })
                   );
                 });
+
+                it("pages oversized-letter chunk containers", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 700000,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 700000 }],
+                      items: new Array(700000),
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsByLetter:P",
+                    index: 30,
+                    count: 30,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.index).toEqual(30);
+                  expect(md.total).toEqual(35); // ceil(700000 / 20000)
+                  expect(md.mediaCollection.map((c: any) => c.id)).toEqual([
+                    "albumsChunk:P_30",
+                    "albumsChunk:P_31",
+                    "albumsChunk:P_32",
+                    "albumsChunk:P_33",
+                    "albumsChunk:P_34",
+                  ]);
+                });
+
+                it("returns an empty finite result for malformed chunk ids", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 25000,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 25000 }],
+                      items: new Array(25000),
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsChunk:P_bad",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(Number.isFinite(md.total)).toBe(true);
+                  expect(md.total).toEqual(0);
+                  expect(md.count).toEqual(0);
+                  // an empty mediaCollection collapses to undefined over the SOAP round-trip
+                  expect(md.mediaCollection ?? []).toEqual([]);
+                });
               });
 
               describe("asking for all albums for a genre", () => {

@@ -2,7 +2,13 @@ import { option as O, taskEither as TE } from "fp-ts";
 import * as A from "fp-ts/Array";
 import { ordString } from "fp-ts/lib/Ord";
 import { pipe } from "fp-ts/lib/function";
-import { createHash } from "crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+} from "crypto";
+import { isIP } from "net";
 import { generateRandomString } from "./random";
 import {
   Credentials,
@@ -39,6 +45,14 @@ export const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0",
 };
 
+export const SUBSONIC_HTTP_TIMEOUT_MS = 30_000;
+
+// Bound hung upstreams process-wide: a Subsonic request that never responds is aborted by axios
+// after SUBSONIC_HTTP_TIMEOUT_MS instead of tying up a socket and stacking retries behind the
+// SwrCache backstop. Applied as a default (not per-call) so it stays out of the request config
+// the tests assert on; the image fetchers set their own shorter timeout which overrides this.
+if (axios.defaults) axios.defaults.timeout = SUBSONIC_HTTP_TIMEOUT_MS;
+
 export const t = (password: string, s: string) =>
   createHash("md5").update(`${password}${s}`).digest("hex");
 
@@ -50,7 +64,82 @@ export const t_and_s = (password: string) => {
   };
 };
 
+export const ALBUM_INDEX_CACHE_MAX_ENTRIES = 2;
+
 export const DODGY_IMAGE_NAME = "2a96cbd8b46e442fc41c2b86b821562f.png";
+
+const stripIPv6Brackets = (host: string) => host.replace(/^\[|\]$/g, "");
+
+const isPrivateIPv4 = (host: string): boolean => {
+  const parts = host.split(".").map((part) => Number(part));
+  if (
+    parts.length !== 4 ||
+    parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+  ) {
+    return true;
+  }
+  const a = parts[0]!;
+  const b = parts[1]!;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    a >= 224
+  );
+};
+
+const isPrivateIPv6 = (host: string): boolean => {
+  const h = host.toLowerCase();
+  if (h === "::" || h === "::1") return true;
+  if (h.startsWith("::ffff:")) {
+    const mapped = h.slice("::ffff:".length);
+    if (isIP(mapped) === 4) return isPrivateIPv4(mapped);
+  }
+  const first = Number.parseInt(h.split(":")[0] || "0", 16);
+  if (!Number.isFinite(first)) return true;
+  return (
+    (first & 0xfe00) === 0xfc00 ||
+    (first & 0xffc0) === 0xfe80 ||
+    (first & 0xff00) === 0xff00
+  );
+};
+
+const isUnsafeExternalImageHost = (host: string): boolean => {
+  const normalized = stripIPv6Brackets(host).toLowerCase();
+  if (
+    normalized === "localhost" ||
+    normalized.endsWith(".localhost") ||
+    normalized === "metadata.google.internal"
+  ) {
+    return true;
+  }
+  const ipKind = isIP(normalized);
+  if (ipKind === 4) return isPrivateIPv4(normalized);
+  if (ipKind === 6) return isPrivateIPv6(normalized);
+  return false;
+};
+
+// Generic external art is server-fetched from third-party (Subsonic/Last.fm) metadata, so a
+// compromised backend could point it at an internal address. Enforced at fetch time in /art:
+// allow only http(s) and reject loopback/link-local/private/metadata hosts. (http is permitted
+// because real backends still serve some art over http; the SSRF risk is the host, not the
+// scheme. Deezer has its own stricter *.dzcdn.net https allowlist.)
+export function isSafeExternalImageUrl(url: unknown): url is string {
+  if (typeof url !== "string") return false;
+  try {
+    const parsed = new URL(url);
+    return (
+      (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+      !isUnsafeExternalImageHost(parsed.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
 
 export const isValidImage = (url: string | undefined) =>
   url != undefined && !url.endsWith(DODGY_IMAGE_NAME);
@@ -707,7 +796,10 @@ const imageFetcherWith =
       }))
       .catch(() => undefined);
 
-export const axiosImageFetcher = imageFetcherWith({});
+// Generic external art is server-fetched from third-party metadata: refuse redirects so a
+// safe-looking URL cannot 30x to an internal address. The URL is also validated at sign time and
+// again in the /art route via isSafeExternalImageUrl.
+export const axiosImageFetcher = imageFetcherWith({ maxRedirects: 0 });
 
 // Deezer art must NOT follow redirects: the SSRF allowlist only validates the initial *.dzcdn.net
 // URL, so a manipulated/compromised response that 30x-es to an internal address would otherwise be
@@ -742,11 +834,77 @@ const VOLATILE_ALBUM_TYPES: ReadonlySet<AlbumQueryType> = new Set([
 const artistIsInLibrary = (artistId: string | undefined) =>
   artistId != undefined && artistId != "-1";
 
-export const asToken = (credentials: Credentials) =>
-  b64Encode(JSON.stringify(credentials));
+const SERVICE_TOKEN_PREFIX = "enc:";
+const SERVICE_TOKEN_ALGORITHM = "aes-256-gcm";
 
-export const parseToken = (token: string): Credentials =>
-  JSON.parse(b64Decode(token));
+type EncryptedServiceToken = {
+  v: 1;
+  iv: string;
+  tag: string;
+  ciphertext: string;
+};
+
+const serviceTokenKey = () =>
+  createHash("sha256")
+    .update(`bonob:subsonic-service-token:${process.env["BNB_SECRET"] || ""}`)
+    .digest();
+
+const encryptedServiceToken = (credentials: Credentials): string => {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv(SERVICE_TOKEN_ALGORITHM, serviceTokenKey(), iv);
+  const ciphertext = Buffer.concat([
+    cipher.update(JSON.stringify(credentials), "utf8"),
+    cipher.final(),
+  ]);
+  const encrypted: EncryptedServiceToken = {
+    v: 1,
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  };
+  return `${SERVICE_TOKEN_PREFIX}${b64Encode(JSON.stringify(encrypted))}`;
+};
+
+const parseEncryptedServiceToken = (token: string): Credentials => {
+  if (!token.startsWith(SERVICE_TOKEN_PREFIX)) {
+    throw new Error("Not an encrypted service token");
+  }
+  const parsed = JSON.parse(
+    b64Decode(token.slice(SERVICE_TOKEN_PREFIX.length))
+  ) as Partial<EncryptedServiceToken>;
+  if (
+    parsed.v !== 1 ||
+    typeof parsed.iv !== "string" ||
+    typeof parsed.tag !== "string" ||
+    typeof parsed.ciphertext !== "string"
+  ) {
+    throw new Error("Invalid encrypted service token");
+  }
+  const decipher = createDecipheriv(
+    SERVICE_TOKEN_ALGORITHM,
+    serviceTokenKey(),
+    Buffer.from(parsed.iv, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(parsed.tag, "base64"));
+  return JSON.parse(
+    Buffer.concat([
+      decipher.update(Buffer.from(parsed.ciphertext, "base64")),
+      decipher.final(),
+    ]).toString("utf8")
+  );
+};
+
+export const asToken = (credentials: Credentials) =>
+  encryptedServiceToken(credentials);
+
+export const parseToken = (token: string): Credentials => {
+  try {
+    return parseEncryptedServiceToken(token);
+  } catch (e) {
+    if (token.startsWith(SERVICE_TOKEN_PREFIX)) throw e;
+    return JSON.parse(b64Decode(token));
+  }
+};
 
 // Freeze a summary AND its immediate object-valued fields (the BUrn image / coverArt,
 // the Genre) so a shared cached entry can't be mutated in place by any caller.
@@ -840,7 +998,7 @@ export class Subsonic {
         if (response.status != 200) {
           throw `Subsonic POST failed with a ${response.status || "no!"} status`;
         } else return response;
-      });
+    });
 
   private getJSON = async <T>(
     { username, password }: Credentials,
@@ -983,9 +1141,18 @@ export class Subsonic {
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> => {
     const pages: AlbumSummary[][] = [];
+    const seen = new Set<string>();
     for (let offset = 0; offset < 2_000_000; offset += 500) {
       const page = await this.scanAlbums(credentials, offset);
       if (page.length === 0) break;
+      for (const album of page) {
+        if (seen.has(album.id)) {
+          throw new Error(
+            `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
+          );
+        }
+        seen.add(album.id);
+      }
       pages.push(page);
       if (page.length < 500) break;
     }
@@ -1169,44 +1336,47 @@ export class Subsonic {
         return albums;
       });
 
-  // Cache each album-list page too: like getArtists it is a large, multi-second fetch that
-  // Sonos re-requests on every browse page, and deep offsets get slower (Navidrome's SQLite
-  // OFFSET scan). Keyed per user + query so sections / pages / filters cache independently;
-  // SwrCache bounds and stale-while-revalidates them. The album TOTAL still comes from the
-  // (separately cached) getArtists sum, so it stays fresh independently of the page.
-  getAlbumList2 = (credentials: Credentials, q: AlbumQuery) =>
-    Promise.all([
-      this.getArtists(credentials).then((it) =>
-        _.inject(it, (total, artist) => total + artist.albumCount, 0)
-      ),
-      // Volatile sections (random / recent / frequent / starred) are never cached; stable ones
-      // go through the SwrCache. Kept inside Promise.all so the getArtists request still fires
-      // before the album-page request (call order the tests + Navidrome expect).
-      VOLATILE_ALBUM_TYPES.has(q.type)
-        ? this.fetchAlbumListPage(credentials, q)
-        : this.cache.get(
-            `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
-            () => this.fetchAlbumListPage(credentials, q)
-          ),
-    ]).then(([total, albums]) => {
+  // Cache each album-list page too: deep offsets get slower (Navidrome's SQLite OFFSET scan).
+  // Keyed per user + query so sections / pages / filters cache independently; SwrCache bounds
+  // and stale-while-revalidates them. Only unfiltered alphabetical lists need the expensive
+  // whole-catalog total from getArtists; filtered/volatile lists advertise a bounded incremental
+  // total from the page itself so cold browses do not wait on the artist list.
+  getAlbumList2 = async (credentials: Credentials, q: AlbumQuery) => {
+    const cachedPage = () =>
+      this.cache.get(
+        `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
+        () => this.fetchAlbumListPage(credentials, q)
+      );
+    // Only the unfiltered alphabetical list needs the true whole-catalog total (from the cached
+    // getArtists sum); keep its original getArtists+page fetch. Filtered/secondary lists
+    // (genre/year/recent/random/starred/...) must NOT wait on the (multi-second, cold) artist list
+    // - a full page there would also claim the ~107k catalog and S2 rejects the oversized
+    // container - so they advertise a bounded "there may be one more page" total from the page.
+    if (q.type === "alphabeticalByName" || q.type === "alphabeticalByArtist") {
+      const [total, albums] = await Promise.all([
+        this.getArtists(credentials).then((it) =>
+          _.inject(it, (total, artist) => total + artist.albumCount, 0)
+        ),
+        cachedPage(),
+      ]);
       const results = albums.slice(0, q._count);
-      const unfiltered =
-        q.type === "alphabeticalByName" || q.type === "alphabeticalByArtist";
       return {
         results,
-        // Unfiltered lists can advertise the true catalog total (or the exact end on a short page).
-        // Filtered/secondary lists (genre, year, recentlyAdded, random, ...) must NOT: a full page
-        // there would claim the whole ~107k catalog and S2 rejects the oversized container. Advertise
-        // a bounded "there may be one more page" total instead, so Sonos pages until a short page.
-        total: unfiltered
-          ? albums.length == 500
-            ? total
-            : q._index + albums.length
-          : q._index +
-            results.length +
-            (results.length >= q._count ? q._count : 0),
+        total: albums.length == 500 ? total : q._index + albums.length,
       };
-    });
+    }
+    const albums = await (VOLATILE_ALBUM_TYPES.has(q.type)
+      ? this.fetchAlbumListPage(credentials, q)
+      : cachedPage());
+    const results = albums.slice(0, q._count);
+    return {
+      results,
+      total:
+        q._index +
+        results.length +
+        (results.length >= q._count ? q._count : 0),
+    };
+  };
 
   getGenres = (credentials: Credentials) =>
     this.getJSON<GetGenresResponse>(credentials, "/rest/getGenres").then((it) =>

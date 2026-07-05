@@ -1,3 +1,5 @@
+import { sonosMaxContainerTotal } from "./config";
+
 // A cached alphabetical index of the album catalog, used to break the huge flat "Albums" list
 // into bounded per-letter buckets (Sonos S2 rejects a single browsable container that advertises
 // a very large total).
@@ -28,8 +30,8 @@ export type AlbumIndex<T = { name: string }> = {
 // and a catalog this small never builds the index at all; a larger catalog builds the snapshot and
 // is split into bounded per-letter buckets, because Sonos rejects a single browsable container
 // advertising a very large total (observed: ~23k ok, ~115k rejected).
-// TODO(config): expose as BNB_SONOS_MAX_CONTAINER_TOTAL.
-export const MAX_ALBUMS_FLAT = 20000;
+// Configurable via BNB_SONOS_MAX_CONTAINER_TOTAL (default 20000). Read once at module load.
+export const MAX_ALBUMS_FLAT = sonosMaxContainerTotal();
 
 // Navidrome's default ND_IGNOREDARTICLES ("The El La Los Las Le Les Os As O A"): leading articles
 // stripped when sorting, so e.g. "The Doors" sorts under D and "O Bem" under B. We mirror it so

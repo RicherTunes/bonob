@@ -15,6 +15,39 @@ export const sha256 = (salt: string) => (value: string) => crypto
   .update(`${value}${salt}`)
   .digest("hex")
 
+export type APITokenScope = "art" | "stream";
+
+type ScopedAPITokenPayload = {
+  bonobApiTokenScope: APITokenScope;
+  serviceToken: string;
+};
+
+export const scopedApiTokenPayload = (
+  scope: APITokenScope,
+  serviceToken: string
+): string =>
+  JSON.stringify({ bonobApiTokenScope: scope, serviceToken });
+
+export const serviceTokenForScopedApiToken = (
+  authToken: string | undefined,
+  scope: APITokenScope,
+  opts: { allowLegacy?: boolean } = {}
+): string | undefined => {
+  if (!authToken) return undefined;
+  try {
+    const parsed = JSON.parse(authToken) as Partial<ScopedAPITokenPayload>;
+    if (parsed.bonobApiTokenScope != undefined) {
+      return parsed.bonobApiTokenScope === scope &&
+        typeof parsed.serviceToken === "string"
+        ? parsed.serviceToken
+        : undefined;
+    }
+  } catch {
+    // Legacy raw service tokens are not JSON.
+  }
+  return opts.allowLegacy ? authToken : undefined;
+};
+
 
 export class InMemoryAPITokens implements APITokens {
   tokens = new Map<string, { authToken: string, expiresAt: Dayjs }>();
