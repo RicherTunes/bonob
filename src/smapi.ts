@@ -21,6 +21,7 @@ import {
   range,
   slice2,
   Track,
+  TrackSummary,
   PlaylistSummary
 } from "./music_library";
 import { APITokens } from "./api_tokens";
@@ -417,6 +418,27 @@ export const track = (bonobUrl: URLBuilder, track: Track) => ({
   },
   dynamic: {
     property: [{ name: "rating", value: `${ratingAsInt(track.rating)}` }],
+  },
+});
+
+// Top songs come back from getTopSongs as TrackSummary (no album context), so they need album-free
+// track metadata. Everything Sonos needs to play + display a track is present on the summary.
+export const topSongMetadata = (bonobUrl: URLBuilder, t: TrackSummary) => ({
+  itemType: "track",
+  id: `track:${t.id}`,
+  mimeType: sonosifyMimeType(t.encoding.mimeType),
+  title: t.name,
+  trackMetadata: {
+    albumArtURI: albumArtURI(coverArtURI(bonobUrl, t).href()),
+    artist: t.artist.name,
+    artistId: t.artist.id ? `artist:${t.artist.id}` : undefined,
+    duration: t.duration,
+    genre: t.genre?.name,
+    genreId: t.genre?.id,
+    trackNumber: t.number,
+  },
+  dynamic: {
+    property: [{ name: "rating", value: `${ratingAsInt(t.rating)}` }],
   },
 });
 
@@ -1231,14 +1253,39 @@ function bindSmapiSoapServiceToExpress(
                         });
                       });
                   case "artist":
+                    return musicLibrary.artist(typeId!).then((artist) => {
+                      // Offer the artist's top songs as the first entry, then their albums. Page
+                      // over the combined list so paging and total stay correct.
+                      const items = [
+                        {
+                          itemType: "trackList",
+                          id: `topSongs:${typeId}`,
+                          title: "Top Songs",
+                          albumArtURI: albumArtURI(
+                            coverArtURI(urlWithToken(apiKey), {
+                              coverArt: artist.image,
+                            }).href()
+                          ),
+                        },
+                        ...artist.albums.map((it) =>
+                          album(urlWithToken(apiKey), it)
+                        ),
+                      ];
+                      const [page, total] = slice2(paging)(items);
+                      return getMetadataResult({
+                        mediaCollection: page,
+                        index: paging._index,
+                        total,
+                      });
+                    });
+                  case "topSongs":
                     return musicLibrary
-                      .artist(typeId!)
-                      .then((artist) => artist.albums)
+                      .topSongs(typeId!)
                       .then(slice2(paging))
                       .then(([page, total]) =>
                         getMetadataResult({
-                          mediaCollection: page.map((it) =>
-                            album(urlWithToken(apiKey), it)
+                          mediaMetadata: page.map((it) =>
+                            topSongMetadata(bonobUrl, it)
                           ),
                           index: paging._index,
                           total,
