@@ -457,6 +457,13 @@ describe("config", () => {
       (config) => config.subsonic.transcode
     );
 
+    describeBooleanConfigValue(
+      "deezerArtistArt",
+      "BNB_DEEZER_ARTIST_ART",
+      false,
+      (config) => config.subsonic.deezerArtistArt
+    );
+
   });
 
   describe("scrobbling and reporting", () => {

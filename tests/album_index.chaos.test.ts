@@ -4,7 +4,20 @@ import {
   albumIndexPage,
   albumIndexLetters,
   albumIndexRangesFor,
+  albumIndexLetterTotal,
 } from "../src/album_index";
+
+// Mirror of smapi's MAX_ALBUMS_FLAT: the largest total any single S2 container may advertise.
+const CAP = 20000;
+const seq = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
+// Sizes of the containers a user actually opens for a letter: the letter itself if it fits,
+// otherwise its fixed-size chunks.
+const servedSizes = (letterTotal: number): number[] =>
+  letterTotal <= CAP
+    ? [letterTotal]
+    : seq(Math.ceil(letterTotal / CAP)).map((i) =>
+        Math.min(CAP, letterTotal - i * CAP)
+      );
 
 // Deterministic PRNG (mulberry32) so failures are reproducible.
 function rng(seed: number): () => number {
@@ -183,6 +196,35 @@ describe("album index — chaos / property tests", () => {
     expect(albumIndexPage(same, "A", 1000, 10).items).toEqual([]);
     // ranges of an absent letter
     expect(albumIndexRangesFor(same, "Z")).toEqual([]);
+  });
+
+  it("NO leaf a user can open ever exceeds the S2 container cap (random catalogs)", () => {
+    const r = rng(31337);
+    for (let trial = 0; trial < 200; trial++) {
+      const catalog = randomCatalog(r, 1 + Math.floor(r() * 500), `cap${trial}`);
+      const idx = buildAlbumIndexFromPages(pageify(catalog, 60));
+      for (const { key } of albumIndexLetters(idx)) {
+        for (const size of servedSizes(albumIndexLetterTotal(idx, key))) {
+          expect(size).toBeGreaterThan(0);
+          expect(size).toBeLessThanOrEqual(CAP);
+        }
+      }
+    }
+  });
+
+  it("an oversized letter chunks into cap-bounded parts that partition it exactly", () => {
+    // A real index whose "P" letter is far bigger than the cap (the case that re-broke S2).
+    const big = Array.from({ length: 25000 }, (_, i) => ({
+      id: `p${i}`,
+      name: `Pop ${i}`,
+    }));
+    const idx = buildAlbumIndexFromPages(pageify(big, 500));
+    const letterTotal = albumIndexLetterTotal(idx, "P");
+    expect(letterTotal).toEqual(25000);
+    const sizes = servedSizes(letterTotal);
+    expect(sizes.length).toEqual(2); // ceil(25000 / 20000)
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(CAP);
+    expect(sizes.reduce((s, n) => s + n, 0)).toEqual(letterTotal); // exact partition
   });
 });
 

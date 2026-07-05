@@ -121,19 +121,22 @@ export class SubsonicMusicLibrary implements MusicLibrary {
     ]).then(([artist, artistInfo]) => ({
       id: artist.id,
       name: artist.name,
-      image: artistImageURN({
-        artistId: artist.id,
-        name: artist.name,
-        artistImageURL: [
-          artist.artistImageUrl,
-          // todo: subsonic.artistInfo should just return a valid image or undefined, then the music lib just chooses first undefined
-          // out of artist.image and artistInfo.image
-          artistInfo.images.l,
-          artistInfo.images.m,
-          artistInfo.images.s,
-          // todo: do we still need this isValidImage?
-        ].find(isValidImage),
-      }),
+      image: artistImageURN(
+        {
+          artistId: artist.id,
+          name: artist.name,
+          artistImageURL: [
+            artist.artistImageUrl,
+            // todo: subsonic.artistInfo should just return a valid image or undefined, then the music lib just chooses first undefined
+            // out of artist.image and artistInfo.image
+            artistInfo.images.l,
+            artistInfo.images.m,
+            artistInfo.images.s,
+            // todo: do we still need this isValidImage?
+          ].find(isValidImage),
+        },
+        this.subsonic.preferDeezerArtistArt
+      ),
       albums: artist.albums,
       similarArtists: artistInfo.similarArtist,
       biography: artistInfo.biography,
@@ -250,10 +253,14 @@ export class SubsonicMusicLibrary implements MusicLibrary {
         artists.map((artist) => ({
           id: artist.id,
           name: artist.name,
-          image: artistImageURN({
-            artistId: artist.id,
-            artistImageURL: artist.artistImageUrl,
-          }),
+          image: artistImageURN(
+            {
+              artistId: artist.id,
+              name: artist.name,
+              artistImageURL: artist.artistImageUrl,
+            },
+            this.subsonic.preferDeezerArtistArt
+          ),
         }))
       );
 

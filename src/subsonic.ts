@@ -274,19 +274,15 @@ export const coverArtURN = (coverArt: string | undefined): BUrn | undefined =>
     O.getOrElseW(() => undefined)
   );
 
-// Opt-in: resolve artist photos from Deezer instead of Navidrome. Off by default so we never
-// clobber real artist art a Navidrome instance already has; enable with BNB_DEEZER_ARTIST_ART=true
-// (recommended when Navidrome only serves the placeholder star).
-export const PREFER_DEEZER_ART =
-  process.env["BNB_DEEZER_ARTIST_ART"] === "true";
-
 export const artistImageURN = (
   spec: Partial<{
     artistId: string | undefined;
     artistImageURL: string | undefined;
     name: string | undefined;
   }>,
-  preferDeezer: boolean = PREFER_DEEZER_ART
+  // Opt-in (BNB_DEEZER_ARTIST_ART, threaded from config): resolve artist photos from Deezer by
+  // name instead of Navidrome. Off by default so we never clobber real art a server already has.
+  preferDeezer: boolean = false
 ): BUrn | undefined => {
   const deets = {
     artistId: undefined,
@@ -756,6 +752,9 @@ export class Subsonic {
   url: URLBuilder;
   customPlayers: CustomPlayers;
   externalImageFetcher: ImageFetcher;
+  // Opt-in artist art from Deezer (read from config); public so the music library can thread it
+  // through to artistImageURN for the artist-detail and search paths.
+  readonly preferDeezerArtistArt: boolean;
   private cache: SwrCache;
   private indexCache: SwrCache;
 
@@ -767,11 +766,13 @@ export class Subsonic {
     // Separate cache for the album index: it is a heavy (~N/500 request) full-catalog scan that
     // changes only on a library scan, so it must have a much longer TTL than the browse cache
     // (otherwise it would re-scan on every stale browse). Defaults to the browse cache.
-    indexCache: SwrCache = cache
+    indexCache: SwrCache = cache,
+    preferDeezerArtistArt: boolean = false
   ) {
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
+    this.preferDeezerArtistArt = preferDeezerArtistArt;
     this.cache = cache;
     this.indexCache = indexCache;
   }
@@ -891,11 +892,14 @@ export class Subsonic {
             id: `${artist.id}`,
             name: artist.name,
             albumCount: artist.albumCount,
-            image: artistImageURN({
-              artistId: artist.id,
-              artistImageURL: artist.artistImageUrl,
-              name: artist.name,
-            }),
+            image: artistImageURN(
+              {
+                artistId: artist.id,
+                artistImageURL: artist.artistImageUrl,
+                name: artist.name,
+              },
+              this.preferDeezerArtistArt
+            ),
           })
         );
         Object.freeze(mapped);

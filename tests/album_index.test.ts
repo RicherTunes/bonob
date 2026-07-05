@@ -3,6 +3,8 @@ import {
   buildAlbumIndexFromPages,
   albumIndexLetters,
   albumIndexRangesFor,
+  albumIndexLetterTotal,
+  albumIndexAll,
   DEFAULT_IGNORED_ARTICLES,
 } from "../src/album_index";
 
@@ -50,6 +52,46 @@ describe("albumBucketKey", () => {
     expect(DEFAULT_IGNORED_ARTICLES).toEqual(
       expect.arrayContaining(["the", "a", "o", "os", "as", "los", "las"])
     );
+  });
+
+  it("normalizes caller-supplied articles (case/whitespace) and strips on any Unicode whitespace", () => {
+    // caller passes mixed-case / padded articles
+    expect(albumBucketKey("The Doors", [" The "])).toEqual("D");
+    // article followed by a non-breaking space or tab still strips
+    expect(albumBucketKey("The Doors")).toEqual("D");
+    expect(albumBucketKey("Los\tLobos")).toEqual("L");
+    // an empty article never strips everything
+    expect(albumBucketKey("Apple", ["", "the"])).toEqual("A");
+  });
+});
+
+describe("albumIndexLetterTotal", () => {
+  it("sums the counts of all of a letter's runs", () => {
+    const idx = buildAlbumIndexFromPages([
+      names("Apple", "Banana", "Apex", "Avocado"), // A(0,1), B(1,1), A(2,2)
+    ]);
+    expect(albumIndexLetterTotal(idx, "A")).toEqual(3);
+    expect(albumIndexLetterTotal(idx, "B")).toEqual(1);
+    expect(albumIndexLetterTotal(idx, "Z")).toEqual(0);
+  });
+});
+
+describe("albumIndexAll", () => {
+  it("slices the raw snapshot for the flat browse", () => {
+    const idx = buildAlbumIndexFromPages([
+      names("Apple", "Banana", "Cherry", "Date"),
+    ]);
+    expect(albumIndexAll(idx, 1, 2).map((a) => a.name)).toEqual([
+      "Banana",
+      "Cherry",
+    ]);
+    expect(albumIndexAll(idx, 0, 100).length).toEqual(4);
+  });
+
+  it("is empty for a malformed index without a snapshot", () => {
+    expect(
+      albumIndexAll({ total: 0, buckets: [] } as any, 0, 10)
+    ).toEqual([]);
   });
 });
 
