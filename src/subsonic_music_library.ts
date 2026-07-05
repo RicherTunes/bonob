@@ -31,6 +31,7 @@ import _ from "underscore";
 
 import logger from "./logger";
 import { assertSystem, BUrn } from "./burn";
+import { AlbumIndex } from "./album_index";
 
 export class SubsonicMusicService implements MusicService {
   subsonic: Subsonic;
@@ -64,9 +65,11 @@ export class SubsonicMusicService implements MusicService {
 
   login = async (token: string) => {
     const credentials = parseToken(token);
-    // Pre-warm the (slow, cold) artist list for this session in the background so the first
-    // browse of a section isn't cold. Fire-and-forget; the cache coalesces + refreshes lazily.
+    // Pre-warm the (slow, cold) artist list AND the album index for this session in the
+    // background so the first browse isn't cold. Fire-and-forget; the cache coalesces +
+    // refreshes lazily, and the album-index scan (multi-minute) runs off the browse path.
     this.subsonic.warmArtists(credentials);
+    this.subsonic.warmAlbumIndex(credentials);
     return this.libraryFor(credentials);
   };
 
@@ -137,6 +140,12 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   albums = async (q: AlbumQuery): Promise<Result<AlbumSummary>> =>
     this.subsonic.getAlbumList2(this.credentials, q);
+
+  albumIndex = (): Promise<AlbumIndex> =>
+    this.subsonic.getAlbumIndex(this.credentials);
+
+  peekAlbumIndex = (): Promise<AlbumIndex> | undefined =>
+    this.subsonic.peekAlbumIndex(this.credentials);
 
   album = (id: string): Promise<Album> =>
     this.subsonic.getAlbum(this.credentials, id);

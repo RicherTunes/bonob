@@ -329,6 +329,20 @@ describe("SwrCache", () => {
     expect(await p).toBe("fetched");
   });
 
+  it("peek() returns a settled value or undefined, and never triggers a fetch", async () => {
+    const cache = new SwrCache(new FixedClock(at), 60_000);
+    const f = deferredFetcher<string>();
+    expect(cache.peek("k")).toBeUndefined(); // absent
+    const p = cache.get("k", f.fetch); // in flight, not settled
+    expect(cache.peek("k")).toBeUndefined(); // still no resolved value
+    f.resolve(0, "v");
+    await p;
+    const peeked = cache.peek<string>("k");
+    expect(peeked).toBeDefined();
+    expect(await peeked!).toBe("v");
+    expect(f.calls).toBe(1); // peek itself fetched nothing
+  });
+
   it("backstop: a hung fetch rejects after backstopMs (and frees the key)", async () => {
     jest.useFakeTimers();
     try {

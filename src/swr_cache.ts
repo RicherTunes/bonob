@@ -119,6 +119,17 @@ export class SwrCache {
     void this.get(key, fetch).catch(() => {});
   }
 
+  // Non-blocking read: return the entry's (already resolved) promise ONLY if a value has
+  // settled and is within the stale cap; never triggers or waits on a fetch. Used to keep a
+  // slow build (e.g. the album-index scan) off the live browse path - callers fall back until
+  // it is warm.
+  peek<T>(key: string): Promise<T> | undefined {
+    const entry = this.entries.get(key);
+    if (!entry || !entry.settled) return undefined;
+    if (this.clock.now().valueOf() - entry.at >= this.maxStaleMs) return undefined;
+    return entry.value as Promise<T>;
+  }
+
   get<T>(key: string, fetch: () => Promise<T>): Promise<T> {
     if (this.ttlMs <= 0) return fetch();
     const now = this.clock.now().valueOf();
