@@ -4,6 +4,7 @@ import {
   Credentials,
   MusicService,
   ArtistSummary,
+  TrackSummary,
   Result,
   slice2,
   AlbumQuery,
@@ -32,21 +33,15 @@ import _ from "underscore";
 import logger from "./logger";
 import { assertSystem, BUrn } from "./burn";
 import { AlbumIndex, MAX_ALBUMS_FLAT } from "./album_index";
+import { withTimeout } from "./timeout";
 
 // Cap the Last.fm-backed artist enrichment so a slow-but-succeeding getArtistInfo can't stall the
 // artist browse past Sonos's ~5s timeout.
 export const ARTIST_INFO_TIMEOUT_MS = 3500;
 
-// Resolve to `fallback` if `p` has not settled within `ms` (and never leaks the timer).
-export const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    p,
-    new Promise<T>((resolve) => {
-      timer = setTimeout(() => resolve(fallback), ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
-};
+// Cap the optional Last.fm-backed top-songs lookup: a slow/rejecting getTopSongs must not stall or
+// break browsing an artist's Top Songs - degrade to no songs.
+export const TOP_SONGS_TIMEOUT_MS = 3500;
 
 export class SubsonicMusicService implements MusicService {
   subsonic: Subsonic;
@@ -320,8 +315,12 @@ export class SubsonicMusicLibrary implements MusicLibrary {
     this.subsonic
       .search3(this.credentials, { query, songCount: 20 })
       .then(({ songs }) =>
-        Promise.all(
+        // One flaky/slow track must not reject the whole search: fetch each independently and keep
+        // only the resolved ones (the SMAPI browse deadline caps overall latency).
+        Promise.allSettled(
           songs.map((it) => this.subsonic.getTrack(this.credentials, it.id))
+        ).then((settled) =>
+          settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []))
         )
       );
 
@@ -346,11 +345,16 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   similarSongs = async (id: string) => 
     this.subsonic.getSimilarSongs2(this.credentials, id)
 
-  topSongs = async (artistId: string) =>
-    this.subsonic.getArtist(this.credentials, artistId)
-      .then(({ name }) =>
-        this.subsonic.getTopSongs(this.credentials, name)
-      );
+  topSongs = async (artistId: string): Promise<TrackSummary[]> =>
+    // Top Songs is Last.fm-backed (getTopSongs) and optional: a slow or failing lookup must not
+    // stall or reject the browse - degrade to no songs (an empty, valid Top Songs list).
+    withTimeout(
+      this.subsonic
+        .getArtist(this.credentials, artistId)
+        .then(({ name }) => this.subsonic.getTopSongs(this.credentials, name)),
+      TOP_SONGS_TIMEOUT_MS,
+      [] as TrackSummary[]
+    ).catch(() => [] as TrackSummary[]);
 
   starredSongs = async () =>
     this.subsonic.starredSongs(this.credentials);

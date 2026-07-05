@@ -28,6 +28,7 @@ import {
   SubsonicMusicService,
   SubsonicMusicLibrary,
   ARTIST_INFO_TIMEOUT_MS,
+  TOP_SONGS_TIMEOUT_MS,
 } from "../src/subsonic_music_library";
 
 import {
@@ -3026,6 +3027,44 @@ describe("SubsonicMusicLibrary", () => {
       });
     });
 
+    describe("when one track lookup fails", () => {
+      // A flaky/malformed track must not reject the whole search (Sonos "something went wrong") -
+      // keep the tracks that resolved and drop the ones that failed.
+      it("still returns the tracks that resolved (allSettled)", async () => {
+        const album1 = anAlbum({ name: "Album1" });
+        const artist = anArtist({ name: "Artist", albums: [album1] });
+        const track1 = aTrack({
+          artist: artistToArtistSummary(artist),
+          album: albumToAlbumSummary(album1),
+        });
+        const track2 = aTrack({
+          artist: artistToArtistSummary(artist),
+          album: albumToAlbumSummary(album1),
+        });
+
+        // dispatch by URL/id so the result is independent of call ordering + the read retry
+        mockGET.mockImplementation((u: string, config: any) => {
+          const url = String(u);
+          const id = config?.params?.get?.("id");
+          if (url.includes("search3"))
+            return Promise.resolve(
+              ok(getSearchResult3Json({ tracks: [track1, track2] }))
+            );
+          if (url.includes("getSong"))
+            return id === track2.id
+              ? Promise.reject(new Error("flaky getSong")) // fails every time, incl. the retry
+              : Promise.resolve(ok(getSongJson(track1)));
+          if (url.includes("getAlbum"))
+            return Promise.resolve(ok(getAlbumJson(album1)));
+          return Promise.reject(new Error("unexpected " + url));
+        });
+
+        const result = await subsonic.searchTracks("moo");
+
+        expect(result).toEqual([track1]);
+      });
+    });
+
     describe("when there are no search results", () => {
       it("should return []", async () => {
         mockGET.mockImplementationOnce(() =>
@@ -3552,6 +3591,35 @@ describe("SubsonicMusicLibrary", () => {
             headers,
           }
         );
+      });
+    });
+
+    describe("when the Last.fm top-songs lookup fails or is slow", () => {
+      // Top Songs is optional Last.fm-backed enrichment: a failure or a slow response must degrade
+      // to no songs, never reject or stall the browse.
+      it("returns no songs when getTopSongs rejects", async () => {
+        const artist = anArtist({ id: "a1", name: "Someone", albums: [] });
+        mockGET
+          .mockImplementationOnce(() => Promise.resolve(ok(getArtistJson(artist))))
+          .mockImplementationOnce(() => Promise.reject(new Error("last.fm 500")));
+
+        expect(await subsonic.topSongs("a1")).toEqual([]);
+      });
+
+      it("returns no songs when getTopSongs is too slow", async () => {
+        jest.useFakeTimers();
+        try {
+          const artist = anArtist({ id: "a1", name: "Someone", albums: [] });
+          mockGET
+            .mockImplementationOnce(() => Promise.resolve(ok(getArtistJson(artist))))
+            .mockImplementationOnce(() => new Promise(() => {})); // never settles
+
+          const resultP = subsonic.topSongs("a1");
+          await jest.advanceTimersByTimeAsync(TOP_SONGS_TIMEOUT_MS);
+          expect(await resultP).toEqual([]);
+        } finally {
+          jest.useRealTimers();
+        }
       });
     });
 
