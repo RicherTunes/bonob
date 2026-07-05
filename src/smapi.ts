@@ -385,6 +385,12 @@ export const track = (bonobUrl: URLBuilder, track: Track) => ({
   },
 });
 
+// A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1
+// hardware); a larger catalog is split into bounded per-letter buckets, because Sonos rejects a
+// single browsable container advertising a very large total (observed: ~23k ok, ~115k rejected).
+// TODO(config): expose as BNB_SONOS_MAX_CONTAINER_TOTAL.
+export const MAX_ALBUMS_FLAT = 20000;
+
 export const artist = (bonobUrl: URLBuilder, artist: ArtistSummary) => ({
   itemType: "artist",
   id: `artist:${artist.id}`,
@@ -916,11 +922,99 @@ function bindSmapiSoapServiceToExpress(
                       });
                     });
                   case "albums": {
-                    return albums({
-                      type: "alphabeticalByName",
-                      ...paging,
+                    // A huge flat "Albums" list (total ~= whole catalog) is rejected by Sonos S2.
+                    // Serve the A-Z letter buckets from the cached index instead, so no single
+                    // container advertises the global total. Peek so we never block the browse on
+                    // the (multi-minute) index scan.
+                    const peeked = musicLibrary.peekAlbumIndex();
+                    if (!peeked) {
+                      // Index still building: kick it, and meanwhile offer bounded sections.
+                      void musicLibrary.albumIndex().catch(() => undefined);
+                      return getMetadataResult({
+                        mediaCollection: [
+                          {
+                            id: "recentlyAdded",
+                            title: lang("recentlyAdded"),
+                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "recentlyAdded").href()),
+                            itemType: "albumList",
+                          },
+                          {
+                            id: "genres",
+                            title: lang("genres"),
+                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "genres").href()),
+                            itemType: "container",
+                          },
+                          {
+                            id: "years",
+                            title: lang("years"),
+                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "music").href()),
+                            itemType: "container",
+                          },
+                          {
+                            id: "randomAlbums",
+                            title: lang("random"),
+                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "random").href()),
+                            itemType: "albumList",
+                          },
+                        ],
+                        index: 0,
+                        total: 4,
+                      });
+                    }
+                    return peeked.then((idx) => {
+                      // Small enough to browse as one flat list (keeps small libraries simple,
+                      // and is safe on older S1 hardware); otherwise split into bounded per-letter
+                      // buckets so no container ever advertises the huge global total.
+                      if (idx.total <= MAX_ALBUMS_FLAT) {
+                        return albums({ type: "alphabeticalByName", ...paging });
+                      }
+                      return getMetadataResult({
+                        mediaCollection: idx.buckets.map((b) => ({
+                          itemType: "albumList",
+                          id: `albumsByLetter:${b.key}`,
+                          title: b.label,
+                          albumArtURI: albumArtURI(
+                            iconArtURI(bonobUrl, "albums").href()
+                          ),
+                        })),
+                        index: 0,
+                        total: idx.buckets.length,
+                      });
                     });
                   }
+                  case "albumsByLetter":
+                    return (
+                      musicLibrary.peekAlbumIndex() ?? musicLibrary.albumIndex()
+                    ).then((idx) => {
+                      const bucket = idx.buckets.find((b) => b.key === typeId);
+                      if (!bucket)
+                        return getMetadataResult({
+                          mediaCollection: [],
+                          index: 0,
+                          total: 0,
+                        });
+                      // Page WITHIN the bucket: fetch from the bucket's global offset, clamp so we
+                      // never spill into the next letter, and advertise only the bucket's size.
+                      const wanted = Math.min(
+                        paging._count,
+                        Math.max(0, bucket.count - paging._index)
+                      );
+                      return musicLibrary
+                        .albums({
+                          type: "alphabeticalByName",
+                          _index: bucket.offset + paging._index,
+                          _count: wanted,
+                        })
+                        .then((result) =>
+                          getMetadataResult({
+                            mediaCollection: result.results
+                              .slice(0, wanted)
+                              .map((it) => album(urlWithToken(apiKey), it)),
+                            index: paging._index,
+                            total: bucket.count,
+                          })
+                        );
+                    });
                   case "genre":
                     return albums({
                       type: "byGenre",

@@ -67,12 +67,23 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
   revive: deepFreeze,
 });
 
+// The album index is a heavy full-catalog scan (~N/500 requests) that changes only on a library
+// scan, so cache it far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on
+// every stale browse. Persisted in its own subdir so it survives restarts.
+const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
+  store: config.subsonic.cacheDir
+    ? fileStore(path.join(config.subsonic.cacheDir, "index"))
+    : undefined,
+  revive: deepFreeze,
+});
+
 const subsonic = new SubsonicMusicService(
   new Subsonic(
     config.subsonic.url,
     customPlayers,
     artistImageFetcher,
-    browseCache
+    browseCache,
+    indexCache
   ),
   customPlayers,
   config.subsonic.transcode
