@@ -267,6 +267,18 @@ describe("isRetryableSubsonicError (read retry policy)", () => {
     expect(isRetryableSubsonicError("Subsonic failed with a 401 status")).toBe(false);
     expect(isRetryableSubsonicError("Subsonic error: parameter missing")).toBe(false);
   });
+
+  it("classifies real AxiosError rejections by response status (axios rejects non-2xx as objects)", () => {
+    // 4xx client errors -> do NOT retry
+    expect(isRetryableSubsonicError({ isAxiosError: true, response: { status: 404 } })).toBe(false);
+    expect(isRetryableSubsonicError({ isAxiosError: true, response: { status: 400 } })).toBe(false);
+    // 5xx -> retry
+    expect(isRetryableSubsonicError({ isAxiosError: true, response: { status: 503 } })).toBe(true);
+    expect(isRetryableSubsonicError({ isAxiosError: true, response: { status: 500 } })).toBe(true);
+    // no response = network / timeout error -> retry
+    expect(isRetryableSubsonicError({ isAxiosError: true, code: "ECONNABORTED" })).toBe(true);
+    expect(isRetryableSubsonicError({ isAxiosError: true })).toBe(true);
+  });
 });
 
 describe("StreamClient(s)", () => {
