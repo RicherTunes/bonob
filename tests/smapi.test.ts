@@ -318,6 +318,34 @@ describe("service config", () => {
 });
 
 describe("getMetadataResult", () => {
+  describe("XML sanitization", () => {
+    it("strips XML-1.0-invalid control characters from emitted media text", () => {
+      const bad = String.fromCharCode(4); // U+0004, illegal in XML 1.0
+      const result = getMetadataResult({
+        mediaCollection: [
+          {
+            itemType: "album",
+            id: "album:1",
+            title: "Awaken" + bad + " My Love!",
+            artist: "Childish" + bad + " Gambino",
+          },
+        ],
+      });
+      const item = result.getMetadataResult.mediaCollection![0];
+      expect(item.title).toEqual("Awaken My Love!");
+      expect(item.artist).toEqual("Childish Gambino");
+    });
+
+    it("leaves clean text (incl. unicode/emoji) untouched", () => {
+      const result = getMetadataResult({
+        mediaCollection: [{ title: "cafe unicode ok & <x>" }],
+      });
+      expect(result.getMetadataResult.mediaCollection![0].title).toEqual(
+        "cafe unicode ok & <x>"
+      );
+    });
+  });
+
   describe("when there are a no mediaCollections & no mediaMetadata", () => {
     it("should have zero count", () => {
       const result = getMetadataResult({
