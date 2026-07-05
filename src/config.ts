@@ -144,6 +144,10 @@ export default function (die: (code?: number) => never = process.exit) {
         legacy: ["BNB_SUBSONIC_ARTIST_CACHE_TTL"],
       })!,
       cacheDir: bnbEnvVar<string>("SUBSONIC_CACHE_DIR"),
+      deezerArtistArt: bnbEnvVar<boolean>("DEEZER_ARTIST_ART", {
+        default: false,
+        parser: asBoolean,
+      }),
     },
     scrobbleTracks: bnbEnvVar<boolean>("SCROBBLE_TRACKS", { default: true, parser: asBoolean }),
     reportNowPlaying:

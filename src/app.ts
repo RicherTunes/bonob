@@ -91,7 +91,8 @@ const subsonic = new SubsonicMusicService(
     customPlayers,
     artistImageFetcher,
     browseCache,
-    indexCache
+    indexCache,
+    config.subsonic.deezerArtistArt
   ),
   customPlayers,
   config.subsonic.transcode

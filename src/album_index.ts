@@ -54,9 +54,13 @@ export function albumBucketKey(
   ignoredArticles: string[] = DEFAULT_IGNORED_ARTICLES
 ): string {
   let t = foldDiacritics((title || "").trim().toLowerCase());
-  for (const a of ignoredArticles) {
-    if (t.startsWith(a + " ")) {
-      t = t.slice(a.length + 1).trim();
+  for (const raw of ignoredArticles) {
+    // Normalize caller-supplied articles (a non-default ND_IGNOREDARTICLES may be mixed-case or
+    // padded), and require any Unicode whitespace after the article (space, tab, NBSP, ...) so a
+    // title like "Los Lobos" still sorts under L while "Theatre" stays under T.
+    const a = raw.trim().toLowerCase();
+    if (a.length > 0 && t.startsWith(a) && /^\s/.test(t.slice(a.length))) {
+      t = t.slice(a.length).replace(/^\s+/, "");
       break;
     }
   }
@@ -152,4 +156,25 @@ export function albumIndexRangesFor(
   key: string
 ): AlbumIndexBucket[] {
   return index.buckets.filter((b) => b.key === key);
+}
+
+// Total number of albums in a letter (across all its runs). Used to decide whether a letter fits
+// in one bounded container or must be split into fixed-size sub-buckets.
+export function albumIndexLetterTotal(
+  index: AlbumIndex<any>,
+  key: string
+): number {
+  return albumIndexRangesFor(index, key).reduce((sum, r) => sum + r.count, 0);
+}
+
+// Slice the raw snapshot in scan order, for the flat (small-library) browse. Drift-proof, and an
+// old/malformed index without a snapshot yields an empty page rather than throwing.
+export function albumIndexAll<T>(
+  index: AlbumIndex<T>,
+  pageIndex: number,
+  pageCount: number
+): T[] {
+  return Array.isArray(index.items)
+    ? index.items.slice(pageIndex, pageIndex + pageCount)
+    : [];
 }

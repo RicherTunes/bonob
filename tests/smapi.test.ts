@@ -2399,6 +2399,61 @@ describe("wsdl api", () => {
                   // it kicked the background build rather than awaiting it
                   expect(musicLibrary.albumIndex).toHaveBeenCalled();
                 });
+
+                it("splits an oversized letter into bounded sub-buckets", async () => {
+                  // A letter bigger than MAX_ALBUMS_FLAT (20000) would itself be rejected by S2, so
+                  // it becomes a menu of fixed-size chunk containers instead of an album list.
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 45000,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 45000 }],
+                      items: new Array(45000), // sparse; the container path never reads items
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsByLetter:P",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(3); // ceil(45000 / 20000)
+                  expect(md.mediaCollection.map((c: any) => c.id)).toEqual([
+                    "albumsChunk:P_0",
+                    "albumsChunk:P_1",
+                    "albumsChunk:P_2",
+                  ]);
+                  expect(md.mediaCollection[0].itemType).toEqual("albumList");
+                });
+
+                it("serves a chunk from the snapshot at the right offset, bounded to the cap", async () => {
+                  const items = new Array(25000);
+                  items[20000] = pop2;
+                  items[20001] = pop3;
+                  items[20002] = pop4;
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 25000,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 25000 }],
+                      items,
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsChunk:P_1", // second chunk of P: items[20000..]
+                    index: 0,
+                    count: 3,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: [pop2, pop3, pop4].map(albumItem),
+                      index: 0,
+                      total: 5000, // min(20000, 25000 - 20000)
+                    })
+                  );
+                });
               });
 
               describe("asking for all albums for a genre", () => {

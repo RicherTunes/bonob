@@ -18,6 +18,7 @@ import {
   MusicService,
   RadioStation,
   Rating,
+  range,
   slice2,
   Track,
   PlaylistSummary
@@ -29,7 +30,12 @@ import { asLANGs, I8N } from "./i8n";
 import { ICON, iconForGenre } from "./icon";
 import _ from "underscore";
 import { BUrn, formatForURL } from "./burn";
-import { albumIndexLetters, albumIndexPage } from "./album_index";
+import {
+  albumIndexLetters,
+  albumIndexPage,
+  albumIndexLetterTotal,
+  albumIndexAll,
+} from "./album_index";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -953,7 +959,17 @@ function bindSmapiSoapServiceToExpress(
                       // and is safe on older S1 hardware); otherwise split into bounded per-letter
                       // buckets so no container ever advertises the huge global total.
                       if (idx.total <= MAX_ALBUMS_FLAT) {
-                        return albums({ type: "alphabeticalByName", ...paging });
+                        // Serve from the snapshot, not a live album fetch: a stale small index must
+                        // never let S2 see the (possibly huge) live catalog total.
+                        return getMetadataResult({
+                          mediaCollection: albumIndexAll(
+                            idx,
+                            paging._index,
+                            paging._count
+                          ).map((it) => album(urlWithToken(apiKey), it)),
+                          index: paging._index,
+                          total: idx.total,
+                        });
                       }
                       const letters = albumIndexLetters(idx);
                       return getMetadataResult({
@@ -992,6 +1008,24 @@ function bindSmapiSoapServiceToExpress(
                       });
                     }
                     return peekedLetter.then((idx) => {
+                      const letterTotal = albumIndexLetterTotal(idx, typeId);
+                      if (letterTotal > MAX_ALBUMS_FLAT) {
+                        // A single letter is itself too big for one S2 container; split it into
+                        // fixed-size sub-buckets so no leaf ever advertises an oversized total.
+                        const chunks = Math.ceil(letterTotal / MAX_ALBUMS_FLAT);
+                        return getMetadataResult({
+                          mediaCollection: range(chunks).map((i) => ({
+                            itemType: "albumList",
+                            id: `albumsChunk:${typeId}_${i}`,
+                            title: `${typeId} · part ${i + 1}`,
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "albums").href()
+                            ),
+                          })),
+                          index: 0,
+                          total: chunks,
+                        });
+                      }
                       // Serve the letter's page straight from the index snapshot (drift-proof: no
                       // live re-fetch by offset). Advertise only this letter's total.
                       const page = albumIndexPage(
@@ -1006,6 +1040,56 @@ function bindSmapiSoapServiceToExpress(
                         ),
                         index: paging._index,
                         total: page.total,
+                      });
+                    });
+                  }
+                  case "albumsChunk": {
+                    // A sub-bucket of an oversized letter: "albumsChunk:<key>_<n>". Parse from the
+                    // right so a "#" key works.
+                    const sep = typeId.lastIndexOf("_");
+                    const chunkKey = sep >= 0 ? typeId.slice(0, sep) : typeId;
+                    const chunk = sep >= 0 ? Number(typeId.slice(sep + 1)) : 0;
+                    const peekedChunk = musicLibrary.peekAlbumIndex();
+                    if (!peekedChunk) {
+                      void musicLibrary.albumIndex().catch(() => undefined);
+                      return getMetadataResult({
+                        mediaCollection: [
+                          {
+                            itemType: "albumList",
+                            id: `albumsChunk:${typeId}`,
+                            title: "Indexing your albums… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "albums").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    }
+                    return peekedChunk.then((idx) => {
+                      const base = chunk * MAX_ALBUMS_FLAT;
+                      const letterTotal = albumIndexLetterTotal(idx, chunkKey);
+                      const chunkTotal = Math.max(
+                        0,
+                        Math.min(MAX_ALBUMS_FLAT, letterTotal - base)
+                      );
+                      const take = Math.min(
+                        paging._count,
+                        Math.max(0, chunkTotal - paging._index)
+                      );
+                      const page = albumIndexPage(
+                        idx,
+                        chunkKey,
+                        base + paging._index,
+                        take
+                      );
+                      return getMetadataResult({
+                        mediaCollection: page.items.map((it) =>
+                          album(urlWithToken(apiKey), it)
+                        ),
+                        index: paging._index,
+                        total: chunkTotal,
                       });
                     });
                   }
