@@ -682,6 +682,7 @@ describe("wsdl api", () => {
     peekAlbumIndex: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
+    topSongs: jest.fn(),
     searchArtists: jest.fn(),
     searchAlbums: jest.fn(),
     searchTracks: jest.fn(),
@@ -1669,37 +1670,43 @@ describe("wsdl api", () => {
               const artistWithManyAlbums = anArtist({
                 albums: [anAlbum(), anAlbum(), anAlbum(), anAlbum(), anAlbum()],
               });
+              const topSongsEntry = {
+                itemType: "trackList",
+                id: `topSongs:${artistWithManyAlbums.id}`,
+                title: "Top Songs",
+                albumArtURI: coverArtURI(bonobUrlWithAccessToken, {
+                  coverArt: artistWithManyAlbums.image,
+                }).href(),
+              };
+              const asAlbumItem = (it: any) => ({
+                itemType: "album",
+                id: `album:${it.id}`,
+                title: it.name,
+                albumArtURI: coverArtURI(bonobUrlWithAccessToken, it).href(),
+                canPlay: true,
+                artistId: `artist:${it.artistId}`,
+                artist: it.artistName,
+              });
 
               beforeEach(() => {
                 musicLibrary.artist.mockResolvedValue(artistWithManyAlbums);
               });
 
-              describe("asking for all albums", () => {
-                it("should return a collection of albums", async () => {
+              describe("the artist view", () => {
+                it("returns a Top Songs entry first, then the albums", async () => {
                   const result = await ws.getMetadataAsync({
                     id: `artist:${artistWithManyAlbums.id}`,
                     index: 0,
                     count: 100,
                   });
-
                   expect(result[0]).toEqual(
                     getMetadataResult({
-                      mediaCollection: artistWithManyAlbums.albums.map(
-                        (it) => ({
-                          itemType: "album",
-                          id: `album:${it.id}`,
-                          title: it.name,
-                          albumArtURI: coverArtURI(
-                            bonobUrlWithAccessToken,
-                            it
-                          ).href(),
-                          canPlay: true,
-                          artistId: `artist:${it.artistId}`,
-                          artist: it.artistName,
-                        })
-                      ),
+                      mediaCollection: [
+                        topSongsEntry,
+                        ...artistWithManyAlbums.albums.map(asAlbumItem),
+                      ],
                       index: 0,
-                      total: artistWithManyAlbums.albums.length,
+                      total: artistWithManyAlbums.albums.length + 1,
                     })
                   );
                   expect(musicLibrary.artist).toHaveBeenCalledWith(
@@ -1707,41 +1714,64 @@ describe("wsdl api", () => {
                   );
                   expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
                 });
-              });
 
-              describe("asking for a page of albums", () => {
-                it("should return just that page", async () => {
+                it("pages the combined [Top Songs, ...albums] list", async () => {
+                  // [Top Songs, a0, a1, a2, a3, a4]; index 2 count 2 -> a1, a2
                   const result = await ws.getMetadataAsync({
                     id: `artist:${artistWithManyAlbums.id}`,
                     index: 2,
                     count: 2,
                   });
-
                   expect(result[0]).toEqual(
                     getMetadataResult({
                       mediaCollection: [
+                        artistWithManyAlbums.albums[1]!,
                         artistWithManyAlbums.albums[2]!,
-                        artistWithManyAlbums.albums[3]!,
-                      ].map((it) => ({
-                        itemType: "album",
-                        id: `album:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          it
-                        ).href(),
-                        canPlay: true,
-                        artistId: `artist:${it.artistId}`,
-                        artist: it.artistName,
-                      })),
+                      ].map(asAlbumItem),
                       index: 2,
-                      total: artistWithManyAlbums.albums.length,
+                      total: artistWithManyAlbums.albums.length + 1,
                     })
                   );
-                  expect(musicLibrary.artist).toHaveBeenCalledWith(
+                });
+              });
+
+              describe("asking for the artist's top songs", () => {
+                const t0 = aTrack();
+                const t1 = aTrack();
+                const t2 = aTrack();
+
+                it("returns top songs as playable track metadata, paged", async () => {
+                  musicLibrary.topSongs.mockResolvedValue([t0, t1, t2]);
+                  const result = await ws.getMetadataAsync({
+                    id: `topSongs:${artistWithManyAlbums.id}`,
+                    index: 1,
+                    count: 2,
+                  });
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(3);
+                  expect(md.index).toEqual(1);
+                  const items = ([] as any[]).concat(md.mediaMetadata);
+                  expect(items.map((m) => m.id)).toEqual([
+                    `track:${t1.id}`,
+                    `track:${t2.id}`,
+                  ]);
+                  expect(items.every((m) => m.itemType === "track")).toBe(true);
+                  expect(items[0].trackMetadata.artist).toEqual(t1.artist.name);
+                  expect(musicLibrary.topSongs).toHaveBeenCalledWith(
                     artistWithManyAlbums.id
                   );
-                  expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
+                });
+
+                it("handles an artist with no top songs", async () => {
+                  musicLibrary.topSongs.mockResolvedValue([]);
+                  const result = await ws.getMetadataAsync({
+                    id: `topSongs:${artistWithManyAlbums.id}`,
+                    index: 0,
+                    count: 100,
+                  });
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(0);
+                  expect(md.count).toEqual(0);
                 });
               });
             });
