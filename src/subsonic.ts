@@ -133,11 +133,16 @@ const hextetsToIPv4 = (hi: number, lo: number): string =>
 const isPrivateIPv6 = (host: string): boolean => {
   const g = expandIPv6(host.toLowerCase());
   if (!g) return true; // unparseable -> treat as unsafe
-  // ::/96 and ::ffff:0:0/96 embed an IPv4 in the low 32 bits (also catches :: and ::1)
-  const lowThirtyTwoIsIPv4Embedding =
-    g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0;
-  if (lowThirtyTwoIsIPv4Embedding && (g[5] === 0 || g[5] === 0xffff)) {
-    if (g[5] === 0 && g[6] === 0 && g[7]! <= 1) return true; // :: or ::1
+  const high64Zero = g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0;
+  // Prefixes that embed an IPv4 in the low 32 bits: ::/96 (IPv4-compatible, also :: and ::1),
+  // ::ffff:0:0/96 IPv4-mapped (ffff at hextet 5), and ::ffff:0:0/96 IPv4-translated/SIIT (ffff at
+  // hextet 4). Decode the low 32 bits and reject a private/loopback/link-local IPv4.
+  if (
+    high64Zero &&
+    ((g[4] === 0 && (g[5] === 0 || g[5] === 0xffff)) ||
+      (g[4] === 0xffff && g[5] === 0))
+  ) {
+    if (g[4] === 0 && g[5] === 0 && g[6] === 0 && g[7]! <= 1) return true; // :: or ::1
     return isPrivateIPv4(hextetsToIPv4(g[6]!, g[7]!));
   }
   // NAT64 well-known prefix 64:ff9b::/96 translates to an IPv4 - block the whole prefix.
@@ -149,6 +154,10 @@ const isPrivateIPv6 = (host: string): boolean => {
     g[4] === 0 &&
     g[5] === 0
   ) {
+    return true;
+  }
+  // 6to4 2002::/16 embeds an IPv4 in hextets 1-2 - reject if that IPv4 is private.
+  if (g[0] === 0x2002 && isPrivateIPv4(hextetsToIPv4(g[1]!, g[2]!))) {
     return true;
   }
   // unique-local fc00::/7, link-local fe80::/10, multicast ff00::/8
