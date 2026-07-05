@@ -571,7 +571,26 @@ describe("SubsonicMusicLibrary_new", () => {
   
           expect(subsonic.getArtist).toHaveBeenCalledWith(credentials, id);
           expect(subsonic.getArtistInfo).toHaveBeenCalledWith(credentials, id);
-        });  
+        });
+      });
+
+      describe("when the artistInfo (Last.fm) enrichment lookup fails", () => {
+        // A flaky/rate-limited external enrichment (bio + similar artists) must NEVER break
+        // browsing an artist: fast-scrolling into artists fires many getArtistInfo2 calls, and one
+        // failing would otherwise reject the whole artist view ("something went wrong" in Sonos).
+        it("still returns the artist and its albums, just without bio/similar", async () => {
+          const albums = [anAlbumSummary(), anAlbumSummary()];
+          subsonic.getArtist.mockResolvedValue({ id, name, artistImageUrl: "http://someImage", albums });
+          subsonic.getArtistInfo.mockRejectedValue(new Error("last.fm timeout"));
+
+          const result = await library.artist(id);
+
+          expect(result.id).toEqual(id);
+          expect(result.name).toEqual(name);
+          expect(result.albums).toEqual(albums);
+          expect(result.similarArtists).toEqual([]);
+          expect(result.biography).toBeUndefined();
+        });
       });
 
       describe("when the artist has no valid artistImageUrl, or valid images in artistInfo" , () => {

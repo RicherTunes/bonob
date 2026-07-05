@@ -124,7 +124,15 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   artist = async (id: string): Promise<Artist> =>
     Promise.all([
       this.subsonic.getArtist(this.credentials, id),
-      this.subsonic.getArtistInfo(this.credentials, id),
+      // getArtistInfo is external enrichment (Last.fm: bio + similar + extra images) and is flaky
+      // and rate-limited. Fast-scrolling into artists fires many of these; a single failure must
+      // NOT reject the whole artist browse (Sonos "something went wrong"). Degrade to no bio/
+      // similar/images and still serve the artist + its albums.
+      this.subsonic.getArtistInfo(this.credentials, id).catch(() => ({
+        biography: undefined,
+        similarArtist: [],
+        images: { s: undefined, m: undefined, l: undefined },
+      })),
     ]).then(([artist, artistInfo]) => ({
       id: artist.id,
       name: artist.name,
