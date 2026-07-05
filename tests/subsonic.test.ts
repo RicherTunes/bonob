@@ -139,6 +139,17 @@ describe("isSafeExternalImageUrl (SSRF guard for server-fetched external art)", 
     }
   });
 
+  it("blocks SIIT (::ffff:0:0/96 translated) + 6to4 (2002::/16) embedded private IPv4", () => {
+    for (const url of [
+      "http://[::ffff:0:a9fe:a9fe]/meta", // SIIT 169.254.169.254
+      "http://[::ffff:0:7f00:1]/a.jpg", // SIIT 127.0.0.1
+      "http://[2002:a9fe:a9fe::]/meta", // 6to4 169.254.169.254
+      "http://[2002:7f00:1::]/a.jpg", // 6to4 127.0.0.1
+    ]) {
+      expect(isSafeExternalImageUrl(url)).toBe(false);
+    }
+  });
+
   it("still allows a normal public IPv6 host", () => {
     expect(isSafeExternalImageUrl("http://[2606:4700:4700::1111]/a.jpg")).toBe(
       true
