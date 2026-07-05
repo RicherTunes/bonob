@@ -5,6 +5,7 @@ import logger from "./logger";
 
 import {
   axiosImageFetcher,
+  deezerImageFetcher,
   cachingImageFetcher,
   TranscodingCustomPlayers,
   NO_CUSTOM_PLAYERS,
@@ -44,6 +45,11 @@ const customPlayers = config.subsonic.customClientsFor
 const artistImageFetcher = config.subsonic.artistImageCache
   ? cachingImageFetcher(config.subsonic.artistImageCache, axiosImageFetcher)
   : axiosImageFetcher;
+
+// Deezer art: same byte cache as external art, but over the redirect-refusing fetcher (SSRF).
+const deezerArtResolver = config.subsonic.artistImageCache
+  ? cachingImageFetcher(config.subsonic.artistImageCache, deezerImageFetcher)
+  : deezerImageFetcher;
 
 // Freeze a loaded value and everything nested in it, matching how fetched summaries are
 // frozen — a persisted entry restored from disk must be just as immutable as a live one.
@@ -150,6 +156,7 @@ const app = server(
     version,
     smapiAuthTokens: new JWTSmapiLoginTokens(clock, config.secret, config.authTimeout),
     externalImageResolver: artistImageFetcher,
+    deezerImageResolver: deezerArtResolver,
     deezerArtistImage: cachedDeezerArtistImage,
     loginTheme: config.loginTheme,
     enableS1: config.sonos.enableS1,

@@ -37,7 +37,7 @@ import _ from "underscore";
 import morgan from "morgan";
 import { parse, BUrn } from "./burn";
 import { deezerArtistImageUrl } from "./deezer";
-import { axiosImageFetcher, ImageFetcher } from "./subsonic";
+import { axiosImageFetcher, deezerImageFetcher, ImageFetcher } from "./subsonic";
 import {
   JWTSmapiLoginTokens,
   SmapiAuthTokens,
@@ -106,6 +106,9 @@ export type ServerOpts = {
   externalImageResolver: ImageFetcher;
   // Resolve an artist name to a real photo URL (Deezer). Cached at the app boundary.
   deezerArtistImage: (name: string) => Promise<string | undefined>;
+  // Fetch a resolved Deezer image URL. Separate from externalImageResolver so it can refuse
+  // redirects (the SSRF allowlist only checks the initial *.dzcdn.net URL).
+  deezerImageResolver: ImageFetcher;
   loginTheme: string;
   enableS1: boolean;
 };
@@ -127,6 +130,7 @@ const DEFAULT_SERVER_OPTS: ServerOpts = {
   ),
   externalImageResolver: axiosImageFetcher,
   deezerArtistImage: deezerArtistImageUrl,
+  deezerImageResolver: deezerImageFetcher,
   loginTheme: DEFAULT_LOGIN_THEME,
   enableS1: false,
 };
@@ -636,11 +640,12 @@ function server(
       .login(serviceToken)
       .then((musicLibrary) => {
         if (urn.system == "deezer") {
-          // Resolve the artist name to a real Deezer photo URL (cached), then proxy the image.
+          // Resolve the artist name to a real Deezer photo URL (cached), then proxy the image with
+          // a redirect-refusing fetcher (the allowlist only validated the initial dzcdn.net URL).
           return serverOpts
             .deezerArtistImage(urn.resource)
             .then((url) =>
-              url ? serverOpts.externalImageResolver(url) : undefined
+              url ? serverOpts.deezerImageResolver(url) : undefined
             );
         } else if (urn.system == "external") {
           return serverOpts.externalImageResolver(urn.resource);
@@ -652,9 +657,15 @@ function server(
         if(coverArt == undefined) {
           res.setHeader("Cache-Control", "private, max-age=60");
           return res.status(404).send();
-        } else if(isValidMimeType(coverArt.contentType)) {
+        } else if (
+          (coverArt.contentType || "").toLowerCase().startsWith("image/") &&
+          isValidMimeType(coverArt.contentType)
+        ) {
+          // Only serve genuine images. An upstream error page / hotlink HTML must never be cached
+          // and served as art; nosniff stops a client re-interpreting the bytes.
           res.status(200);
           res.setHeader("content-type", coverArt.contentType);
+          res.setHeader("X-Content-Type-Options", "nosniff");
           res.setHeader("Cache-Control", "private, max-age=86400");
           return res.send(coverArt.data);
         } else {

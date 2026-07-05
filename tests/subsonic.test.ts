@@ -948,6 +948,79 @@ describe("Subsonic", () => {
         });
       });
 
+      describe("total advertised to Sonos per album-list type", () => {
+        const artist = anArtist();
+        // a FULL page (== the 500 fetch size): the point at which the old code advertised the
+        // whole-catalog total. S2 rejects an oversized container, so filtered sections must not.
+        const fullPage: [Artist, AlbumSummary][] = Array.from(
+          { length: 500 },
+          () => [artist, anAlbumSummary()] as [Artist, AlbumSummary]
+        );
+
+        beforeEach(() => {
+          mockGET.mockImplementation((u: string) =>
+            Promise.resolve(
+              ok(
+                u.includes("getAlbumList2")
+                  ? getAlbumListJson(fullPage)
+                  : asArtistsJson(cached)
+              )
+            )
+          );
+        });
+
+        it("bounds a filtered section's total (index + count + one look-ahead page), never the catalog total", async () => {
+          const genre = await cachingSubsonic.getAlbumList2(credentials, {
+            _index: 0,
+            _count: 100,
+            type: "byGenre",
+            genre: "UG9w",
+          });
+          expect(genre.results.length).toBe(100);
+          // 0 + 100 (this page) + 100 (there may be one more) - deterministic, and far below the
+          // real catalog total the global getArtists sum would give.
+          expect(genre.total).toBe(200);
+        });
+
+        it("returns the exact end for a short filtered page (no phantom extra page)", async () => {
+          const shortPage: [Artist, AlbumSummary][] = [
+            [artist, anAlbumSummary()],
+            [artist, anAlbumSummary()],
+          ];
+          mockGET.mockImplementation((u: string) =>
+            Promise.resolve(
+              ok(
+                u.includes("getAlbumList2")
+                  ? getAlbumListJson(shortPage)
+                  : asArtistsJson(cached)
+              )
+            )
+          );
+          const genre = await cachingSubsonic.getAlbumList2(credentials, {
+            _index: 40,
+            _count: 100,
+            type: "byYear",
+            fromYear: "0",
+            toYear: "0",
+          });
+          expect(genre.results.length).toBe(2);
+          expect(genre.total).toBe(42); // 40 + 2, no look-ahead beyond the real end
+        });
+
+        it("still advertises the true catalog total for the unfiltered flat list on a full page", async () => {
+          const globalTotal = cached.reduce(
+            (sum: number, a: any) => sum + a.albums.length,
+            0
+          );
+          const flat = await cachingSubsonic.getAlbumList2(credentials, {
+            _index: 0,
+            _count: 100,
+            type: "alphabeticalByName",
+          });
+          expect(flat.total).toBe(globalTotal);
+        });
+      });
+
       it("getAlbumIndex scans alphabeticalByName and buckets by first letter", async () => {
         const artist = anArtist();
         const page: [Artist, AlbumSummary][] = [
