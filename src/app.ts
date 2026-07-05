@@ -75,6 +75,9 @@ const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
     ? fileStore(path.join(config.subsonic.cacheDir, "index"))
     : undefined,
   revive: deepFreeze,
+  // The full-catalog scan legitimately takes several minutes on a large library; the default
+  // 60s backstop would abort it before it ever completes. Give it a generous ceiling.
+  backstopMs: 20 * 60 * 1000,
 });
 
 const subsonic = new SubsonicMusicService(

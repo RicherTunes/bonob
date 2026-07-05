@@ -928,37 +928,23 @@ function bindSmapiSoapServiceToExpress(
                     // the (multi-minute) index scan.
                     const peeked = musicLibrary.peekAlbumIndex();
                     if (!peeked) {
-                      // Index still building: kick it, and meanwhile offer bounded sections.
+                      // Index still building (a multi-minute first-time scan); kick it and show a
+                      // single self-retry placeholder rather than duplicating other sections. The
+                      // placeholder points back at "albums", so re-opening it retries.
                       void musicLibrary.albumIndex().catch(() => undefined);
                       return getMetadataResult({
                         mediaCollection: [
                           {
-                            id: "recentlyAdded",
-                            title: lang("recentlyAdded"),
-                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "recentlyAdded").href()),
                             itemType: "albumList",
-                          },
-                          {
-                            id: "genres",
-                            title: lang("genres"),
-                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "genres").href()),
-                            itemType: "container",
-                          },
-                          {
-                            id: "years",
-                            title: lang("years"),
-                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "music").href()),
-                            itemType: "container",
-                          },
-                          {
-                            id: "randomAlbums",
-                            title: lang("random"),
-                            albumArtURI: albumArtURI(iconArtURI(bonobUrl, "random").href()),
-                            itemType: "albumList",
+                            id: "albums",
+                            title: "Indexing your albums… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "albums").href()
+                            ),
                           },
                         ],
                         index: 0,
-                        total: 4,
+                        total: 1,
                       });
                     }
                     return peeked.then((idx) => {
