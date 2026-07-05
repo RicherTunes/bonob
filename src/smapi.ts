@@ -671,7 +671,9 @@ function bindSmapiSoapServiceToExpress(
                       getMediaMetadataResult: {}
                     }
                 }
-              }),
+              })
+              // strip XML-invalid control chars from tag text so one bad tag can't break the page
+              .then(sanitizeXml),
           search: async (
             { id, term }: { id: string; term: string },
             _,
@@ -779,10 +781,11 @@ function bindSmapiSoapServiceToExpress(
                   default:
                     logger.info(`Sonos requested extended meta data for currently unsupported type=${type}, typeId=${typeId}`)
                     return {
-                      getExtendedMetadataResult: {}                      
+                      getExtendedMetadataResult: {}
                     };
                 }
-              }),
+              })
+              .then(sanitizeXml),
           getExtendedMetadataText: async (
             { id, type: textType }: { id: string; type: string },
             _,
@@ -803,7 +806,8 @@ function bindSmapiSoapServiceToExpress(
                   `Sonos requested extended metadata text for currently unsupported type=${textType}, id=${id}`
                 );
                 return { getExtendedMetadataTextResult: "" };
-              }),
+              })
+              .then(sanitizeXml),
           getMetadata: async (
             {
               id,

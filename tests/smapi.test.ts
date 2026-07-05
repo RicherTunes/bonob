@@ -2907,6 +2907,35 @@ describe("wsdl api", () => {
                     getExtendedMetadataTextResult: "an influential dance-punk band",
                   });
                 });
+
+                it("getExtendedMetadataText strips XML-invalid control chars from the biography", async () => {
+                  const bad = String.fromCharCode(4);
+                  musicLibrary.artist.mockResolvedValue({
+                    ...artist,
+                    biography: "Great" + bad + " band" + bad,
+                  });
+                  const root = await ws.getExtendedMetadataTextAsync({
+                    id: `artist:${artist.id}`,
+                    type: "ARTIST_BIO",
+                  });
+                  expect(root[0]).toEqual({
+                    getExtendedMetadataTextResult: "Great band",
+                  });
+                });
+
+                it("getExtendedMetadata strips control chars from the artist name", async () => {
+                  const bad = String.fromCharCode(4);
+                  musicLibrary.artist.mockResolvedValue({
+                    ...artist,
+                    name: "Bad" + bad + "Name",
+                  });
+                  const root = await ws.getExtendedMetadataAsync({
+                    id: `artist:${artist.id}`,
+                  });
+                  expect(
+                    root[0].getExtendedMetadataResult.mediaCollection.title
+                  ).toEqual("BadName");
+                });
               });
 
               describe("when none of the similar artists are in the library", () => {
@@ -3208,6 +3237,20 @@ describe("wsdl api", () => {
                 expect(musicService.login).toHaveBeenCalledWith(serviceToken);
                 expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
                 expect(musicLibrary.track).toHaveBeenCalledWith(someTrack.id);
+              });
+
+              it("strips XML-invalid control chars from track metadata", async () => {
+                const bad = String.fromCharCode(4);
+                musicLibrary.track.mockResolvedValue({
+                  ...someTrack,
+                  name: "Awaken" + bad + " My Love!",
+                });
+                const root = await ws.getMediaMetadataAsync({
+                  id: `track:${someTrack.id}`,
+                });
+                // the response round-trips as valid XML (would have failed otherwise) and is clean
+                expect(JSON.stringify(root[0])).not.toContain(bad);
+                expect(JSON.stringify(root[0])).toContain("Awaken My Love!");
               });
             });
 
