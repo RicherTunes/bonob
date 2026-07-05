@@ -93,32 +93,69 @@ const isPrivateIPv4 = (host: string): boolean => {
   );
 };
 
-const isPrivateIPv6 = (host: string): boolean => {
-  const h = host.toLowerCase();
-  if (h === "::" || h === "::1") return true;
-  if (h.startsWith("::ffff:")) {
-    const mapped = h.slice("::ffff:".length);
-    // dotted IPv4-mapped form, e.g. ::ffff:127.0.0.1
-    if (isIP(mapped) === 4) return isPrivateIPv4(mapped);
-    // hex-hextet IPv4-mapped form (how Node/WHATWG canonicalizes it), e.g. ::ffff:7f00:1
-    const hextets = mapped.split(":");
-    if (hextets.length === 2) {
-      const hi = Number.parseInt(hextets[0] || "", 16);
-      const lo = Number.parseInt(hextets[1] || "", 16);
-      if (Number.isFinite(hi) && Number.isFinite(lo)) {
-        return isPrivateIPv4(
-          `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`
-        );
+// Expand an IPv6 string to its 8 16-bit hextets, resolving "::" zero-compression and a trailing
+// embedded dotted IPv4 (e.g. ::ffff:127.0.0.1). Returns undefined if unparseable.
+const expandIPv6 = (addr: string): number[] | undefined => {
+  const a = addr.split("%")[0]!; // drop any zone id
+  if (a === "::") return [0, 0, 0, 0, 0, 0, 0, 0];
+  const sides = a.split("::");
+  if (sides.length > 2) return undefined;
+  const parseGroups = (s: string | undefined): number[] | undefined => {
+    if (!s) return [];
+    const groups = s.split(":");
+    const out: number[] = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i]!;
+      if (g.includes(".")) {
+        if (i !== groups.length - 1 || isIP(g) !== 4) return undefined;
+        const o = g.split(".").map((x) => Number(x));
+        out.push(((o[0]! << 8) | o[1]!) & 0xffff, ((o[2]! << 8) | o[3]!) & 0xffff);
+      } else {
+        if (!/^[0-9a-f]{1,4}$/.test(g)) return undefined;
+        out.push(Number.parseInt(g, 16));
       }
     }
+    return out;
+  };
+  const head = parseGroups(sides[0]);
+  if (!head) return undefined;
+  if (sides.length === 1) return head.length === 8 ? head : undefined;
+  const tail = parseGroups(sides[1]);
+  if (!tail) return undefined;
+  const fill = 8 - head.length - tail.length;
+  if (fill < 1) return undefined; // "::" must stand for at least one zero group
+  return [...head, ...Array(fill).fill(0), ...tail];
+};
+
+const hextetsToIPv4 = (hi: number, lo: number): string =>
+  `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`;
+
+const isPrivateIPv6 = (host: string): boolean => {
+  const g = expandIPv6(host.toLowerCase());
+  if (!g) return true; // unparseable -> treat as unsafe
+  // ::/96 and ::ffff:0:0/96 embed an IPv4 in the low 32 bits (also catches :: and ::1)
+  const lowThirtyTwoIsIPv4Embedding =
+    g[0] === 0 && g[1] === 0 && g[2] === 0 && g[3] === 0 && g[4] === 0;
+  if (lowThirtyTwoIsIPv4Embedding && (g[5] === 0 || g[5] === 0xffff)) {
+    if (g[5] === 0 && g[6] === 0 && g[7]! <= 1) return true; // :: or ::1
+    return isPrivateIPv4(hextetsToIPv4(g[6]!, g[7]!));
+  }
+  // NAT64 well-known prefix 64:ff9b::/96 translates to an IPv4 - block the whole prefix.
+  if (
+    g[0] === 0x64 &&
+    g[1] === 0xff9b &&
+    g[2] === 0 &&
+    g[3] === 0 &&
+    g[4] === 0 &&
+    g[5] === 0
+  ) {
     return true;
   }
-  const first = Number.parseInt(h.split(":")[0] || "0", 16);
-  if (!Number.isFinite(first)) return true;
+  // unique-local fc00::/7, link-local fe80::/10, multicast ff00::/8
   return (
-    (first & 0xfe00) === 0xfc00 ||
-    (first & 0xffc0) === 0xfe80 ||
-    (first & 0xff00) === 0xff00
+    (g[0]! & 0xfe00) === 0xfc00 ||
+    (g[0]! & 0xffc0) === 0xfe80 ||
+    (g[0]! & 0xff00) === 0xff00
   );
 };
 
@@ -810,15 +847,41 @@ const imageFetcherWith =
       }))
       .catch(() => undefined);
 
-// Generic external art is server-fetched from third-party metadata: refuse redirects so a
-// safe-looking URL cannot 30x to an internal address. The URL is also validated at sign time and
-// again in the /art route via isSafeExternalImageUrl.
-// SSRF: before fetching generic external art, resolve the host and refuse if any resolved address
-// is private/loopback/link-local/metadata. This guards DNS names (e.g. 169.254.169.254.nip.io) that
-// pass the literal-IP host check but resolve to an internal address. maxRedirects:0 stops a 30x to
-// an internal host. (A residual DNS-rebind TOCTOU between this check and the socket connect remains;
-// pinning the connection to the validated address would fully close it.)
-const externalImageFetcher = imageFetcherWith({ maxRedirects: 0 });
+// Generic external art is server-fetched from third-party metadata, so a compromised backend could
+// point it at an internal address. Three layers of SSRF defence:
+//   1. isSafeExternalImageUrl + resolvedExternalHostIsSafe reject unsafe hosts/resolutions up front;
+//   2. maxRedirects:0 stops a 30x to an internal host;
+//   3. pinnedSafeExternalLookup resolves ONCE, validates every returned address, and returns the
+//      address axios actually connects to - closing the DNS-rebind TOCTOU (the pre-check could see a
+//      public answer while the socket got a private one).
+// axios callbackifies a promise-style custom lookup (verified against the installed axios http
+// adapter), so this is async and returns { address, family } (or an array when opt.all is set).
+export const pinnedSafeExternalLookup = async (
+  hostname: string,
+  options?: { family?: number; hints?: number; all?: boolean }
+): Promise<{ address: string; family: number } | { address: string; family: number }[]> => {
+  const resolved = await dnsPromises.lookup(hostname, {
+    all: true,
+    family: options?.family,
+    hints: options?.hints,
+  });
+  const unsafe = resolved.find((a) => isUnsafeExternalImageHost(a.address));
+  if (unsafe) {
+    throw new Error(
+      `refusing external art host '${hostname}' that resolves to '${unsafe.address}'`
+    );
+  }
+  const first = resolved[0];
+  if (!first) throw new Error(`no address for external art host '${hostname}'`);
+  return options?.all
+    ? resolved.map((a) => ({ address: a.address, family: a.family }))
+    : { address: first.address, family: first.family };
+};
+
+const externalImageFetcher = imageFetcherWith({
+  maxRedirects: 0,
+  lookup: pinnedSafeExternalLookup,
+});
 
 export const resolvedExternalHostIsSafe = async (url: string): Promise<boolean> => {
   try {
