@@ -29,7 +29,7 @@ import { asLANGs, I8N } from "./i8n";
 import { ICON, iconForGenre } from "./icon";
 import _ from "underscore";
 import { BUrn, formatForURL } from "./burn";
-import { albumIndexLetters, albumIndexRangesFor } from "./album_index";
+import { albumIndexLetters, albumIndexPage } from "./album_index";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -974,44 +974,21 @@ function bindSmapiSoapServiceToExpress(
                     return (
                       musicLibrary.peekAlbumIndex() ?? musicLibrary.albumIndex()
                     ).then((idx) => {
-                      // A letter is one or more contiguous ranges in alphabeticalByName order.
-                      // Map the requested (index,count) window across them into concrete fetches
-                      // (usually just one) and advertise only this letter's total.
-                      const ranges = albumIndexRangesFor(idx, typeId);
-                      const total = ranges.reduce((sum, r) => sum + r.count, 0);
-                      let skip = paging._index;
-                      let take = paging._count;
-                      const fetches: { offset: number; count: number }[] = [];
-                      for (const r of ranges) {
-                        if (take <= 0) break;
-                        if (skip >= r.count) {
-                          skip -= r.count;
-                          continue;
-                        }
-                        const count = Math.min(r.count - skip, take);
-                        fetches.push({ offset: r.offset + skip, count });
-                        take -= count;
-                        skip = 0;
-                      }
-                      return Promise.all(
-                        fetches.map((f) =>
-                          musicLibrary
-                            .albums({
-                              type: "alphabeticalByName",
-                              _index: f.offset,
-                              _count: f.count,
-                            })
-                            .then((result) => result.results.slice(0, f.count))
-                        )
-                      ).then((pages) =>
-                        getMetadataResult({
-                          mediaCollection: pages
-                            .flat()
-                            .map((it) => album(urlWithToken(apiKey), it)),
-                          index: paging._index,
-                          total,
-                        })
+                      // Serve the letter's page straight from the index snapshot (drift-proof: no
+                      // live re-fetch by offset). Advertise only this letter's total.
+                      const page = albumIndexPage(
+                        idx,
+                        typeId,
+                        paging._index,
+                        paging._count
                       );
+                      return getMetadataResult({
+                        mediaCollection: page.items.map((it) =>
+                          album(urlWithToken(apiKey), it)
+                        ),
+                        index: paging._index,
+                        total: page.total,
+                      });
                     });
                   case "genre":
                     return albums({

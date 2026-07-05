@@ -193,12 +193,12 @@ export interface MusicLibrary {
   artists(q: ArtistQuery): Promise<Result<ArtistSummary>>;
   artist(id: string): Promise<Artist>;
   albums(q: AlbumQuery): Promise<Result<AlbumSummary>>;
-  // Cached alphabetical album index, used to break the huge flat album list into bounded
-  // per-letter buckets (Sonos rejects a single container advertising a very large total).
-  albumIndex(): Promise<AlbumIndex>;
+  // Cached alphabetical album index (a self-contained snapshot of album summaries), used to break
+  // the huge flat album list into bounded per-letter buckets served drift-proof from the snapshot.
+  albumIndex(): Promise<AlbumIndex<AlbumSummary>>;
   // Non-blocking peek: the index if already built, else undefined (browse falls back while
   // the multi-minute scan runs). Returns the already-resolved promise when warm.
-  peekAlbumIndex(): Promise<AlbumIndex> | undefined;
+  peekAlbumIndex(): Promise<AlbumIndex<AlbumSummary>> | undefined;
   album(id: string): Promise<Album>;
   track(trackId: string): Promise<Track>;
   genres(): Promise<Genre[]>;

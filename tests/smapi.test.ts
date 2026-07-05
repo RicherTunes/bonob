@@ -2308,17 +2308,24 @@ describe("wsdl api", () => {
               });
 
               describe("asking for a letter's albums (albumsByLetter)", () => {
-                it("pages within the bucket and advertises only the bucket's total", async () => {
+                const albumItem = (it: any) => ({
+                  itemType: "album",
+                  id: `album:${it.id}`,
+                  title: it.name,
+                  albumArtURI: coverArtURI(bonobUrlWithAccessToken, it).href(),
+                  canPlay: true,
+                  artistId: `artist:${it.artistId}`,
+                  artist: it.artistName,
+                });
+
+                it("pages a letter from the snapshot, advertising only the letter's total", async () => {
                   musicLibrary.peekAlbumIndex.mockReturnValue(
                     Promise.resolve({
-                      total: 6,
+                      total: 4,
                       buckets: [{ key: "P", label: "P", offset: 0, count: 4 }],
+                      items: [pop1, pop2, pop3, pop4],
                     })
                   );
-                  musicLibrary.albums.mockResolvedValue({
-                    results: [pop3, pop4],
-                    total: 6,
-                  });
 
                   const result = await ws.getMetadataAsync({
                     id: "albumsByLetter:P",
@@ -2328,47 +2335,31 @@ describe("wsdl api", () => {
 
                   expect(result[0]).toEqual(
                     getMetadataResult({
-                      mediaCollection: [pop3, pop4].map((it) => ({
-                        itemType: "album",
-                        id: `album:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          it
-                        ).href(),
-                        canPlay: true,
-                        artistId: `artist:${it.artistId}`,
-                        artist: it.artistName,
-                      })),
+                      mediaCollection: [pop3, pop4].map(albumItem),
                       index: 2,
-                      total: 4, // the bucket count, NOT the global catalog total
+                      total: 4, // the letter count, NOT the global catalog total
                     })
                   );
-
-                  // fetched from the bucket's global offset (0 + index 2), clamped to the bucket
-                  expect(musicLibrary.albums).toHaveBeenCalledWith({
-                    type: "alphabeticalByName",
-                    _index: 2,
-                    _count: 2,
-                  });
                 });
 
-                it("pages across a letter split into non-contiguous ranges", async () => {
-                  // "P" appears in two contiguous runs (a stray title sorts between them). The
-                  // leaf must page across both and advertise only P's combined total.
+                it("pages across a letter split into non-contiguous ranges (stray title)", async () => {
+                  // "P" appears in two runs (a stray sorts between them); the page must span both,
+                  // served straight from the snapshot with no live re-fetch (drift-proof).
+                  const items = new Array(13).fill(pop1);
+                  items[1] = pop2;
+                  items[10] = pop3;
+                  items[11] = pop4;
                   musicLibrary.peekAlbumIndex.mockReturnValue(
                     Promise.resolve({
-                      total: 100,
+                      total: 13,
                       buckets: [
                         { key: "P", label: "P", offset: 0, count: 2 },
                         { key: "Q", label: "Q", offset: 2, count: 8 },
                         { key: "P", label: "P", offset: 10, count: 3 },
                       ],
+                      items,
                     })
                   );
-                  musicLibrary.albums
-                    .mockResolvedValueOnce({ results: [pop2], total: 100 })
-                    .mockResolvedValueOnce({ results: [pop3, pop4], total: 100 });
 
                   const result = await ws.getMetadataAsync({
                     id: "albumsByLetter:P",
@@ -2378,34 +2369,11 @@ describe("wsdl api", () => {
 
                   expect(result[0]).toEqual(
                     getMetadataResult({
-                      mediaCollection: [pop2, pop3, pop4].map((it) => ({
-                        itemType: "album",
-                        id: `album:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          it
-                        ).href(),
-                        canPlay: true,
-                        artistId: `artist:${it.artistId}`,
-                        artist: it.artistName,
-                      })),
+                      mediaCollection: [pop2, pop3, pop4].map(albumItem),
                       index: 1,
-                      total: 5, // 2 + 3 across both P ranges, never the global 100
+                      total: 5, // 2 + 3 across both P ranges, never the global 13
                     })
                   );
-                  // window (index 1, count 3): 1 from the first run at offset 1, 2 from the
-                  // second run at offset 10
-                  expect(musicLibrary.albums).toHaveBeenNthCalledWith(1, {
-                    type: "alphabeticalByName",
-                    _index: 1,
-                    _count: 1,
-                  });
-                  expect(musicLibrary.albums).toHaveBeenNthCalledWith(2, {
-                    type: "alphabeticalByName",
-                    _index: 10,
-                    _count: 2,
-                  });
                 });
               });
 

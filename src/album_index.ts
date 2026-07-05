@@ -1,21 +1,27 @@
 // A cached alphabetical index of the album catalog, used to break the huge flat "Albums" list
 // into bounded per-letter buckets (Sonos S2 rejects a single browsable container that advertises
-// a very large total). The index records CONTIGUOUS runs of same-letter albums in the
-// getAlbumList2(type=alphabeticalByName) order, so every (offset,count) range is exact even when a
-// title lands outside its apparent letter (Navidrome's collation and ours can never match 100%).
+// a very large total).
+//
+// It stores the scanned album snapshot (`items`) plus CONTIGUOUS runs of same-letter albums; run
+// offsets index the immutable snapshot, NOT live getAlbumList2. This is deliberate: Navidrome
+// re-scans reorder the catalog, so serving a letter by re-fetching live offsets drifts and returns
+// wrong-letter albums. Serving from the snapshot is drift-proof (the snapshot only changes when the
+// whole index is rebuilt).
 
 export type AlbumIndexBucket = {
   key: string; // bucket key (a letter A-Z, or "#" for non-letters)
   label: string; // display label
-  offset: number; // offset of this run's first album in alphabeticalByName order
+  offset: number; // offset of this run's first album in the snapshot (`items`)
   count: number; // number of albums in this contiguous run
 };
 
-export type AlbumIndex = {
+export type AlbumIndex<T = { name: string }> = {
   total: number;
   // Contiguous runs in scan order. A letter may appear in more than one run when a stray title
   // sorts away from its neighbours; correctness does not depend on runs being one-per-letter.
   buckets: AlbumIndexBucket[];
+  // The scanned album snapshot, in scan order. Runs index into this array.
+  items: T[];
 };
 
 // Navidrome's default ND_IGNOREDARTICLES ("The El La Los Las Le Les Os As O A"): leading articles
@@ -64,18 +70,20 @@ export function albumBucketKey(
 const compareBucketKeys = (a: string, b: string): number =>
   a === b ? 0 : a === "#" ? -1 : b === "#" ? 1 : a < b ? -1 : 1;
 
-// Reduce the scanned album pages (in alphabeticalByName order) into contiguous runs. Pure so it
-// can be unit-tested without the Subsonic client. A new run starts whenever the bucket key changes
-// from the previous album, so each run is an exact [offset, offset+count) slice of the catalog.
-export function buildAlbumIndexFromPages(
-  pages: { name: string }[][],
+// Reduce the scanned album pages (in alphabeticalByName order) into the snapshot + contiguous runs.
+// Pure so it can be unit-tested without the Subsonic client. A new run starts whenever the bucket
+// key changes, so each run is an exact [offset, offset+count) slice of the stored `items` snapshot.
+export function buildAlbumIndexFromPages<T extends { name: string }>(
+  pages: T[][],
   ignoredArticles?: string[]
-): AlbumIndex {
+): AlbumIndex<T> {
   const buckets: AlbumIndexBucket[] = [];
+  const items: T[] = [];
   let offset = 0;
   let current: AlbumIndexBucket | undefined;
   for (const page of pages) {
     for (const album of page) {
+      items.push(album);
       const key = albumBucketKey(album.name, ignoredArticles);
       if (!current || current.key !== key) {
         current = { key, label: key, offset, count: 0 };
@@ -85,14 +93,43 @@ export function buildAlbumIndexFromPages(
       offset++;
     }
   }
-  return { total: offset, buckets };
+  return { total: offset, buckets, items };
+}
+
+// Serve one page of a letter directly from the stored snapshot: gather the letter's contiguous
+// runs and slice `items` across them. Drift-proof - never re-fetches by live offset. Returns the
+// page's items and the letter's total (so the container never advertises the whole-catalog total).
+export function albumIndexPage<T>(
+  index: AlbumIndex<T>,
+  key: string,
+  pageIndex: number,
+  pageCount: number
+): { items: T[]; total: number } {
+  const ranges = albumIndexRangesFor(index, key);
+  const total = ranges.reduce((sum, r) => sum + r.count, 0);
+  const items: T[] = [];
+  let skip = pageIndex;
+  let take = pageCount;
+  for (const r of ranges) {
+    if (take <= 0) break;
+    if (skip >= r.count) {
+      skip -= r.count;
+      continue;
+    }
+    const from = r.offset + skip;
+    const n = Math.min(r.count - skip, take);
+    for (let i = from; i < from + n; i++) items.push(index.items[i]!);
+    take -= n;
+    skip = 0;
+  }
+  return { items, total };
 }
 
 // The distinct letters to show in the Albums A-Z menu, each once, ordered "#" then A..Z. The
 // underlying runs are scattered by Navidrome's collation, but the menu always reads in order (each
 // letter's leaf still gathers all of its runs).
 export function albumIndexLetters(
-  index: AlbumIndex
+  index: AlbumIndex<any>
 ): { key: string; label: string }[] {
   const seen = new Set<string>();
   const letters: { key: string; label: string }[] = [];
@@ -108,7 +145,7 @@ export function albumIndexLetters(
 // Every contiguous range that belongs to a letter (usually one, occasionally more for stray
 // titles). The leaf browse pages across these ranges so it returns exactly that letter's albums.
 export function albumIndexRangesFor(
-  index: AlbumIndex,
+  index: AlbumIndex<any>,
   key: string
 ): AlbumIndexBucket[] {
   return index.buckets.filter((b) => b.key === key);
