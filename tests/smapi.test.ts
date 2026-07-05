@@ -2375,6 +2375,30 @@ describe("wsdl api", () => {
                     })
                   );
                 });
+
+                it("does not block on the scan when the index is still building", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  // albumIndex() would take minutes; a never-resolving promise proves we never await it
+                  musicLibrary.albumIndex.mockReturnValue(new Promise<never>(() => {}));
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsByLetter:S",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  expect(md.count).toEqual(1);
+                  // a single bounded placeholder (a 1-item collection collapses to one object)
+                  expect(md.mediaCollection).toMatchObject({
+                    itemType: "albumList",
+                    id: "albumsByLetter:S",
+                    title: "Indexing your albums… (open again shortly)",
+                  });
+                  // it kicked the background build rather than awaiting it
+                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                });
               });
 
               describe("asking for all albums for a genre", () => {

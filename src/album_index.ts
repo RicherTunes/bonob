@@ -105,6 +105,9 @@ export function albumIndexPage<T>(
   pageIndex: number,
   pageCount: number
 ): { items: T[]; total: number } {
+  // Defence in depth: a malformed/old-schema index (no snapshot) yields an empty page rather than
+  // throwing. The versioned cache key is the primary guard; this is the backstop.
+  if (!Array.isArray(index.items)) return { items: [], total: 0 };
   const ranges = albumIndexRangesFor(index, key);
   const total = ranges.reduce((sum, r) => sum + r.count, 0);
   const items: T[] = [];

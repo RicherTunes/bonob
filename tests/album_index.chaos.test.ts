@@ -122,28 +122,41 @@ describe("album index — chaos / property tests", () => {
     }
   });
 
-  it("is DRIFT-PROOF: a live catalog re-scan cannot corrupt a served letter", () => {
-    // This is the exact failure that broke S2 in production: Navidrome re-scanned and the offset
-    // index went stale. Serving from the snapshot must be immune.
+  it("is DRIFT-PROOF: snapshot serving survives a re-scan that WOULD break offset serving", () => {
+    // The exact production failure: Navidrome re-scanned, the offset index went stale, and a
+    // served letter returned wrong-letter albums. This test proves (a) snapshot serving is immune
+    // and (b) the old offset approach demonstrably drifts on the same mutation - so a regression
+    // back to live-offset fetching would be caught.
     const r = rng(9001);
+    let offsetApproachDrifted = false;
     for (let trial = 0; trial < 100; trial++) {
       const v1 = randomCatalog(r, 300, `v1-${trial}`);
       const idx = buildAlbumIndexFromPages(pageify(v1, 50));
 
-      // Simulate a re-scan mutating the LIVE catalog (inserts/removes/reorders shift every offset).
+      // Simulate a re-scan mutating the LIVE catalog (inserts/removes shift every later offset).
       const v2 = [...v1];
       v2.splice(Math.floor(r() * v2.length), 0, {
         id: `new-${trial}`,
         name: randomName(r),
       });
-      v2.splice(Math.floor(r() * v2.length), Math.floor(r() * 5));
+      v2.splice(Math.floor(r() * v2.length), 1 + Math.floor(r() * 4));
 
-      // The snapshot-served page depends only on the frozen snapshot, never on v2.
       for (const { key } of albumIndexLetters(idx)) {
-        const { items } = albumIndexPage(idx, key, 0, v1.length);
-        expect(items.every((a) => albumBucketKey(a.name) === key)).toBe(true);
+        // NEW: served from the frozen snapshot - must always be correct.
+        const snap = albumIndexPage(idx, key, 0, v1.length);
+        expect(snap.items.every((a) => albumBucketKey(a.name) === key)).toBe(true);
+
+        // OLD: re-fetch the same run offsets against the mutated LIVE catalog v2 - drifts.
+        for (const run of albumIndexRangesFor(idx, key)) {
+          const refetched = v2.slice(run.offset, run.offset + run.count);
+          if (refetched.some((a) => a && albumBucketKey(a.name) !== key)) {
+            offsetApproachDrifted = true;
+          }
+        }
       }
     }
+    // Confirms the mutation genuinely breaks offset serving (so the test has teeth).
+    expect(offsetApproachDrifted).toBe(true);
   });
 
   it("handles degenerate catalogs without crashing", () => {

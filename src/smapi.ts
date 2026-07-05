@@ -970,10 +970,28 @@ function bindSmapiSoapServiceToExpress(
                       });
                     });
                   }
-                  case "albumsByLetter":
-                    return (
-                      musicLibrary.peekAlbumIndex() ?? musicLibrary.albumIndex()
-                    ).then((idx) => {
+                  case "albumsByLetter": {
+                    const peekedLetter = musicLibrary.peekAlbumIndex();
+                    if (!peekedLetter) {
+                      // Never block a leaf browse on the multi-minute scan (S2 would time out);
+                      // kick the build and show the retry placeholder instead.
+                      void musicLibrary.albumIndex().catch(() => undefined);
+                      return getMetadataResult({
+                        mediaCollection: [
+                          {
+                            itemType: "albumList",
+                            id: `albumsByLetter:${typeId}`,
+                            title: "Indexing your albums… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "albums").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    }
+                    return peekedLetter.then((idx) => {
                       // Serve the letter's page straight from the index snapshot (drift-proof: no
                       // live re-fetch by offset). Advertise only this letter's total.
                       const page = albumIndexPage(
@@ -990,6 +1008,7 @@ function bindSmapiSoapServiceToExpress(
                         total: page.total,
                       });
                     });
+                  }
                   case "genre":
                     return albums({
                       type: "byGenre",

@@ -958,7 +958,7 @@ export class Subsonic {
   getAlbumIndex = (
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> =>
-    this.indexCache.get(`albumIndex:${credentials.username}`, () =>
+    this.indexCache.get(`albumIndex:v2:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 
@@ -969,12 +969,12 @@ export class Subsonic {
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> | undefined =>
     this.indexCache.peek<AlbumIndex<AlbumSummary>>(
-      `albumIndex:${credentials.username}`
+      `albumIndex:v2:${credentials.username}`
     );
 
   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
   warmAlbumIndex = (credentials: Credentials): void =>
-    this.indexCache.warm(`albumIndex:${credentials.username}`, () =>
+    this.indexCache.warm(`albumIndex:v2:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 
