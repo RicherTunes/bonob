@@ -61,16 +61,17 @@ item | default value | description
 ---- | ------------- | -----------
 BNB_PORT | 4534 | Default http port for bonob to listen on
 BNB_URL | http://$(hostname):4534 | **S1:** URL (including path) for bonob so that Sonos devices can communicate. This can be an IP address or hostname on your local network, it must however be accessible by your Sonos S1 devices.  ie. `http://192.168.1.5:4534`**S2:** This must be the publicly available DNS entry for your bonob instance, ie. `https://bonob.example.com`
-BNB_SECRET | undefined | Secret used for encrypting credentials, must be provided, make it long, make it secure
+BNB_SECRET | undefined | Secret used to encrypt Subsonic credentials inside SMAPI service tokens and sign bonob tokens, must be provided, make it long, make it secure
 BNB_AUTH_TIMEOUT | 1h | Timeout for the Sonos auth token, described in the format [ms](https://github.com/vercel/ms), ie. '5s' == 5 seconds, '11h' == 11 hours.  In the case of using Navidrome this should be less than the value for ND_SESSIONTIMEOUT
 BNB_LOG_LEVEL | info | Log level. One of ['debug', 'info', 'warn', 'error']
-BNB_SERVER_LOG_REQUESTS | false | Whether or not to log http requests
+BNB_SERVER_LOG_REQUESTS | false | Whether or not to log http requests (the `bat` art/stream access token is redacted from the logged URL)
+BNB_SONOS_MAX_CONTAINER_TOTAL | 20000 | Maximum album count a single Sonos browsable container may advertise before bonob splits it into bounded album buckets/chunks
 BNB_SUBSONIC_URL | http://$(hostname):4533 | URL for subsonic clone
 BNB_SUBSONIC_TRANSCODE | true | Whether to use the [OpenSubsonic Transcoding extension](https://opensubsonic.netlify.app/docs/extensions/transcoding/) when the server supports it. Set to 'false' to disable automatic transcoding negotiation and always use the legacy stream path.
 BNB_SUBSONIC_CUSTOM_CLIENTS | undefined | This probably should not be used any more, it would be better to use a subsonic server that supports the transcoding extensions, see BNB_SUBSONIC_TRANSCODE.  Comma delimeted mime types for custom subsonic clients when streaming. <P>Must specify the source mime type and optionally the transcoded mime type. <p>For example; <p>If you want to simply re-encode some flacs, then you could specify just "audio/flac".  <p>However; <p>if your subsonic server will transcode the track then you need to specify the resulting mime type, ie. "audio/flac>audio/mp3" <p>If you want to specify many something like; "audio/flac>audio/mp3,audio/ogg" would use client = 'bonob+audio/flac' for flacs, and 'bonob+audio/ogg' for oggs.  <p>Disclaimer: Getting this configuration wrong will cause Sonos to refuse to play your music, by all means experiment, however know that this may well break your setup.
 BNB_SUBSONIC_ARTIST_IMAGE_CACHE | undefined | Path for caching of artist images that are sourced externally. ie. Navidrome provides spotify URLs. Remember to provide a volume-mapping for Docker, when enabling this cache.
-BNB_SUBSONIC_CACHE_TTL | 5m | TTL ([ms](https://github.com/vercel/ms) format, e.g. `5m`, `30s`) for the in-memory stale-while-revalidate cache of large browse lists (see [Browse list caching](#browse-list-caching)). Set to `0s` (or any zero duration) to disable.
-BNB_SUBSONIC_CACHE_DIR | undefined | Directory for persisting the browse cache to disk so it survives restarts - the first browse after a redeploy is then served instantly from disk instead of a cold multi-second fetch. Provide a Docker volume-mapping when enabling this. Leave unset to keep the cache in memory only.
+BNB_SUBSONIC_CACHE_TTL | 5m | TTL ([ms](https://github.com/vercel/ms) format, e.g. `5m`, `30s`) for the in-memory stale-while-revalidate cache of large browse lists (see [Browse list caching](#browse-list-caching)). Live stale entries may be served up to 4×TTL while a background refresh runs. Set to `0s` (or any zero duration) to disable.
+BNB_SUBSONIC_CACHE_DIR | undefined | Directory for persisting the browse cache to disk so it survives restarts. Entries persisted less than 7 days ago are restored on startup, clamped to stale if needed, served immediately, and revalidated in the background. Provide a Docker volume-mapping when enabling this. Leave unset to keep the cache in memory only.
 BNB_DEEZER_ARTIST_ART | false | When `true`, resolve artist photos from Deezer's public API (no API key) by artist name, instead of the subsonic server's artist image. Useful when the backend only serves a placeholder (e.g. current Navidrome, which no longer fetches Spotify/Last.fm artist images). Images are resolved lazily (only for artists actually browsed) and cached in memory for a day. Off by default so a server that already has real artist art is left untouched.
 BNB_SCROBBLE_TRACKS | true | Whether to scrobble the playing of a track if it has been played for >30s
 BNB_REPORT_NOW_PLAYING | true | Whether to report a track as now playing
@@ -114,16 +115,20 @@ Cached: the artist list (`getArtists`) and each album-list page (`getAlbumList2`
 query: type/offset/genre/year). Mutable resources (e.g. playlists) are never cached. Cached
 values are deep-frozen so a shared entry can't be mutated in place.
 
-**Warm on connect** — on login bonob kicks a background fetch of the artist list, so the first
-browse of a session isn't cold.
+**Warm on connect** — on login bonob kicks a background fetch of the artist list and, for large
+catalogs, the album index. If a browse arrives before the warm completes, bonob either coalesces
+onto the in-flight fetch or returns a bounded loading/indexing placeholder instead of blocking the
+SMAPI request past Sonos's timeout.
 
 **Persistence (optional)** — set `BNB_SUBSONIC_CACHE_DIR` to a writable, volume-mapped
-directory and the cache is written to disk and **reloaded on startup**, so the first browse
-after a restart/redeploy is served from disk instead of a cold multi-second fetch (entries
-older than the stale cap are skipped). Without it the cache is in-memory only, rebuilt on the
-first browse after each restart.
+directory and the cache is written to disk and **reloaded on startup**. Persisted entries newer
+than 7 days are restored even if they are older than the live stale cap; old restored entries are
+clamped to "just stale" so the first browse serves from disk and triggers a background refresh.
+Entries older than the persistence cap, future-dated entries, and non-finite timestamps are
+skipped. Without persistence the cache is in-memory only, rebuilt on demand after each restart.
 
-Tuning: `BNB_SUBSONIC_CACHE_TTL` (default `5m`; `0s` disables) and `BNB_SUBSONIC_CACHE_DIR`.
+Tuning: `BNB_SUBSONIC_CACHE_TTL` (default `5m`; live `maxStaleMs` defaults to 4×TTL; `0s`
+disables) and `BNB_SUBSONIC_CACHE_DIR` (enables up-to-7-day disk restore).
 
 ## Transcoding
 

@@ -25,6 +25,7 @@ jest.mock("../src/random");
 import { URLBuilder } from "../src/url_builder";
 import {
   isValidImage,
+  isSafeExternalImageUrl,
   t,
   DODGY_IMAGE_NAME,
   asURLSearchParams,
@@ -82,6 +83,38 @@ describe("isValidImage", () => {
         )
       ).toEqual(true);
     });
+  });
+});
+
+describe("isSafeExternalImageUrl (SSRF guard for server-fetched external art)", () => {
+  it("allows public http(s) art hosts", () => {
+    expect(isSafeExternalImageUrl("https://images.example.com/a.jpg")).toBe(true);
+    expect(isSafeExternalImageUrl("http://images.example.com/a.jpg")).toBe(true);
+  });
+
+  it("blocks loopback, link-local, private, and metadata hosts", () => {
+    for (const url of [
+      "http://127.0.0.1/a.jpg",
+      "https://127.0.0.1/a.jpg",
+      "http://localhost/a.jpg",
+      "https://sub.localhost/a.jpg",
+      "https://169.254.169.254/latest/meta-data",
+      "http://10.0.0.5/a.jpg",
+      "http://192.168.1.1/a.jpg",
+      "http://172.16.0.1/a.jpg",
+      "http://[::1]/a.jpg",
+      "http://metadata.google.internal/x",
+    ]) {
+      expect(isSafeExternalImageUrl(url)).toBe(false);
+    }
+  });
+
+  it("blocks non-http(s) schemes and non-strings", () => {
+    expect(isSafeExternalImageUrl("ftp://example.com/a")).toBe(false);
+    expect(isSafeExternalImageUrl("file:///etc/passwd")).toBe(false);
+    expect(isSafeExternalImageUrl("not a url")).toBe(false);
+    expect(isSafeExternalImageUrl(undefined)).toBe(false);
+    expect(isSafeExternalImageUrl(42)).toBe(false);
   });
 });
 
@@ -1019,6 +1052,40 @@ describe("Subsonic", () => {
           });
           expect(flat.total).toBe(globalTotal);
         });
+
+        it("does not wait for getArtists when a filtered section derives a bounded total from the page", async () => {
+          const shortPage: [Artist, AlbumSummary][] = [
+            [artist, anAlbumSummary()],
+            [artist, anAlbumSummary()],
+          ];
+          let getArtistsRequested = false;
+          mockGET.mockImplementation((u: string) => {
+            if (u.includes("getArtists")) {
+              getArtistsRequested = true;
+              return new Promise(() => {}); // never resolves
+            }
+            return Promise.resolve(ok(getAlbumListJson(shortPage)));
+          });
+
+          const result = await Promise.race([
+            cachingSubsonic.getAlbumList2(credentials, {
+              _index: 0,
+              _count: 100,
+              type: "byGenre",
+              genre: "UG9w",
+            }),
+            new Promise<"blocked">((resolve) =>
+              setImmediate(() => resolve("blocked"))
+            ),
+          ]);
+
+          if (result === "blocked") {
+            throw new Error("filtered album browse blocked on getArtists");
+          }
+          expect(getArtistsRequested).toBe(false);
+          expect(result.results.length).toBe(2);
+          expect(result.total).toBe(2);
+        });
       });
 
       it("getAlbumIndex scans alphabeticalByName and buckets by first letter", async () => {
@@ -1044,6 +1111,86 @@ describe("Subsonic", () => {
           "A:1:1",
           "B:2:1",
         ]);
+      });
+
+      it("rejects an inconsistent album-index scan so a duplicate/missing snapshot is not cached or persisted", async () => {
+        const indexCacheStore = {
+          load: jest.fn(() => []),
+          save: jest.fn(),
+        };
+        const indexCache = new SwrCache(clock, 60_000, {
+          store: indexCacheStore,
+        });
+        const indexedSubsonic = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          SwrCache.disabled(),
+          indexCache
+        );
+        const artist = anArtist();
+        const firstPage = Array.from({ length: 500 }, (_, i) =>
+          anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
+        );
+        const driftedSecondPage = [
+          anAlbumSummary({ id: "album-499", name: "Duplicate Album 499" }),
+          anAlbumSummary({ id: "album-501", name: "Album 501" }),
+        ];
+
+        mockGET.mockImplementation((_u: string, config: any) => {
+          const offset = Number(config.params.get("offset"));
+          const page = offset === 0 ? firstPage : driftedSecondPage;
+          return Promise.resolve(
+            ok(
+              getAlbumListJson(
+                page.map((album) => [artist, album] as [Artist, AlbumSummary])
+              )
+            )
+          );
+        });
+
+        await expect(indexedSubsonic.getAlbumIndex(credentials)).rejects.toThrow(
+          "Inconsistent album index scan"
+        );
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(indexCache.size()).toBe(0);
+        expect(indexCacheStore.save).not.toHaveBeenCalled();
+      });
+
+      it("evicts album indexes beyond the dedicated album-index cache cap", async () => {
+        const { ALBUM_INDEX_CACHE_MAX_ENTRIES } = jest.requireActual("../src/subsonic");
+        expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeGreaterThan(0);
+        expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeLessThanOrEqual(2);
+
+        const indexCache = new SwrCache(clock, 60_000, {
+          maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
+        });
+        const indexedSubsonic = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          SwrCache.disabled(),
+          indexCache
+        );
+        const artist = anArtist();
+        mockGET.mockImplementation(() =>
+          Promise.resolve(
+            ok(
+              getAlbumListJson([
+                [artist, anAlbumSummary({ id: uuid(), name: "One Album" })],
+              ])
+            )
+          )
+        );
+
+        for (let i = 0; i < ALBUM_INDEX_CACHE_MAX_ENTRIES + 2; i++) {
+          await indexedSubsonic.getAlbumIndex({
+            username: `index-user-${i}`,
+            password,
+          });
+        }
+
+        expect(indexCache.size()).toBe(ALBUM_INDEX_CACHE_MAX_ENTRIES);
       });
 
       it("serves stale instantly and refreshes in the background", async () => {

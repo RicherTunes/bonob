@@ -24,7 +24,7 @@ import {
   TrackSummary,
   PlaylistSummary
 } from "./music_library";
-import { APITokens } from "./api_tokens";
+import { APITokens, scopedApiTokenPayload } from "./api_tokens";
 import { Clock } from "./clock";
 import { URLBuilder } from "./url_builder";
 import { asLANGs, I8N } from "./i8n";
@@ -524,10 +524,12 @@ function bindSmapiSoapServiceToExpress(
 ) {
   const sonosSoap = new SonosSoap(bonobUrl, linkCodes, smapiAuthTokens, clock);
 
+  const artApiKeysByApiKey = new Map<string, string>();
+
   const urlWithToken = (accessToken: string) =>
     bonobUrl.append({
       searchParams: {
-        bat: accessToken,
+        bat: artApiKeysByApiKey.get(accessToken) ?? accessToken,
       },
     });
 
@@ -545,10 +547,14 @@ function bindSmapiSoapServiceToExpress(
           }))
         )
       ),
-      E.map(({ serviceToken }) => ({
-        serviceToken,
-        apiKey: apiKeys.mint(serviceToken),
-      }))
+      E.map(({ serviceToken }) => {
+        const apiKey = apiKeys.mint(serviceToken);
+        artApiKeysByApiKey.set(
+          apiKey,
+          apiKeys.mint(scopedApiTokenPayload("art", serviceToken))
+        );
+        return { serviceToken, apiKey };
+      })
     );
   };
 
@@ -1124,8 +1130,12 @@ function bindSmapiSoapServiceToExpress(
                         // A single letter is itself too big for one S2 container; split it into
                         // fixed-size sub-buckets so no leaf ever advertises an oversized total.
                         const chunks = Math.ceil(letterTotal / MAX_ALBUMS_FLAT);
+                        const chunkIndexes = range(chunks).slice(
+                          paging._index,
+                          paging._index + paging._count
+                        );
                         return getMetadataResult({
-                          mediaCollection: range(chunks).map((i) => ({
+                          mediaCollection: chunkIndexes.map((i) => ({
                             itemType: "albumList",
                             id: `albumsChunk:${typeId}_${i}`,
                             title: `${typeId} · part ${i + 1}`,
@@ -1133,7 +1143,7 @@ function bindSmapiSoapServiceToExpress(
                               iconArtURI(bonobUrl, "albums").href()
                             ),
                           })),
-                          index: 0,
+                          index: paging._index,
                           total: chunks,
                         });
                       }
@@ -1159,7 +1169,15 @@ function bindSmapiSoapServiceToExpress(
                     // right so a "#" key works.
                     const sep = typeId.lastIndexOf("_");
                     const chunkKey = sep >= 0 ? typeId.slice(0, sep) : typeId;
-                    const chunk = sep >= 0 ? Number(typeId.slice(sep + 1)) : 0;
+                    const chunkText = sep >= 0 ? typeId.slice(sep + 1) : "0";
+                    const chunk = Number(chunkText);
+                    if (!/^\d+$/.test(chunkText) || !Number.isSafeInteger(chunk)) {
+                      return getMetadataResult({
+                        mediaCollection: [],
+                        index: paging._index,
+                        total: 0,
+                      });
+                    }
                     const peekedChunk = musicLibrary.peekAlbumIndex();
                     if (!peekedChunk) {
                       void musicLibrary.albumIndex().catch(() => undefined);

@@ -25,7 +25,11 @@ import { makeS1Router } from "./routes/s1";
 import { LinkCodes, InMemoryLinkCodes } from "./link_codes";
 import { MusicService, AuthFailure, AuthSuccess } from "./music_library";
 import bindSmapiSoapServiceToExpress from "./smapi";
-import { APITokens, InMemoryAPITokens } from "./api_tokens";
+import {
+  APITokens,
+  InMemoryAPITokens,
+  serviceTokenForScopedApiToken,
+} from "./api_tokens";
 import logger from "./logger";
 import { Clock, SystemClock } from "./clock";
 import { pipe } from "fp-ts/lib/function";
@@ -37,7 +41,12 @@ import _ from "underscore";
 import morgan from "morgan";
 import { parse, BUrn } from "./burn";
 import { deezerArtistImageUrl } from "./deezer";
-import { axiosImageFetcher, deezerImageFetcher, ImageFetcher } from "./subsonic";
+import {
+  axiosImageFetcher,
+  deezerImageFetcher,
+  ImageFetcher,
+  isSafeExternalImageUrl,
+} from "./subsonic";
 import {
   JWTSmapiLoginTokens,
   SmapiAuthTokens,
@@ -115,6 +124,25 @@ export type ServerOpts = {
 
 const DEFAULT_TIMEOUT = "1h"
 
+export const redactAccessTokenFromUrl = (value: string | undefined): string => {
+  if (!value) return "";
+  try {
+    const parsed = new URL(value, "http://bonob.local");
+    if (parsed.searchParams.has(BONOB_ACCESS_TOKEN_HEADER)) {
+      parsed.searchParams.set(BONOB_ACCESS_TOKEN_HEADER, "*****");
+    }
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return value.replace(
+      new RegExp(`([?&]${BONOB_ACCESS_TOKEN_HEADER}=)[^&\\s"]*`, "g"),
+      "$1*****"
+    );
+  }
+};
+
+const MORGAN_REDACTED_COMBINED =
+  ':remote-addr - :remote-user [:date[clf]] ":method :redacted-url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"';
+
 const DEFAULT_SERVER_OPTS: ServerOpts = {
   linkCodes: () => new InMemoryLinkCodes(),
   apiTokens: () => new InMemoryAPITokens(SystemClock, DEFAULT_TIMEOUT),
@@ -156,7 +184,10 @@ function server(
   const i8n = makeI8N(service.name);
 
   if (serverOpts.logRequests) {
-    app.use(morgan("combined"));
+    morgan.token("redacted-url", (req) =>
+      redactAccessTokenFromUrl(req.url)
+    );
+    app.use(morgan(MORGAN_REDACTED_COMBINED));
   }
   app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
@@ -429,7 +460,13 @@ function server(
       E.chain((authorization) =>
         pipe(
           apiTokens.authTokenFor(authorization),
-          E.fromNullable("Failed to find matching API token, or API token has expired")
+          E.fromNullable("Failed to find matching API token, or API token has expired"),
+          E.map((authToken) =>
+            serviceTokenForScopedApiToken(authToken, "stream", {
+              allowLegacy: true,
+            })
+          ),
+          E.chain(E.fromNullable("API token scope is not authorized for streams"))
         )
       ),
       E.getOrElseW(() => undefined)
@@ -614,8 +651,10 @@ function server(
   });
 
   app.get("/art/:burn/size/:size", (req, res) => {
-    const serviceToken = apiTokens.authTokenFor(
-      req.query[BONOB_ACCESS_TOKEN_HEADER] as string
+    const serviceToken = serviceTokenForScopedApiToken(
+      apiTokens.authTokenFor(req.query[BONOB_ACCESS_TOKEN_HEADER] as string),
+      "art",
+      { allowLegacy: true }
     );
     const size = Number.parseInt(req.params["size"]!);
 
@@ -630,6 +669,12 @@ function server(
       urn = parse(req.params["burn"]!);
     } catch (e) {
       logger.warn(`Invalid art burn '${req.params["burn"]}': ${e}`);
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(400).send();
+    }
+
+    if (urn.system == "external" && !isSafeExternalImageUrl(urn.resource)) {
+      logger.warn(`Refusing unsafe external art URL '${urn.resource}'`);
       res.setHeader("Cache-Control", "no-store");
       return res.status(400).send();
     }

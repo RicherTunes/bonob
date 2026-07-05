@@ -18,6 +18,7 @@ import {
   asGenre,
   asURLSearchParams,
   asToken,
+  parseToken,
   CustomPlayers,
   images,
   artistImageURN
@@ -477,20 +478,24 @@ describe("SubsonicMusicService", () => {
 
     it("should be able to generate a token", async () => {
       const result = await service.generateToken(credentials)()
-      expect(result).toEqual(E.right({ 
-        serviceToken: asToken(credentials),
+      // serviceToken is now AES-GCM encrypted (random IV), so it is not a stable string; assert it
+      // round-trips back to the credentials rather than matching an exact ciphertext.
+      expect(result).toEqual(E.right({
+        serviceToken: expect.any(String),
         userId: credentials.username,
         nickname: credentials.username
       }));
+      expect(parseToken((result as any).right.serviceToken)).toEqual(credentials);
     });
 
     it("should be able to refresh a token", async () => {
       const result = await service.refreshToken(asToken(credentials))()
-      expect(result).toEqual(E.right({ 
-        serviceToken: asToken(credentials),
+      expect(result).toEqual(E.right({
+        serviceToken: expect.any(String),
         userId: credentials.username,
         nickname: credentials.username
       }));
+      expect(parseToken((result as any).right.serviceToken)).toEqual(credentials);
     });
   });
 
@@ -778,9 +783,6 @@ describe("SubsonicMusicLibrary", () => {
         beforeEach(() => {
           mockGET
             .mockImplementationOnce(() =>
-              Promise.resolve(ok(asArtistsJson([artist])))
-            )
-            .mockImplementationOnce(() =>
               Promise.resolve(
                 ok(
                   getAlbumListJson([
@@ -808,14 +810,6 @@ describe("SubsonicMusicLibrary", () => {
           });
 
           expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
-
-          expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
             {
               params: asURLSearchParams({
@@ -834,9 +828,6 @@ describe("SubsonicMusicLibrary", () => {
       describe("by newest", () => {
         beforeEach(() => {
           mockGET
-            .mockImplementationOnce(() =>
-              Promise.resolve(ok(asArtistsJson([artist])))
-            )
             .mockImplementationOnce(() =>
               Promise.resolve(
                 ok(
@@ -864,14 +855,6 @@ describe("SubsonicMusicLibrary", () => {
           });
 
           expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
-
-          expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
             {
               params: asURLSearchParams({
@@ -889,9 +872,6 @@ describe("SubsonicMusicLibrary", () => {
       describe("by recently played", () => {
         beforeEach(() => {
           mockGET
-            .mockImplementationOnce(() =>
-              Promise.resolve(ok(asArtistsJson([artist])))
-            )
             .mockImplementationOnce(() =>
               Promise.resolve(
                 ok(
@@ -919,14 +899,6 @@ describe("SubsonicMusicLibrary", () => {
           });
 
           expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
-
-          expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
             {
               params: asURLSearchParams({
@@ -944,9 +916,6 @@ describe("SubsonicMusicLibrary", () => {
       describe("by frequently played", () => {
         beforeEach(() => {
           mockGET
-            .mockImplementationOnce(() =>
-              Promise.resolve(ok(asArtistsJson([artist])))
-            )
             .mockImplementationOnce(
               () =>
                 // album1 never played
@@ -963,14 +932,6 @@ describe("SubsonicMusicLibrary", () => {
             results: [album2].map(albumToAlbumSummary),
             total: 1,
           });
-
-          expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
 
           expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
@@ -990,9 +951,6 @@ describe("SubsonicMusicLibrary", () => {
       describe("by starred", () => {
         beforeEach(() => {
           mockGET
-            .mockImplementationOnce(() =>
-              Promise.resolve(ok(asArtistsJson([artist])))
-            )
             .mockImplementationOnce(
               () =>
                 // album1 never played
@@ -1009,14 +967,6 @@ describe("SubsonicMusicLibrary", () => {
             results: [album2].map(albumToAlbumSummary),
             total: 1,
           });
-
-          expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
 
           expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
@@ -1189,14 +1139,6 @@ describe("SubsonicMusicLibrary", () => {
           });
 
           expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
-
-          expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),
             {
               params: asURLSearchParams({
@@ -1242,14 +1184,6 @@ describe("SubsonicMusicLibrary", () => {
             results: [artist1.albums[2], artist2.albums[0]],
             total: 6,
           });
-
-          expect(axios.get).toHaveBeenCalledWith(
-            url.append({ pathname: "/rest/getArtists" }).href(),
-            {
-              params: asURLSearchParams(authParamsPlusJson),
-              headers,
-            }
-          );
 
           expect(axios.get).toHaveBeenCalledWith(
             url.append({ pathname: "/rest/getAlbumList2" }).href(),

@@ -56,6 +56,15 @@ const asBoolean = (value: string) => value == "true";
 
 const asInt = (value: string) => Number.parseInt(value);
 
+export const DEFAULT_SONOS_MAX_CONTAINER_TOTAL = 20000;
+
+export const sonosMaxContainerTotal = () =>
+  bnbEnvVar<number>("SONOS_MAX_CONTAINER_TOTAL", {
+    default: DEFAULT_SONOS_MAX_CONTAINER_TOTAL,
+    parser: asInt,
+    validationPattern: /^[1-9]\d*$/,
+  });
+
 export const DEFAULT_LOGIN_THEME = "classic"
 const VALID_LOGIN_THEMES = [DEFAULT_LOGIN_THEME, "navidrome-ish", "wkulhanek"]
 

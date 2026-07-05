@@ -9,7 +9,8 @@ import {
   cachingImageFetcher,
   TranscodingCustomPlayers,
   NO_CUSTOM_PLAYERS,
-  Subsonic
+  Subsonic,
+  ALBUM_INDEX_CACHE_MAX_ENTRIES
 } from "./subsonic";
 import { SubsonicMusicService} from "./subsonic_music_library";
 import { InMemoryAPITokens, sha256 } from "./api_tokens";
@@ -80,12 +81,14 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
 const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
   store: config.subsonic.cacheDir
     ? // the index holds a full album snapshot (tens of MB on a large library), so raise the
-      // per-file cap well above the browse cache's default.
+      // per-file cap well above the browse cache's default but keep only a small number of snapshots.
       fileStore(path.join(config.subsonic.cacheDir, "index"), {
+        maxFiles: ALBUM_INDEX_CACHE_MAX_ENTRIES,
         maxFileBytes: 256 * 1024 * 1024,
       })
     : undefined,
   revive: deepFreeze,
+  maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
   // The full-catalog scan legitimately takes several minutes on a large library; the default
   // 60s backstop would abort it before it ever completes. Give it a generous ceiling.
   backstopMs: 20 * 60 * 1000,
