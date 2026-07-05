@@ -680,6 +680,7 @@ describe("wsdl api", () => {
     albums: jest.fn(),
     albumIndex: jest.fn(),
     peekAlbumIndex: jest.fn(),
+    albumCount: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
     topSongs: jest.fn(),
@@ -1585,6 +1586,40 @@ describe("wsdl api", () => {
                   );
                 });
               });
+
+              describe("browsing into a year", () => {
+                it("queries albums by that year", async () => {
+                  musicLibrary.albums.mockResolvedValue({ results: [], total: 0 });
+                  await ws.getMetadataAsync({
+                    id: "year:1980",
+                    index: 0,
+                    count: 100,
+                  });
+                  expect(musicLibrary.albums).toHaveBeenCalledWith({
+                    type: "byYear",
+                    fromYear: "1980",
+                    toYear: "1980",
+                    _index: 0,
+                    _count: 100,
+                  });
+                });
+
+                it("maps the unknown-year '?' bucket to year 0 (Navidrome rejects '?')", async () => {
+                  musicLibrary.albums.mockResolvedValue({ results: [], total: 0 });
+                  await ws.getMetadataAsync({
+                    id: "year:?",
+                    index: 0,
+                    count: 100,
+                  });
+                  expect(musicLibrary.albums).toHaveBeenCalledWith({
+                    type: "byYear",
+                    fromYear: "0",
+                    toYear: "0",
+                    _index: 0,
+                    _count: 100,
+                  });
+                });
+              });
             });
 
             describe("asking for playlists", () => {
@@ -2324,6 +2359,7 @@ describe("wsdl api", () => {
               describe("asking for the A-Z album buckets (large catalog)", () => {
                 beforeEach(() => {
                   // total exceeds MAX_ALBUMS_FLAT, so Albums is split into per-letter buckets
+                  musicLibrary.albumCount.mockResolvedValue(30000);
                   musicLibrary.peekAlbumIndex.mockReturnValue(
                     Promise.resolve({
                       total: 30000,
@@ -2362,6 +2398,49 @@ describe("wsdl api", () => {
                       total: 2,
                     })
                   );
+                });
+              });
+
+              describe("asking for albums in a small catalog (flat, no index)", () => {
+                it("serves the flat list live and never builds the index", async () => {
+                  musicLibrary.albumCount.mockResolvedValue(5000); // <= MAX_ALBUMS_FLAT
+                  musicLibrary.albums.mockResolvedValue({
+                    results: [pop1, pop2],
+                    total: 5000,
+                  });
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albums",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: [pop1, pop2].map((it) => ({
+                        itemType: "album",
+                        id: `album:${it.id}`,
+                        title: it.name,
+                        albumArtURI: coverArtURI(
+                          bonobUrlWithAccessToken,
+                          it
+                        ).href(),
+                        canPlay: true,
+                        artistId: `artist:${it.artistId}`,
+                        artist: it.artistName,
+                      })),
+                      index: 0,
+                      total: 5000,
+                    })
+                  );
+                  // served live from getAlbumList2 - no bucketing, no index touched
+                  expect(musicLibrary.albums).toHaveBeenCalledWith({
+                    type: "alphabeticalByName",
+                    _index: 0,
+                    _count: 100,
+                  });
+                  expect(musicLibrary.peekAlbumIndex).not.toHaveBeenCalled();
+                  expect(musicLibrary.albumIndex).not.toHaveBeenCalled();
                 });
               });
 

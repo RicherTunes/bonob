@@ -36,6 +36,7 @@ import {
   albumIndexPage,
   albumIndexLetterTotal,
   albumIndexAll,
+  MAX_ALBUMS_FLAT,
 } from "./album_index";
 import {
   isExpiredTokenError,
@@ -442,11 +443,9 @@ export const topSongMetadata = (bonobUrl: URLBuilder, t: TrackSummary) => ({
   },
 });
 
-// A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1
-// hardware); a larger catalog is split into bounded per-letter buckets, because Sonos rejects a
-// single browsable container advertising a very large total (observed: ~23k ok, ~115k rejected).
-// TODO(config): expose as BNB_SONOS_MAX_CONTAINER_TOTAL.
-export const MAX_ALBUMS_FLAT = 20000;
+// MAX_ALBUMS_FLAT now lives in album_index.ts (one source of truth); re-export it here
+// so existing callers/tests importing it from smapi keep working.
+export { MAX_ALBUMS_FLAT };
 
 export const artist = (bonobUrl: URLBuilder, artist: ArtistSummary) => ({
   itemType: "artist",
@@ -983,60 +982,70 @@ function bindSmapiSoapServiceToExpress(
                       });
                     });
                   case "albums": {
-                    // A huge flat "Albums" list (total ~= whole catalog) is rejected by Sonos S2.
-                    // Serve the A-Z letter buckets from the cached index instead, so no single
-                    // container advertises the global total. Peek so we never block the browse on
-                    // the (multi-minute) index scan.
-                    const peeked = musicLibrary.peekAlbumIndex();
-                    if (!peeked) {
-                      // Index still building (a multi-minute first-time scan); kick it and show a
-                      // single self-retry placeholder rather than duplicating other sections. The
-                      // placeholder points back at "albums", so re-opening it retries.
-                      void musicLibrary.albumIndex().catch(() => undefined);
-                      return getMetadataResult({
-                        mediaCollection: [
-                          {
+                    return musicLibrary.albumCount().then((count) => {
+                      if (count <= MAX_ALBUMS_FLAT) {
+                        // Small catalog: serve the flat Albums list LIVE and never build the index.
+                        // A small container is fine for S2; this is stock bonob behavior and small
+                        // setups pay nothing for the bucketing machinery.
+                        return musicLibrary
+                          .albums({ type: "alphabeticalByName", ...paging })
+                          .then((result) =>
+                            getMetadataResult({
+                              mediaCollection: result.results.map((it) =>
+                                album(urlWithToken(apiKey), it)
+                              ),
+                              index: paging._index,
+                              total: count,
+                            })
+                          );
+                      }
+                      // Large catalog: a flat list is rejected by S2, so bucket via the cached
+                      // drift-proof snapshot index. Peek so we never block on the multi-minute scan.
+                      const peeked = musicLibrary.peekAlbumIndex();
+                      if (!peeked) {
+                        void musicLibrary.albumIndex().catch(() => undefined);
+                        return getMetadataResult({
+                          mediaCollection: [
+                            {
+                              itemType: "albumList",
+                              id: "albums",
+                              title: "Indexing your albums… (open again shortly)",
+                              albumArtURI: albumArtURI(
+                                iconArtURI(bonobUrl, "albums").href()
+                              ),
+                            },
+                          ],
+                          index: 0,
+                          total: 1,
+                        });
+                      }
+                      return peeked.then((idx) => {
+                        // A catalog that shrank back under the cap can still serve flat from the
+                        // snapshot; otherwise the A-Z letter menu.
+                        if (idx.total <= MAX_ALBUMS_FLAT) {
+                          return getMetadataResult({
+                            mediaCollection: albumIndexAll(
+                              idx,
+                              paging._index,
+                              paging._count
+                            ).map((it) => album(urlWithToken(apiKey), it)),
+                            index: paging._index,
+                            total: idx.total,
+                          });
+                        }
+                        const letters = albumIndexLetters(idx);
+                        return getMetadataResult({
+                          mediaCollection: letters.map((b) => ({
                             itemType: "albumList",
-                            id: "albums",
-                            title: "Indexing your albums… (open again shortly)",
+                            id: `albumsByLetter:${b.key}`,
+                            title: b.label,
                             albumArtURI: albumArtURI(
                               iconArtURI(bonobUrl, "albums").href()
                             ),
-                          },
-                        ],
-                        index: 0,
-                        total: 1,
-                      });
-                    }
-                    return peeked.then((idx) => {
-                      // Small enough to browse as one flat list (keeps small libraries simple,
-                      // and is safe on older S1 hardware); otherwise split into bounded per-letter
-                      // buckets so no container ever advertises the huge global total.
-                      if (idx.total <= MAX_ALBUMS_FLAT) {
-                        // Serve from the snapshot, not a live album fetch: a stale small index must
-                        // never let S2 see the (possibly huge) live catalog total.
-                        return getMetadataResult({
-                          mediaCollection: albumIndexAll(
-                            idx,
-                            paging._index,
-                            paging._count
-                          ).map((it) => album(urlWithToken(apiKey), it)),
-                          index: paging._index,
-                          total: idx.total,
+                          })),
+                          index: 0,
+                          total: letters.length,
                         });
-                      }
-                      const letters = albumIndexLetters(idx);
-                      return getMetadataResult({
-                        mediaCollection: letters.map((b) => ({
-                          itemType: "albumList",
-                          id: `albumsByLetter:${b.key}`,
-                          title: b.label,
-                          albumArtURI: albumArtURI(
-                            iconArtURI(bonobUrl, "albums").href()
-                          ),
-                        })),
-                        index: 0,
-                        total: letters.length,
                       });
                     });
                   }
@@ -1153,13 +1162,17 @@ function bindSmapiSoapServiceToExpress(
                       genre: typeId,
                       ...paging,
                     });
-                  case "year":
+                  case "year": {
+                    // "?" is our label for unknown-year albums, which Navidrome stores as year 0.
+                    // getAlbumList2(byYear) requires an integer, so "?" itself is rejected.
+                    const yr = typeId === "?" ? "0" : typeId;
                     return albums({
                       type: "byYear",
-                      fromYear: typeId,
-                      toYear: typeId,
+                      fromYear: yr,
+                      toYear: yr,
                       ...paging,
                     });
+                  }
                   case "randomAlbums":
                     return albums({
                       type: "random",
