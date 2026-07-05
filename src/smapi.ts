@@ -38,6 +38,7 @@ import {
   albumIndexAll,
   MAX_ALBUMS_FLAT,
 } from "./album_index";
+import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -715,7 +716,7 @@ function bindSmapiSoapServiceToExpress(
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) =>
-            login(findLoginToken(soapyHeaders, headers))
+            withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey }) => {
                 switch (id) {
@@ -754,13 +755,16 @@ function bindSmapiSoapServiceToExpress(
                     })
                 }
               }),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              searchResult({ count: 0, mediaCollection: [] })
+            ).catch(faultOrFallback(searchResult({ count: 0, mediaCollection: [] }))),
           getExtendedMetadata: async (
             { id }: { id: string },
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) =>
-            login(findLoginToken(soapyHeaders, headers))
+            withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey, type, typeId }) => {
                 switch (type) {
@@ -821,28 +825,35 @@ function bindSmapiSoapServiceToExpress(
                 }
               })
               .then(sanitizeXml),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              { getExtendedMetadataResult: {} }
+            ).catch(faultOrFallback({ getExtendedMetadataResult: {} })),
           getExtendedMetadataText: async (
             { id, type: textType }: { id: string; type: string },
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) =>
-            login(findLoginToken(soapyHeaders, headers))
-              .then(withSplitId(id))
-              .then(async ({ musicLibrary, type, typeId }) => {
-                if (textType === "ARTIST_BIO" && type === "artist") {
-                  return musicLibrary
-                    .artist(typeId)
-                    .then((it) => ({
-                      getExtendedMetadataTextResult: it.biography || "",
-                    }));
-                }
-                logger.info(
-                  `Sonos requested extended metadata text for currently unsupported type=${textType}, id=${id}`
-                );
-                return { getExtendedMetadataTextResult: "" };
-              })
-              .then(sanitizeXml),
+            withTimeout(
+              login(findLoginToken(soapyHeaders, headers))
+                .then(withSplitId(id))
+                .then(async ({ musicLibrary, type, typeId }) => {
+                  if (textType === "ARTIST_BIO" && type === "artist") {
+                    return musicLibrary
+                      .artist(typeId)
+                      .then((it) => ({
+                        getExtendedMetadataTextResult: it.biography || "",
+                      }));
+                  }
+                  logger.info(
+                    `Sonos requested extended metadata text for currently unsupported type=${textType}, id=${id}`
+                  );
+                  return { getExtendedMetadataTextResult: "" };
+                })
+                .then(sanitizeXml),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              { getExtendedMetadataTextResult: "" }
+            ).catch(faultOrFallback({ getExtendedMetadataTextResult: "" })),
           getMetadata: async (
             {
               id,
@@ -854,7 +865,16 @@ function bindSmapiSoapServiceToExpress(
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) => {
-            return login(findLoginToken(soapyHeaders, headers))
+            // Browse deadline (below Sonos's ~5s SMAPI timeout): if a handler hangs or rejects on a
+            // slow/flaky backend, return a "please try again" placeholder rather than a Sonos error.
+            const browseTimeoutFallback = getMetadataResult({
+              mediaCollection: [
+                { itemType: "container", id, title: "Loading, please try again..." },
+              ],
+              index: 0,
+              total: 1,
+            });
+            return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(({ musicLibrary, apiKey, type, typeId }) => {
                 const paging = { _index: index, _count: count };
@@ -1420,7 +1440,10 @@ function bindSmapiSoapServiceToExpress(
                       total: 0,
                     });
                 }
-              })
+              }),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              browseTimeoutFallback
+            ).catch(faultOrFallback(browseTimeoutFallback))
           }
           ,
           createContainer: async (

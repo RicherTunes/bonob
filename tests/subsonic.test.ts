@@ -27,6 +27,7 @@ import {
   isValidImage,
   isSafeExternalImageUrl,
   resolvedExternalHostIsSafe,
+  isRetryableSubsonicError,
   pinnedSafeExternalLookup,
   t,
   DODGY_IMAGE_NAME,
@@ -254,6 +255,17 @@ describe("pinnedSafeExternalLookup (TOCTOU-safe pinned resolver for external art
       "pinned.invalid",
       expect.objectContaining({ all: true })
     );
+  });
+});
+
+describe("isRetryableSubsonicError (read retry policy)", () => {
+  it("retries transport failures (network error / 5xx) but not 4xx or app-level errors", () => {
+    expect(isRetryableSubsonicError(new Error("ECONNRESET"))).toBe(true);
+    expect(isRetryableSubsonicError("Subsonic failed with a 503 status")).toBe(true);
+    expect(isRetryableSubsonicError("Subsonic failed with a 500 status")).toBe(true);
+    expect(isRetryableSubsonicError("Subsonic failed with a 404 status")).toBe(false);
+    expect(isRetryableSubsonicError("Subsonic failed with a 401 status")).toBe(false);
+    expect(isRetryableSubsonicError("Subsonic error: parameter missing")).toBe(false);
   });
 });
 

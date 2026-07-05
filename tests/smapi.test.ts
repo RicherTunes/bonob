@@ -1277,7 +1277,7 @@ describe("wsdl api", () => {
                     },
                     {
                       id: "favouriteAlbums",
-                      title: "Favourites",
+                      title: "Favourite Albums",
                       albumArtURI: iconArtURI(bonobUrl, "heart").href(),
                       itemType: "albumList",
                     },
@@ -1524,6 +1524,24 @@ describe("wsdl api", () => {
                       total: expectedGenres.length,
                     })
                   );
+                });
+              });
+
+              describe("when the backend rejects the browse", () => {
+                it("returns a 'try again' placeholder, not a Sonos fault", async () => {
+                  musicLibrary.genres.mockRejectedValue(new Error("navidrome down"));
+                  const result = await ws.getMetadataAsync({
+                    id: `genres`,
+                    index: 0,
+                    count: 100,
+                  });
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  const item = Array.isArray(md.mediaCollection)
+                    ? md.mediaCollection[0]
+                    : md.mediaCollection;
+                  expect(item.id).toEqual("genres");
+                  expect(String(item.title)).toMatch(/try again/i);
                 });
               });
 

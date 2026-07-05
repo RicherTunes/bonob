@@ -204,6 +204,17 @@ export function isSafeExternalImageUrl(url: unknown): url is string {
 export const isValidImage = (url: string | undefined) =>
   url != undefined && !url.endsWith(DODGY_IMAGE_NAME);
 
+// A READ may be retried once on a transient transport failure (network error / 5xx). Do NOT retry a
+// 4xx or a Subsonic-level application error (a valid response reporting a problem) - retrying those
+// is pointless, and the GET-based mutations must never be retried.
+export const isRetryableSubsonicError = (e: unknown): boolean => {
+  const s = String(e);
+  if (s.startsWith("Subsonic error:")) return false;
+  const m = s.match(/Subsonic (?:POST )?failed with a (\d+) status/);
+  if (m) return Number(m[1]) >= 500;
+  return true; // network / transport error
+};
+
 type SubsonicEnvelope = {
   "subsonic-response": SubsonicResponse;
 };
@@ -1124,6 +1135,22 @@ export class Subsonic {
         else return json as unknown as T;
       });
 
+  // Retry a READ once on a transient transport failure (network error / 5xx). Never on a 4xx or a
+  // Subsonic app-level error. The GET-based mutations (star/unstar/setRating/scrobble) stay on plain
+  // getJSON below and are NOT routed through here, so they are never retried.
+  private getJSONWithRetry = async <T>(
+    credentials: Credentials,
+    path: string,
+    q: {} = {}
+  ): Promise<T> => {
+    try {
+      return await this.getJSON<T>(credentials, path, q);
+    } catch (e) {
+      if (!isRetryableSubsonicError(e)) throw e;
+      return this.getJSON<T>(credentials, path, q);
+    }
+  };
+
   private postJSON = async <T>(
     credentials: Credentials,
     path: string,
@@ -1160,7 +1187,7 @@ export class Subsonic {
   private fetchArtists = (
     credentials: Credentials
   ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> =>
-    this.getJSON<GetArtistsResponse>(credentials, "/rest/getArtists")
+    this.getJSONWithRetry<GetArtistsResponse>(credentials, "/rest/getArtists")
       .then((it) => (it.artists.index || []).flatMap((it) => it.artist || []))
       .then((artists) => {
         // Deep-frozen: this array + its objects are shared across every cache hit and user,
@@ -1239,7 +1266,7 @@ export class Subsonic {
     credentials: Credentials,
     offset: number
   ): Promise<AlbumSummary[]> =>
-    this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
+    this.getJSONWithRetry<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
       type: "alphabeticalByName",
       size: 500,
       offset,
@@ -1308,7 +1335,7 @@ export class Subsonic {
       l: string | undefined;
     };
   }> =>
-    this.getJSON<GetArtistInfoResponse>(credentials, "/rest/getArtistInfo2", {
+    this.getJSONWithRetry<GetArtistInfoResponse>(credentials, "/rest/getArtistInfo2", {
       id,
       count: 50,
       includeNotPresent: true,
@@ -1336,7 +1363,7 @@ export class Subsonic {
       );
 
   getAlbum = (credentials: Credentials, id: string): Promise<Album>  =>
-    this.getJSON<GetAlbumResponse>(credentials, "/rest/getAlbum", { id })
+    this.getJSONWithRetry<GetAlbumResponse>(credentials, "/rest/getAlbum", { id })
       .then((it) => it.album)
       .then((album) => {
         const x: AlbumSummary = {
@@ -1364,7 +1391,7 @@ export class Subsonic {
   ): Promise<
     IdName & { artistImageUrl: string | undefined; albums: AlbumSummary[] }
   > =>
-    this.getJSON<GetArtistResponse>(credentials, "/rest/getArtist", {
+    this.getJSONWithRetry<GetArtistResponse>(credentials, "/rest/getArtist", {
       id,
     })
       .then((it) => it.artist)
@@ -1382,7 +1409,7 @@ export class Subsonic {
     });
 
   getTrack = (credentials: Credentials, id: string) =>
-    this.getJSON<GetSongResponse>(credentials, "/rest/getSong", {
+    this.getJSONWithRetry<GetSongResponse>(credentials, "/rest/getSong", {
       id,
     })
       .then((it) => it.song)
@@ -1393,14 +1420,14 @@ export class Subsonic {
       );
 
   getStarred = (credentials: Credentials) =>
-    this.getJSON<GetStarredResponse>(credentials, "/rest/getStarred2").then(
+    this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then(
       (it) => new Set(it.starred2.song.map((it) => it.id))
     );
 
   // The user's starred/favourite tracks as playable summaries (Favourite Songs section). getStarred2
   // is per-user and volatile, so it is fetched live (never cached).
   starredSongs = (credentials: Credentials) =>
-    this.getJSON<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
+    this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
       (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
     );
 
@@ -1416,7 +1443,7 @@ export class Subsonic {
     }));
 
   search3 = (credentials: Credentials, q: any) =>
-    this.getJSON<Search3Response>(credentials, "/rest/search3", {
+    this.getJSONWithRetry<Search3Response>(credentials, "/rest/search3", {
       artistCount: 0,
       albumCount: 0,
       songCount: 0,
@@ -1431,7 +1458,7 @@ export class Subsonic {
     credentials: Credentials,
     q: AlbumQuery
   ): Promise<AlbumSummary[]> =>
-    this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
+    this.getJSONWithRetry<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
       type: AlbumQueryTypeToSubsonicType[q.type],
       ...(q.genre ? { genre: b64Decode(q.genre) } : {}),
       ...(q.fromYear ? { fromYear: q.fromYear } : {}),
@@ -1490,7 +1517,7 @@ export class Subsonic {
   };
 
   getGenres = (credentials: Credentials) =>
-    this.getJSON<GetGenresResponse>(credentials, "/rest/getGenres").then((it) =>
+    this.getJSONWithRetry<GetGenresResponse>(credentials, "/rest/getGenres").then((it) =>
       pipe(
         it.genres.genre || [],
         A.filter((it) => it.albumCount > 0),
@@ -1614,7 +1641,7 @@ export class Subsonic {
     }));
 
   playlists = (credentials: Credentials) =>
-    this.getJSON<GetPlaylistsResponse>(credentials, "/rest/getPlaylists")
+    this.getJSONWithRetry<GetPlaylistsResponse>(credentials, "/rest/getPlaylists")
     .then(({ playlists }) => (playlists.playlist || []).map( it => ({
         id: it.id,
         name: it.name,
@@ -1623,7 +1650,7 @@ export class Subsonic {
     );
 
   playlist = (credentials: Credentials, id: string) =>
-    this.getJSON<GetPlaylistResponse>(credentials, "/rest/getPlaylist", {
+    this.getJSONWithRetry<GetPlaylistResponse>(credentials, "/rest/getPlaylist", {
       id,
     })
     .then(({ playlist }) => {
@@ -1652,7 +1679,7 @@ export class Subsonic {
     });
 
     createPlayList = (credentials: Credentials, name: string) =>
-      this.getJSON<GetPlaylistResponse>(credentials, "/rest/createPlaylist", {
+      this.getJSONWithRetry<GetPlaylistResponse>(credentials, "/rest/createPlaylist", {
         name,
       })
       .then(({ playlist }) => ({
@@ -1679,7 +1706,7 @@ export class Subsonic {
       .then(it => it.status == "ok");
 
     getSimilarSongs2 = (credentials: Credentials, id: string) =>
-      this.getJSON<GetSimilarSongsResponse>(
+      this.getJSONWithRetry<GetSimilarSongsResponse>(
         credentials,
         "/rest/getSimilarSongs2",
         //todo: remove this hard coded 50?
@@ -1690,7 +1717,7 @@ export class Subsonic {
       );
 
     getTopSongs = (credentials: Credentials, artist: string) =>
-      this.getJSON<GetTopSongsResponse>(
+      this.getJSONWithRetry<GetTopSongsResponse>(
         credentials,
         "/rest/getTopSongs",
         //todo: remove this hard coded 50?
@@ -1701,7 +1728,7 @@ export class Subsonic {
       );
 
   getInternetRadioStations = (credentials: Credentials) =>
-    this.getJSON<GetInternetRadioStationsResponse>(
+    this.getJSONWithRetry<GetInternetRadioStationsResponse>(
       credentials,
       "/rest/getInternetRadioStations"
     )
@@ -1716,7 +1743,7 @@ export class Subsonic {
     );
 
   getOpenSubsonicExtensions = (credentials: Credentials): Promise<OpenSubsonicExtension[]> =>
-    this.getJSON<GetOpenSubsonicExtensionsResponse>(
+    this.getJSONWithRetry<GetOpenSubsonicExtensionsResponse>(
       credentials,
       "/rest/getOpenSubsonicExtensions.view"
     )

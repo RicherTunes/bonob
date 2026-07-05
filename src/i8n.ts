@@ -83,7 +83,7 @@ const translations: Record<SUPPORTED_LANG, Record<KEY, string>> = {
     loginSuccessful: "Login successful!",
     loginFailed: "Login failed!",
     noSonosDevices: "No sonos devices",
-    favourites: "Favourites",
+    favourites: "Favourite Albums",
     years: "Years",
     STAR: "Star",
     UNSTAR: "Un-star",
