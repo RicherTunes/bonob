@@ -202,6 +202,9 @@ export interface MusicLibrary {
   // Total album count, cheap from the cached artist list. Used to decide whether the catalog
   // is large enough to need the bucketed A-Z index at all (small libraries serve the flat list).
   albumCount(): Promise<number>;
+  // Non-blocking peek at the album count: undefined until the artist list is warm, so a live
+  // Albums browse never blocks on a multi-second cold getArtists.
+  peekAlbumCount(): Promise<number> | undefined;
   album(id: string): Promise<Album>;
   track(trackId: string): Promise<Track>;
   genres(): Promise<Genre[]>;

@@ -155,6 +155,9 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   albumCount = (): Promise<number> =>
     this.subsonic.albumCount(this.credentials);
 
+  peekAlbumCount = (): Promise<number> | undefined =>
+    this.subsonic.peekAlbumCount(this.credentials);
+
   albumIndex = (): Promise<AlbumIndex<AlbumSummary>> =>
     this.subsonic.getAlbumIndex(this.credentials);
 

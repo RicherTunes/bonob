@@ -13,6 +13,7 @@ import { bonobService, SONOS_DISABLED, SONOS_LANG } from "../src/sonos";
 import {
   STRINGS_ROUTE,
   getMetadataResult,
+  splitId,
   PRESENTATION_MAP_ROUTE,
   SONOS_RECOMMENDED_IMAGE_SIZES,
   track,
@@ -62,6 +63,19 @@ import { FixedClock } from "../src/clock";
 import { ExpiredTokenError, InvalidTokenError, SmapiAuthTokens, SmapiToken, ToSmapiFault } from "../src/smapi_auth";
 
 const parseXML = (value: string) => new DOMParserImpl().parseFromString(value);
+
+describe("splitId", () => {
+  it("splits on the first colon so ids that contain colons keep their full typeId", () => {
+    expect(splitId("root")).toEqual({ type: "root", typeId: "" });
+    expect(splitId("artist:123")).toEqual({ type: "artist", typeId: "123" });
+    expect(splitId("year:?")).toEqual({ type: "year", typeId: "?" });
+    expect(splitId("albumsByLetter:#")).toEqual({ type: "albumsByLetter", typeId: "#" });
+    expect(splitId("albumsChunk:S_0")).toEqual({ type: "albumsChunk", typeId: "S_0" });
+    // ids whose typeId itself contains colons must NOT be truncated
+    expect(splitId("artist:a:b")).toEqual({ type: "artist", typeId: "a:b" });
+    expect(splitId("topSongs:a:b")).toEqual({ type: "topSongs", typeId: "a:b" });
+  });
+});
 
 describe("rating to and from ints", () => {
   describe("ratingAsInt", () => {
@@ -681,6 +695,7 @@ describe("wsdl api", () => {
     albumIndex: jest.fn(),
     peekAlbumIndex: jest.fn(),
     albumCount: jest.fn(),
+    peekAlbumCount: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
     topSongs: jest.fn(),
@@ -1792,6 +1807,11 @@ describe("wsdl api", () => {
                   ]);
                   expect(items.every((m) => m.itemType === "track")).toBe(true);
                   expect(items[0].trackMetadata.artist).toEqual(t1.artist.name);
+                  // top-song art must carry the access token (bat) so the token-gated /art route
+                  // authorizes the fetch - a bare bonobUrl would 401.
+                  expect(items[0].trackMetadata.albumArtURI).toContain(
+                    `bat=${apiToken}`
+                  );
                   expect(musicLibrary.topSongs).toHaveBeenCalledWith(
                     artistWithManyAlbums.id
                   );
@@ -2403,7 +2423,9 @@ describe("wsdl api", () => {
 
               describe("asking for albums in a small catalog (flat, no index)", () => {
                 it("serves the flat list live and never builds the index", async () => {
-                  musicLibrary.albumCount.mockResolvedValue(5000); // <= MAX_ALBUMS_FLAT
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined); // not indexed
+                  // count is warm (from the cached artist list) and small
+                  musicLibrary.peekAlbumCount.mockReturnValue(Promise.resolve(5000));
                   musicLibrary.albums.mockResolvedValue({
                     results: [pop1, pop2],
                     total: 5000,
@@ -2433,14 +2455,35 @@ describe("wsdl api", () => {
                       total: 5000,
                     })
                   );
-                  // served live from getAlbumList2 - no bucketing, no index touched
+                  // served live from getAlbumList2 - no bucketing, and the (expensive) index build
+                  // is never triggered for a small catalog
                   expect(musicLibrary.albums).toHaveBeenCalledWith({
                     type: "alphabeticalByName",
                     _index: 0,
                     _count: 100,
                   });
-                  expect(musicLibrary.peekAlbumIndex).not.toHaveBeenCalled();
                   expect(musicLibrary.albumIndex).not.toHaveBeenCalled();
+                });
+
+                it("does not block on a cold album count (returns a placeholder)", async () => {
+                  // Nothing warm yet: peekAlbumIndex + peekAlbumCount both undefined. Must NOT
+                  // await the multi-second albumCount() - return a bounded placeholder immediately.
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.peekAlbumCount.mockReturnValue(undefined);
+                  musicLibrary.albumCount.mockReturnValue(new Promise<number>(() => {}));
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albums",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  expect(md.mediaCollection).toMatchObject({ id: "albums" });
+                  // kicked the warm in the background rather than awaiting it
+                  expect(musicLibrary.albumCount).toHaveBeenCalled();
+                  expect(musicLibrary.albums).not.toHaveBeenCalled();
                 });
               });
 

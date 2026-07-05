@@ -139,8 +139,14 @@ export type GetMetadataResponse = {
 // rejects wholesale (one bad album breaks the whole page). Strip it from all emitted text.
 const XML_INVALID_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
 
+// Unpaired UTF-16 surrogates are also illegal in XML 1.0: a high surrogate not followed by a low,
+// or a low not preceded by a high. Strip those while leaving valid pairs (emoji) intact.
+const LONE_SURROGATES =
+  /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
 export const sanitizeXml = (value: any): any => {
-  if (typeof value === "string") return value.replace(XML_INVALID_CHARS, "");
+  if (typeof value === "string")
+    return value.replace(XML_INVALID_CHARS, "").replace(LONE_SURROGATES, "");
   if (Array.isArray(value)) return value.map(sanitizeXml);
   if (value && typeof value === "object") {
     const out: Record<string, any> = {};
@@ -456,11 +462,13 @@ export const artist = (bonobUrl: URLBuilder, artist: ArtistSummary) => ({
 });
 
 export const splitId = (id: string) => {
-  const [type, typeId] = id.split(":")
+  // Split on the FIRST colon only: subsonic ids can themselves contain colons (and our
+  // synthetic ids like topSongs:<id> wrap them), so id.split(":")[1] would truncate the typeId.
+  const sep = id.indexOf(":");
   return {
-    type: type!!,
-    typeId: typeId!!
-  }
+    type: sep < 0 ? id : id.slice(0, sep),
+    typeId: sep < 0 ? "" : id.slice(sep + 1),
+  };
 }
 
 export function withSplitId<T>(id: string) {
@@ -982,44 +990,26 @@ function bindSmapiSoapServiceToExpress(
                       });
                     });
                   case "albums": {
-                    return musicLibrary.albumCount().then((count) => {
-                      if (count <= MAX_ALBUMS_FLAT) {
-                        // Small catalog: serve the flat Albums list LIVE and never build the index.
-                        // A small container is fine for S2; this is stock bonob behavior and small
-                        // setups pay nothing for the bucketing machinery.
-                        return musicLibrary
-                          .albums({ type: "alphabeticalByName", ...paging })
-                          .then((result) =>
-                            getMetadataResult({
-                              mediaCollection: result.results.map((it) =>
-                                album(urlWithToken(apiKey), it)
-                              ),
-                              index: paging._index,
-                              total: count,
-                            })
-                          );
-                      }
-                      // Large catalog: a flat list is rejected by S2, so bucket via the cached
-                      // drift-proof snapshot index. Peek so we never block on the multi-minute scan.
-                      const peeked = musicLibrary.peekAlbumIndex();
-                      if (!peeked) {
-                        void musicLibrary.albumIndex().catch(() => undefined);
-                        return getMetadataResult({
-                          mediaCollection: [
-                            {
-                              itemType: "albumList",
-                              id: "albums",
-                              title: "Indexing your albums… (open again shortly)",
-                              albumArtURI: albumArtURI(
-                                iconArtURI(bonobUrl, "albums").href()
-                              ),
-                            },
-                          ],
-                          index: 0,
-                          total: 1,
-                        });
-                      }
-                      return peeked.then((idx) => {
+                    const albumsPlaceholder = () =>
+                      getMetadataResult({
+                        mediaCollection: [
+                          {
+                            itemType: "albumList",
+                            id: "albums",
+                            title: "Loading your albums… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "albums").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    // 1. Index warm -> the catalog is large (the index is only built for large
+                    // catalogs) -> serve the bucketed A-Z menu. No count fetch, never blocks.
+                    const peekedAlbums = musicLibrary.peekAlbumIndex();
+                    if (peekedAlbums) {
+                      return peekedAlbums.then((idx) => {
                         // A catalog that shrank back under the cap can still serve flat from the
                         // snapshot; otherwise the A-Z letter menu.
                         if (idx.total <= MAX_ALBUMS_FLAT) {
@@ -1047,6 +1037,35 @@ function bindSmapiSoapServiceToExpress(
                           total: letters.length,
                         });
                       });
+                    }
+                    // 2. Not indexed. Decide small vs large from the NON-BLOCKING cached count -
+                    // never a cold multi-second getArtists on this live browse.
+                    const peekedCount = musicLibrary.peekAlbumCount();
+                    if (!peekedCount) {
+                      // Not even the count is warm: kick the artist-list warm, show a placeholder.
+                      void musicLibrary.albumCount().catch(() => undefined);
+                      return albumsPlaceholder();
+                    }
+                    return peekedCount.then((count) => {
+                      if (count <= MAX_ALBUMS_FLAT) {
+                        // Small catalog: serve the flat Albums list LIVE, never build the index.
+                        // Stock bonob behavior; small setups pay nothing for the bucketing machinery.
+                        return musicLibrary
+                          .albums({ type: "alphabeticalByName", ...paging })
+                          .then((result) =>
+                            getMetadataResult({
+                              mediaCollection: result.results.map((it) =>
+                                album(urlWithToken(apiKey), it)
+                              ),
+                              index: paging._index,
+                              total: count,
+                            })
+                          );
+                      }
+                      // Large catalog, index not warm yet: kick the build, show the placeholder
+                      // (never block the browse on the multi-minute scan).
+                      void musicLibrary.albumIndex().catch(() => undefined);
+                      return albumsPlaceholder();
                     });
                   }
                   case "albumsByLetter": {
@@ -1298,7 +1317,8 @@ function bindSmapiSoapServiceToExpress(
                       .then(([page, total]) =>
                         getMetadataResult({
                           mediaMetadata: page.map((it) =>
-                            topSongMetadata(bonobUrl, it)
+                            // /art needs the access token (bat), same as album art
+                            topSongMetadata(urlWithToken(apiKey), it)
                           ),
                           index: paging._index,
                           total,

@@ -20,6 +20,15 @@ describe("sanitizeXml", () => {
     expect(sanitizeXml(s)).toEqual(s);
   });
 
+  it("strips unpaired UTF-16 surrogates but keeps valid pairs (emoji)", () => {
+    // lone high (no following low) and lone low (no preceding high) are both illegal in XML 1.0
+    expect(sanitizeXml("a" + ch(0xd800) + "b")).toEqual("ab");
+    expect(sanitizeXml("a" + ch(0xdc00) + "b")).toEqual("ab");
+    // a valid surrogate pair (musical note emoji) survives intact
+    const emoji = ch(0xd83c) + ch(0xdfb5);
+    expect(sanitizeXml("x" + emoji + "y")).toEqual("x" + emoji + "y");
+  });
+
   it("recurses into nested arrays and objects", () => {
     const input = {
       title: "x" + ch(4),

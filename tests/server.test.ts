@@ -1438,6 +1438,8 @@ describe("server", () => {
                   expect(res.header["cache-control"]).toMatch(/private/);
                   expect(res.header["cache-control"]).not.toMatch(/public/);
                   expect(res.header["cache-control"]).toMatch(/max-age=86400\b/);
+                  // never let a client re-sniff the bytes as something other than the declared image
+                  expect(res.header["x-content-type-options"]).toEqual("nosniff");
                 });
               });
 
@@ -1461,6 +1463,26 @@ describe("server", () => {
 
                   expect(res.status).toEqual(502);
                   // upstream returned junk (e.g. an HTML hotlink page) — never cache it
+                  expect(res.header["cache-control"]).toMatch(/no-store/);
+                });
+
+                it("should reject a syntactically-valid but non-image content type (e.g. text/html)", async () => {
+                  // text/html passes a generic MIME validator but must NOT be served as art: an
+                  // upstream error/redirect page would otherwise be cached and returned as an image.
+                  const coverArtURN = { system: "subsonic", resource: "art:200" };
+
+                  musicService.login.mockResolvedValue(musicLibrary);
+                  musicLibrary.coverArt.mockResolvedValue(
+                    coverArtResponse({ contentType: "text/html" })
+                  );
+
+                  const res = await request(server)
+                    .get(
+                      `/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+                    )
+                    .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                  expect(res.status).toEqual(502);
                   expect(res.header["cache-control"]).toMatch(/no-store/);
                 });
               });

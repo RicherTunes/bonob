@@ -686,23 +686,33 @@ export const cachingImageFetcher = (
       );
   };
 
-export const axiosImageFetcher = (url: string): Promise<CoverArt | undefined> =>
-  axios
-    .get(url, {
-      headers: BROWSER_HEADERS,
-      responseType: "arraybuffer",
-      // Bound external image fetches: a hung/slow upstream must not tie up the
-      // process, and a huge response must not exhaust memory. (Defence in depth
-      // alongside refusing unsigned external burns in burn.parse.)
-      timeout: 10000,
-      maxContentLength: 25 * 1024 * 1024,
-      maxBodyLength: 25 * 1024 * 1024,
-    })
-    .then((res) => ({
-      contentType: res.headers["content-type"],
-      data: Buffer.from(res.data, "binary"),
-    }))
-    .catch(() => undefined);
+const imageFetcherWith =
+  (extra: Record<string, unknown>): ImageFetcher =>
+  (url: string): Promise<CoverArt | undefined> =>
+    axios
+      .get(url, {
+        headers: BROWSER_HEADERS,
+        responseType: "arraybuffer",
+        // Bound external image fetches: a hung/slow upstream must not tie up the
+        // process, and a huge response must not exhaust memory. (Defence in depth
+        // alongside refusing unsigned external burns in burn.parse.)
+        timeout: 10000,
+        maxContentLength: 25 * 1024 * 1024,
+        maxBodyLength: 25 * 1024 * 1024,
+        ...extra,
+      })
+      .then((res) => ({
+        contentType: res.headers["content-type"],
+        data: Buffer.from(res.data, "binary"),
+      }))
+      .catch(() => undefined);
+
+export const axiosImageFetcher = imageFetcherWith({});
+
+// Deezer art must NOT follow redirects: the SSRF allowlist only validates the initial *.dzcdn.net
+// URL, so a manipulated/compromised response that 30x-es to an internal address would otherwise be
+// fetched. dzcdn.net serves images directly, so refusing redirects is correct.
+export const deezerImageFetcher = imageFetcherWith({ maxRedirects: 0 });
 
 const AlbumQueryTypeToSubsonicType: Record<AlbumQueryType, string> = {
   alphabeticalByArtist: "alphabeticalByArtist",
@@ -935,6 +945,17 @@ export class Subsonic {
       _.inject(artists, (total, artist) => total + artist.albumCount, 0)
     );
 
+  // Non-blocking peek at the album count: undefined when the artist list is not warm yet, so a live
+  // Albums browse can avoid a multi-second cold getArtists; otherwise the already-resolved count.
+  peekAlbumCount = (credentials: Credentials): Promise<number> | undefined =>
+    this.cache
+      .peek<(IdName & { albumCount: number })[]>(
+        `artists:${credentials.username}`
+      )
+      ?.then((artists) =>
+        _.inject(artists, (total, artist) => total + artist.albumCount, 0)
+      );
+
   // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
   // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
   // self-contained SNAPSHOT: serving a letter never re-fetches by live offset, which would drift
@@ -1154,10 +1175,25 @@ export class Subsonic {
             `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
             () => this.fetchAlbumListPage(credentials, q)
           ),
-    ]).then(([total, albums]) => ({
-      results: albums.slice(0, q._count),
-      total: albums.length == 500 ? total : q._index + albums.length,
-    }));
+    ]).then(([total, albums]) => {
+      const results = albums.slice(0, q._count);
+      const unfiltered =
+        q.type === "alphabeticalByName" || q.type === "alphabeticalByArtist";
+      return {
+        results,
+        // Unfiltered lists can advertise the true catalog total (or the exact end on a short page).
+        // Filtered/secondary lists (genre, year, recentlyAdded, random, ...) must NOT: a full page
+        // there would claim the whole ~107k catalog and S2 rejects the oversized container. Advertise
+        // a bounded "there may be one more page" total instead, so Sonos pages until a short page.
+        total: unfiltered
+          ? albums.length == 500
+            ? total
+            : q._index + albums.length
+          : q._index +
+            results.length +
+            (results.length >= q._count ? q._count : 0),
+      };
+    });
 
   getGenres = (credentials: Credentials) =>
     this.getJSON<GetGenresResponse>(credentials, "/rest/getGenres").then((it) =>
