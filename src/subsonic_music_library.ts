@@ -166,6 +166,9 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   peekAlbumCount = (): Promise<number> | undefined =>
     this.subsonic.peekAlbumCount(this.credentials);
 
+  peekArtists = (): Promise<unknown> | undefined =>
+    this.subsonic.peekArtists(this.credentials);
+
   albumIndex = (): Promise<AlbumIndex<AlbumSummary>> =>
     this.subsonic.getAlbumIndex(this.credentials);
 
@@ -325,6 +328,9 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       .then(({ name }) =>
         this.subsonic.getTopSongs(this.credentials, name)
       );
+
+  starredSongs = async () =>
+    this.subsonic.starredSongs(this.credentials);
 
   radioStations = async () =>
     this.subsonic.getInternetRadioStations(this.credentials);

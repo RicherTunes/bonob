@@ -119,6 +119,7 @@ export class InMemoryMusicService implements MusicService {
         Promise.resolve(this.artists.flatMap((a) => a.albums).length),
       peekAlbumCount: () =>
         Promise.resolve(this.artists.flatMap((a) => a.albums).length),
+      peekArtists: () => Promise.resolve(this.artists),
       album: (id: string) =>
         pipe(
           this.artists.flatMap((it) => it.albums).find((it) => it.id === id),
@@ -174,6 +175,7 @@ export class InMemoryMusicService implements MusicService {
         Promise.reject("Unsupported operation"),
       similarSongs: async (_: string) => Promise.resolve([]),
       topSongs: async (_: string) => Promise.resolve([]),
+      starredSongs: async () => Promise.resolve([]),
       radioStations: async () => Promise.resolve([]),
       radioStation: async (_: string) => Promise.reject("Unsupported operation"),
       years: async () => Promise.resolve([]),

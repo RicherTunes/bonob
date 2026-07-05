@@ -956,6 +956,12 @@ export class Subsonic {
         _.inject(artists, (total, artist) => total + artist.albumCount, 0)
       );
 
+  // Non-blocking peek at the artist list itself: the settled cached list, or undefined when it is
+  // in-flight or cold. Lets a cold Artists browse fall back to a placeholder rather than block on
+  // the multi-second full-artist fetch (which would blow Sonos's ~5s timeout).
+  peekArtists = (credentials: Credentials): Promise<unknown> | undefined =>
+    this.cache.peek(`artists:${credentials.username}`);
+
   // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
   // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
   // self-contained SNAPSHOT: serving a letter never re-fetches by live offset, which would drift
@@ -1111,6 +1117,13 @@ export class Subsonic {
   getStarred = (credentials: Credentials) =>
     this.getJSON<GetStarredResponse>(credentials, "/rest/getStarred2").then(
       (it) => new Set(it.starred2.song.map((it) => it.id))
+    );
+
+  // The user's starred/favourite tracks as playable summaries (Favourite Songs section). getStarred2
+  // is per-user and volatile, so it is fetched live (never cached).
+  starredSongs = (credentials: Credentials) =>
+    this.getJSON<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
+      (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
     );
 
   toAlbumSummary = (albumList: album[]): AlbumSummary[] =>
