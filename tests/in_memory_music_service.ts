@@ -4,6 +4,7 @@ import { fromEquals } from "fp-ts/lib/Eq";
 import { pipe } from "fp-ts/lib/function";
 import { ordString, fromCompare } from "fp-ts/lib/Ord";
 import { shuffle } from "underscore";
+import { buildAlbumIndexFromPages } from "../src/album_index";
 
 import { b64Encode, b64Decode } from "../src/b64";
 
@@ -98,6 +99,22 @@ export class InMemoryMusicService implements MusicService {
           .then((matches) => matches.map((it) => it.album))
           .then(slice2(q))
           .then(asResult),
+      albumIndex: () =>
+        Promise.resolve(
+          buildAlbumIndexFromPages([
+            this.artists
+              .flatMap((a) => a.albums)
+              .sort((x, y) => x.name.localeCompare(y.name)),
+          ])
+        ),
+      peekAlbumIndex: () =>
+        Promise.resolve(
+          buildAlbumIndexFromPages([
+            this.artists
+              .flatMap((a) => a.albums)
+              .sort((x, y) => x.name.localeCompare(y.name)),
+          ])
+        ),
       album: (id: string) =>
         pipe(
           this.artists.flatMap((it) => it.albums).find((it) => it.id === id),

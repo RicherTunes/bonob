@@ -741,17 +741,23 @@ export class Subsonic {
   customPlayers: CustomPlayers;
   externalImageFetcher: ImageFetcher;
   private cache: SwrCache;
+  private indexCache: SwrCache;
 
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
     externalImageFetcher: ImageFetcher = axiosImageFetcher,
-    cache: SwrCache = SwrCache.disabled()
+    cache: SwrCache = SwrCache.disabled(),
+    // Separate cache for the album index: it is a heavy (~N/500 request) full-catalog scan that
+    // changes only on a library scan, so it must have a much longer TTL than the browse cache
+    // (otherwise it would re-scan on every stale browse). Defaults to the browse cache.
+    indexCache: SwrCache = cache
   ) {
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
     this.cache = cache;
+    this.indexCache = indexCache;
   }
 
   private get = async (
@@ -931,7 +937,7 @@ export class Subsonic {
   // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
   // "Albums -> A-Z" browse so no single container advertises the huge global album total.
   getAlbumIndex = (credentials: Credentials): Promise<AlbumIndex> =>
-    this.cache.get(`albumIndex:${credentials.username}`, () =>
+    this.indexCache.get(`albumIndex:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 
@@ -941,11 +947,11 @@ export class Subsonic {
   peekAlbumIndex = (
     credentials: Credentials
   ): Promise<AlbumIndex> | undefined =>
-    this.cache.peek<AlbumIndex>(`albumIndex:${credentials.username}`);
+    this.indexCache.peek<AlbumIndex>(`albumIndex:${credentials.username}`);
 
   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
   warmAlbumIndex = (credentials: Credentials): void =>
-    this.cache.warm(`albumIndex:${credentials.username}`, () =>
+    this.indexCache.warm(`albumIndex:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 

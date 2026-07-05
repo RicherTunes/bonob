@@ -650,6 +650,8 @@ describe("wsdl api", () => {
     playlist: jest.fn(),
     album: jest.fn(),
     albums: jest.fn(),
+    albumIndex: jest.fn(),
+    peekAlbumIndex: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
     searchArtists: jest.fn(),
@@ -2261,74 +2263,72 @@ describe("wsdl api", () => {
                 });
               });
 
-              describe("asking for all albums", () => {
+              describe("asking for the A-Z album buckets (large catalog)", () => {
                 beforeEach(() => {
-                  musicLibrary.albums.mockResolvedValue({
-                    results: allAlbums,
-                    total: allAlbums.length,
-                  });
+                  // total exceeds MAX_ALBUMS_FLAT, so Albums is split into per-letter buckets
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 30000,
+                      buckets: [
+                        { key: "P", label: "P", offset: 0, count: 20000 },
+                        { key: "R", label: "R", offset: 20000, count: 10000 },
+                      ],
+                    })
+                  );
                 });
 
-                it("should return them all", async () => {
-                  const paging = {
-                    index: 0,
-                    count: 100,
-                  };
-
+                it("returns a bounded container per letter, not a huge flat list", async () => {
                   const result = await ws.getMetadataAsync({
                     id: "albums",
-                    ...paging,
+                    index: 0,
+                    count: 100,
                   });
 
                   expect(result[0]).toEqual(
                     getMetadataResult({
-                      mediaCollection: allAlbums.map((it) => ({
-                        itemType: "album",
-                        id: `album:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          it
-                        ).href(),
-                        canPlay: true,
-                        artistId: `artist:${it.artistId}`,
-                        artist: it.artistName,
-                      })),
+                      mediaCollection: [
+                        {
+                          itemType: "albumList",
+                          id: "albumsByLetter:P",
+                          title: "P",
+                          albumArtURI: iconArtURI(bonobUrl, "albums").href(),
+                        },
+                        {
+                          itemType: "albumList",
+                          id: "albumsByLetter:R",
+                          title: "R",
+                          albumArtURI: iconArtURI(bonobUrl, "albums").href(),
+                        },
+                      ],
                       index: 0,
-                      total: 6,
+                      total: 2,
                     })
                   );
-
-                  expect(musicLibrary.albums).toHaveBeenCalledWith({
-                    type: "alphabeticalByName",
-                    _index: paging.index,
-                    _count: paging.count,
-                  });
                 });
               });
 
-              describe("asking for a page of albums", () => {
-                const pageOfAlbums = [pop3, pop4, rock1];
-
-                it("should return only that page", async () => {
-                  const paging = {
-                    index: 2,
-                    count: 3,
-                  };
-
+              describe("asking for a letter's albums (albumsByLetter)", () => {
+                it("pages within the bucket and advertises only the bucket's total", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 6,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 4 }],
+                    })
+                  );
                   musicLibrary.albums.mockResolvedValue({
-                    results: pageOfAlbums,
-                    total: allAlbums.length,
+                    results: [pop3, pop4],
+                    total: 6,
                   });
 
                   const result = await ws.getMetadataAsync({
-                    id: "albums",
-                    ...paging,
+                    id: "albumsByLetter:P",
+                    index: 2,
+                    count: 2,
                   });
 
                   expect(result[0]).toEqual(
                     getMetadataResult({
-                      mediaCollection: pageOfAlbums.map((it) => ({
+                      mediaCollection: [pop3, pop4].map((it) => ({
                         itemType: "album",
                         id: `album:${it.id}`,
                         title: it.name,
@@ -2341,14 +2341,15 @@ describe("wsdl api", () => {
                         artist: it.artistName,
                       })),
                       index: 2,
-                      total: 6,
+                      total: 4, // the bucket count, NOT the global catalog total
                     })
                   );
 
+                  // fetched from the bucket's global offset (0 + index 2), clamped to the bucket
                   expect(musicLibrary.albums).toHaveBeenCalledWith({
                     type: "alphabeticalByName",
-                    _index: paging.index,
-                    _count: paging.count,
+                    _index: 2,
+                    _count: 2,
                   });
                 });
               });
