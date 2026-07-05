@@ -208,11 +208,18 @@ export const isValidImage = (url: string | undefined) =>
 // 4xx or a Subsonic-level application error (a valid response reporting a problem) - retrying those
 // is pointless, and the GET-based mutations must never be retried.
 export const isRetryableSubsonicError = (e: unknown): boolean => {
-  const s = String(e);
-  if (s.startsWith("Subsonic error:")) return false;
-  const m = s.match(/Subsonic (?:POST )?failed with a (\d+) status/);
+  // Subsonic application-level error (a valid HTTP response reporting a problem) - retrying is pointless.
+  if (String(e).startsWith("Subsonic error:")) return false;
+  // Real Axios rejections (axios rejects any non-2xx before our own status check): no response means
+  // a network/transport/timeout error -> retry; a 5xx -> retry; a 4xx is a client error -> do NOT.
+  if (axios.isAxiosError(e)) {
+    return !e.response || e.response.status >= 500;
+  }
+  // Our own "Subsonic (POST) failed with a NNN status" throw (a 2xx that wasn't 200/206).
+  const m = String(e).match(/Subsonic (?:POST )?failed with a (\d+) status/);
   if (m) return Number(m[1]) >= 500;
-  return true; // network / transport error
+  // Unknown non-Axios error -> treat as a transient transport error.
+  return true;
 };
 
 type SubsonicEnvelope = {
@@ -1679,7 +1686,9 @@ export class Subsonic {
     });
 
     createPlayList = (credentials: Credentials, name: string) =>
-      this.getJSONWithRetry<GetPlaylistResponse>(credentials, "/rest/createPlaylist", {
+      // createPlaylist is a MUTATION (despite using GET + returning a playlist), so it must NOT be
+      // retried - a transient blip after the server already created it would double-create.
+      this.getJSON<GetPlaylistResponse>(credentials, "/rest/createPlaylist", {
         name,
       })
       .then(({ playlist }) => ({
