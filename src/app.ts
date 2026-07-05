@@ -73,7 +73,11 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
 // every stale browse. Persisted in its own subdir so it survives restarts.
 const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
   store: config.subsonic.cacheDir
-    ? fileStore(path.join(config.subsonic.cacheDir, "index"))
+    ? // the index holds a full album snapshot (tens of MB on a large library), so raise the
+      // per-file cap well above the browse cache's default.
+      fileStore(path.join(config.subsonic.cacheDir, "index"), {
+        maxFileBytes: 256 * 1024 * 1024,
+      })
     : undefined,
   revive: deepFreeze,
   // The full-catalog scan legitimately takes several minutes on a large library; the default

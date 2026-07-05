@@ -142,10 +142,10 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   albums = async (q: AlbumQuery): Promise<Result<AlbumSummary>> =>
     this.subsonic.getAlbumList2(this.credentials, q);
 
-  albumIndex = (): Promise<AlbumIndex> =>
+  albumIndex = (): Promise<AlbumIndex<AlbumSummary>> =>
     this.subsonic.getAlbumIndex(this.credentials);
 
-  peekAlbumIndex = (): Promise<AlbumIndex> | undefined =>
+  peekAlbumIndex = (): Promise<AlbumIndex<AlbumSummary>> | undefined =>
     this.subsonic.peekAlbumIndex(this.credentials);
 
   album = (id: string): Promise<Album> =>

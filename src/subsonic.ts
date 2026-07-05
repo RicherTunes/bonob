@@ -923,27 +923,29 @@ export class Subsonic {
       this.fetchArtists(credentials)
     );
 
-  // Raw, un-cached, un-frozen page of album names in alphabeticalByName order (used only by the
-  // index scan; the browse path uses the cached/frozen fetchAlbumListPage).
-  private scanAlbumNames = (
+  // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
+  // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
+  // self-contained SNAPSHOT: serving a letter never re-fetches by live offset, which would drift
+  // when Navidrome re-scans and reorders the catalog.
+  private scanAlbums = (
     credentials: Credentials,
     offset: number
-  ): Promise<{ name: string }[]> =>
+  ): Promise<AlbumSummary[]> =>
     this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
       type: "alphabeticalByName",
       size: 500,
       offset,
-    }).then((r) => (r.albumList2.album || []).map((a) => ({ name: a.name })));
+    }).then((r) => (r.albumList2.album || []).map(asAlbumSummary));
 
   // Build the alphabetical album index by scanning the whole catalog once (500/page). Heavy
   // (~N/500 requests), so it is only ever run behind the cache (getAlbumIndex) as a background
   // job - never inline on a live browse. A safety cap stops a runaway scan.
   private buildAlbumIndex = async (
     credentials: Credentials
-  ): Promise<AlbumIndex> => {
-    const pages: { name: string }[][] = [];
+  ): Promise<AlbumIndex<AlbumSummary>> => {
+    const pages: AlbumSummary[][] = [];
     for (let offset = 0; offset < 2_000_000; offset += 500) {
-      const page = await this.scanAlbumNames(credentials, offset);
+      const page = await this.scanAlbums(credentials, offset);
       if (page.length === 0) break;
       pages.push(page);
       if (page.length < 500) break;
@@ -953,7 +955,9 @@ export class Subsonic {
 
   // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
   // "Albums -> A-Z" browse so no single container advertises the huge global album total.
-  getAlbumIndex = (credentials: Credentials): Promise<AlbumIndex> =>
+  getAlbumIndex = (
+    credentials: Credentials
+  ): Promise<AlbumIndex<AlbumSummary>> =>
     this.indexCache.get(`albumIndex:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
@@ -963,8 +967,10 @@ export class Subsonic {
   // resolved) promise when warm, or undefined when not yet available.
   peekAlbumIndex = (
     credentials: Credentials
-  ): Promise<AlbumIndex> | undefined =>
-    this.indexCache.peek<AlbumIndex>(`albumIndex:${credentials.username}`);
+  ): Promise<AlbumIndex<AlbumSummary>> | undefined =>
+    this.indexCache.peek<AlbumIndex<AlbumSummary>>(
+      `albumIndex:${credentials.username}`
+    );
 
   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
   warmAlbumIndex = (credentials: Credentials): void =>
