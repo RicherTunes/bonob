@@ -29,6 +29,7 @@ import { asLANGs, I8N } from "./i8n";
 import { ICON, iconForGenre } from "./icon";
 import _ from "underscore";
 import { BUrn, formatForURL } from "./burn";
+import { albumIndexLetters, albumIndexRangesFor } from "./album_index";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -954,8 +955,9 @@ function bindSmapiSoapServiceToExpress(
                       if (idx.total <= MAX_ALBUMS_FLAT) {
                         return albums({ type: "alphabeticalByName", ...paging });
                       }
+                      const letters = albumIndexLetters(idx);
                       return getMetadataResult({
-                        mediaCollection: idx.buckets.map((b) => ({
+                        mediaCollection: letters.map((b) => ({
                           itemType: "albumList",
                           id: `albumsByLetter:${b.key}`,
                           title: b.label,
@@ -964,7 +966,7 @@ function bindSmapiSoapServiceToExpress(
                           ),
                         })),
                         index: 0,
-                        total: idx.buckets.length,
+                        total: letters.length,
                       });
                     });
                   }
@@ -972,34 +974,44 @@ function bindSmapiSoapServiceToExpress(
                     return (
                       musicLibrary.peekAlbumIndex() ?? musicLibrary.albumIndex()
                     ).then((idx) => {
-                      const bucket = idx.buckets.find((b) => b.key === typeId);
-                      if (!bucket)
-                        return getMetadataResult({
-                          mediaCollection: [],
-                          index: 0,
-                          total: 0,
-                        });
-                      // Page WITHIN the bucket: fetch from the bucket's global offset, clamp so we
-                      // never spill into the next letter, and advertise only the bucket's size.
-                      const wanted = Math.min(
-                        paging._count,
-                        Math.max(0, bucket.count - paging._index)
-                      );
-                      return musicLibrary
-                        .albums({
-                          type: "alphabeticalByName",
-                          _index: bucket.offset + paging._index,
-                          _count: wanted,
+                      // A letter is one or more contiguous ranges in alphabeticalByName order.
+                      // Map the requested (index,count) window across them into concrete fetches
+                      // (usually just one) and advertise only this letter's total.
+                      const ranges = albumIndexRangesFor(idx, typeId);
+                      const total = ranges.reduce((sum, r) => sum + r.count, 0);
+                      let skip = paging._index;
+                      let take = paging._count;
+                      const fetches: { offset: number; count: number }[] = [];
+                      for (const r of ranges) {
+                        if (take <= 0) break;
+                        if (skip >= r.count) {
+                          skip -= r.count;
+                          continue;
+                        }
+                        const count = Math.min(r.count - skip, take);
+                        fetches.push({ offset: r.offset + skip, count });
+                        take -= count;
+                        skip = 0;
+                      }
+                      return Promise.all(
+                        fetches.map((f) =>
+                          musicLibrary
+                            .albums({
+                              type: "alphabeticalByName",
+                              _index: f.offset,
+                              _count: f.count,
+                            })
+                            .then((result) => result.results.slice(0, f.count))
+                        )
+                      ).then((pages) =>
+                        getMetadataResult({
+                          mediaCollection: pages
+                            .flat()
+                            .map((it) => album(urlWithToken(apiKey), it)),
+                          index: paging._index,
+                          total,
                         })
-                        .then((result) =>
-                          getMetadataResult({
-                            mediaCollection: result.results
-                              .slice(0, wanted)
-                              .map((it) => album(urlWithToken(apiKey), it)),
-                            index: paging._index,
-                            total: bucket.count,
-                          })
-                        );
+                      );
                     });
                   case "genre":
                     return albums({
