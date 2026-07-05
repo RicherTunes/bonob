@@ -33,6 +33,21 @@ import logger from "./logger";
 import { assertSystem, BUrn } from "./burn";
 import { AlbumIndex, MAX_ALBUMS_FLAT } from "./album_index";
 
+// Cap the Last.fm-backed artist enrichment so a slow-but-succeeding getArtistInfo can't stall the
+// artist browse past Sonos's ~5s timeout.
+export const ARTIST_INFO_TIMEOUT_MS = 3500;
+
+// Resolve to `fallback` if `p` has not settled within `ms` (and never leaks the timer).
+export const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    p,
+    new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
+
 export class SubsonicMusicService implements MusicService {
   subsonic: Subsonic;
   customPlayers: CustomPlayers;
@@ -128,7 +143,15 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       // and rate-limited. Fast-scrolling into artists fires many of these; a single failure must
       // NOT reject the whole artist browse (Sonos "something went wrong"). Degrade to no bio/
       // similar/images and still serve the artist + its albums.
-      this.subsonic.getArtistInfo(this.credentials, id).catch(() => ({
+      withTimeout(
+        this.subsonic.getArtistInfo(this.credentials, id),
+        ARTIST_INFO_TIMEOUT_MS,
+        {
+          biography: undefined,
+          similarArtist: [],
+          images: { s: undefined, m: undefined, l: undefined },
+        }
+      ).catch(() => ({
         biography: undefined,
         similarArtist: [],
         images: { s: undefined, m: undefined, l: undefined },

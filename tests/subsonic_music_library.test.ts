@@ -27,6 +27,7 @@ import {
 import {
   SubsonicMusicService,
   SubsonicMusicLibrary,
+  ARTIST_INFO_TIMEOUT_MS,
 } from "../src/subsonic_music_library";
 
 import {
@@ -595,6 +596,29 @@ describe("SubsonicMusicLibrary_new", () => {
           expect(result.albums).toEqual(albums);
           expect(result.similarArtists).toEqual([]);
           expect(result.biography).toBeUndefined();
+        });
+      });
+
+      describe("when the artistInfo (Last.fm) enrichment is too slow", () => {
+        // A slow-but-succeeding getArtistInfo must not stall the artist browse past Sonos's ~5s
+        // timeout: it degrades to no bio/similar after ARTIST_INFO_TIMEOUT_MS, albums still render.
+        it("returns the artist + albums without bio/similar once the timeout elapses", async () => {
+          jest.useFakeTimers();
+          try {
+            const albums = [anAlbumSummary()];
+            subsonic.getArtist.mockResolvedValue({ id, name, artistImageUrl: "http://someImage", albums });
+            subsonic.getArtistInfo.mockReturnValue(new Promise(() => {})); // never settles
+
+            const resultP = library.artist(id);
+            await jest.advanceTimersByTimeAsync(ARTIST_INFO_TIMEOUT_MS);
+            const result = await resultP;
+
+            expect(result.albums).toEqual(albums);
+            expect(result.similarArtists).toEqual([]);
+            expect(result.biography).toBeUndefined();
+          } finally {
+            jest.useRealTimers();
+          }
         });
       });
 
