@@ -27,6 +27,7 @@ import axios, { AxiosRequestConfig } from "axios";
 import { b64Encode, b64Decode } from "./b64";
 import { BUrn } from "./burn";
 import { SwrCache } from "./swr_cache";
+import { AlbumIndex, buildAlbumIndexFromPages } from "./album_index";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
 
@@ -897,6 +898,55 @@ export class Subsonic {
   warmArtists = (credentials: Credentials): void =>
     this.cache.warm(`artists:${credentials.username}`, () =>
       this.fetchArtists(credentials)
+    );
+
+  // Raw, un-cached, un-frozen page of album names in alphabeticalByName order (used only by the
+  // index scan; the browse path uses the cached/frozen fetchAlbumListPage).
+  private scanAlbumNames = (
+    credentials: Credentials,
+    offset: number
+  ): Promise<{ name: string }[]> =>
+    this.getJSON<GetAlbumListResponse>(credentials, "/rest/getAlbumList2", {
+      type: "alphabeticalByName",
+      size: 500,
+      offset,
+    }).then((r) => (r.albumList2.album || []).map((a) => ({ name: a.name })));
+
+  // Build the alphabetical album index by scanning the whole catalog once (500/page). Heavy
+  // (~N/500 requests), so it is only ever run behind the cache (getAlbumIndex) as a background
+  // job - never inline on a live browse. A safety cap stops a runaway scan.
+  private buildAlbumIndex = async (
+    credentials: Credentials
+  ): Promise<AlbumIndex> => {
+    const pages: { name: string }[][] = [];
+    for (let offset = 0; offset < 2_000_000; offset += 500) {
+      const page = await this.scanAlbumNames(credentials, offset);
+      if (page.length === 0) break;
+      pages.push(page);
+      if (page.length < 500) break;
+    }
+    return buildAlbumIndexFromPages(pages);
+  };
+
+  // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
+  // "Albums -> A-Z" browse so no single container advertises the huge global album total.
+  getAlbumIndex = (credentials: Credentials): Promise<AlbumIndex> =>
+    this.cache.get(`albumIndex:${credentials.username}`, () =>
+      this.buildAlbumIndex(credentials)
+    );
+
+  // Peek the album index without triggering a (multi-minute) scan - lets the browse path fall
+  // back gracefully while the index is still building on first use. Returns the (already
+  // resolved) promise when warm, or undefined when not yet available.
+  peekAlbumIndex = (
+    credentials: Credentials
+  ): Promise<AlbumIndex> | undefined =>
+    this.cache.peek<AlbumIndex>(`albumIndex:${credentials.username}`);
+
+  // Kick the index build in the background (on login) so it is ready before the user opens Albums.
+  warmAlbumIndex = (credentials: Credentials): void =>
+    this.cache.warm(`albumIndex:${credentials.username}`, () =>
+      this.buildAlbumIndex(credentials)
     );
 
       // todo: should be getArtistInfo2?

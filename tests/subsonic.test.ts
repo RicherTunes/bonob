@@ -910,6 +910,31 @@ describe("Subsonic", () => {
         });
       });
 
+      it("getAlbumIndex scans alphabeticalByName and buckets by first letter", async () => {
+        const artist = anArtist();
+        const page: [Artist, AlbumSummary][] = [
+          [artist, anAlbumSummary({ name: "369" })],
+          [artist, anAlbumSummary({ name: "Amsterdam" })],
+          [artist, anAlbumSummary({ name: "The Beatles" })],
+        ];
+        mockGET.mockImplementation((u: string) =>
+          Promise.resolve(
+            ok(
+              u.includes("getAlbumList2")
+                ? getAlbumListJson(page)
+                : asArtistsJson(cached)
+            )
+          )
+        );
+        const idx = await cachingSubsonic.getAlbumIndex(credentials);
+        expect(idx.total).toBe(3);
+        expect(idx.buckets.map((b) => `${b.key}:${b.offset}:${b.count}`)).toEqual([
+          "#:0:1",
+          "A:1:1",
+          "B:2:1",
+        ]);
+      });
+
       it("serves stale instantly and refreshes in the background", async () => {
         const first = await cachingSubsonic.getArtists(credentials);
         expect(mockGET).toHaveBeenCalledTimes(1);
