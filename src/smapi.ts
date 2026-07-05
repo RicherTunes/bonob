@@ -132,6 +132,22 @@ export type GetMetadataResponse = {
   getMetadataResult: getMetadataResult;
 };
 
+// Characters that are illegal in XML 1.0 (control chars, U+FFFE/FFFF). Music tags routinely carry
+// junk like a stray \x04; leaving it in a title produces a malformed SOAP response that Sonos
+// rejects wholesale (one bad album breaks the whole page). Strip it from all emitted text.
+const XML_INVALID_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g;
+
+export const sanitizeXml = (value: any): any => {
+  if (typeof value === "string") return value.replace(XML_INVALID_CHARS, "");
+  if (Array.isArray(value)) return value.map(sanitizeXml);
+  if (value && typeof value === "object") {
+    const out: Record<string, any> = {};
+    for (const k of Object.keys(value)) out[k] = sanitizeXml(value[k]);
+    return out;
+  }
+  return value;
+};
+
 export function getMetadataResult(
   result: Partial<getMetadataResult>
 ): GetMetadataResponse {
@@ -144,6 +160,12 @@ export function getMetadataResult(
       index: 0,
       total: count,
       ...result,
+      ...(result.mediaCollection && {
+        mediaCollection: sanitizeXml(result.mediaCollection),
+      }),
+      ...(result.mediaMetadata && {
+        mediaMetadata: sanitizeXml(result.mediaMetadata),
+      }),
     },
   };
 }
@@ -164,6 +186,12 @@ export function searchResult(
       index: 0,
       total: count,
       ...result,
+      ...(result.mediaCollection && {
+        mediaCollection: sanitizeXml(result.mediaCollection),
+      }),
+      ...(result.mediaMetadata && {
+        mediaMetadata: sanitizeXml(result.mediaMetadata),
+      }),
     },
   };
 }
