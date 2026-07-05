@@ -696,9 +696,11 @@ describe("wsdl api", () => {
     peekAlbumIndex: jest.fn(),
     albumCount: jest.fn(),
     peekAlbumCount: jest.fn(),
+    peekArtists: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
     topSongs: jest.fn(),
+    starredSongs: jest.fn(),
     searchArtists: jest.fn(),
     searchAlbums: jest.fn(),
     searchTracks: jest.fn(),
@@ -1280,6 +1282,12 @@ describe("wsdl api", () => {
                       itemType: "albumList",
                     },
                     {
+                      id: "favouriteSongs",
+                      title: "Favourite Songs",
+                      albumArtURI: iconArtURI(bonobUrl, "heart").href(),
+                      itemType: "trackList",
+                    },
+                    {
                       id: "starredAlbums",
                       title: "Top Rated",
                       albumArtURI: iconArtURI(bonobUrl, "star").href(),
@@ -1376,6 +1384,12 @@ describe("wsdl api", () => {
                       title: "Favorieten",
                       albumArtURI: iconArtURI(bonobUrl, "heart").href(),
                       itemType: "albumList",
+                    },
+                    {
+                      id: "favouriteSongs",
+                      title: "Favourite Songs",
+                      albumArtURI: iconArtURI(bonobUrl, "heart").href(),
+                      itemType: "trackList",
                     },
                     {
                       id: "starredAlbums",
@@ -1831,6 +1845,47 @@ describe("wsdl api", () => {
               });
             });
 
+            describe("asking for favourite songs", () => {
+              const s0 = aTrack();
+              const s1 = aTrack();
+              const s2 = aTrack();
+
+              it("returns the user's starred songs as playable track metadata, paged", async () => {
+                musicLibrary.starredSongs.mockResolvedValue([s0, s1, s2]);
+                const result = await ws.getMetadataAsync({
+                  id: "favouriteSongs",
+                  index: 1,
+                  count: 2,
+                });
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(3);
+                expect(md.index).toEqual(1);
+                const items = ([] as any[]).concat(md.mediaMetadata);
+                expect(items.map((m) => m.id)).toEqual([
+                  `track:${s1.id}`,
+                  `track:${s2.id}`,
+                ]);
+                expect(items.every((m) => m.itemType === "track")).toBe(true);
+                // favourite-song art must carry the access token (bat) for the token-gated /art route
+                expect(items[0].trackMetadata.albumArtURI).toContain(
+                  `bat=${apiToken}`
+                );
+                expect(musicLibrary.starredSongs).toHaveBeenCalled();
+              });
+
+              it("handles a user with no favourite songs", async () => {
+                musicLibrary.starredSongs.mockResolvedValue([]);
+                const result = await ws.getMetadataAsync({
+                  id: "favouriteSongs",
+                  index: 0,
+                  count: 100,
+                });
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(0);
+                expect(md.count).toEqual(0);
+              });
+            });
+
             describe("asking for artists", () => {
               const artistSummaries = [
                 anArtist(),
@@ -1839,6 +1894,43 @@ describe("wsdl api", () => {
                 anArtist(),
                 anArtist(),
               ].map(artistToArtistSummary);
+
+              beforeEach(() => {
+                // Warm by default so the existing assertions serve real artists; a cold list serves
+                // a placeholder instead (tested below).
+                musicLibrary.peekArtists.mockReturnValue(
+                  Promise.resolve(artistSummaries)
+                );
+              });
+
+              describe("when the artist list is not warm yet (cold)", () => {
+                it("returns a placeholder synchronously without blocking on the cold fetch", async () => {
+                  musicLibrary.peekArtists.mockReturnValue(undefined);
+                  // A cold getArtists takes many seconds; here it never resolves, so if the code
+                  // awaited it this test would hang. It must return the placeholder without awaiting.
+                  musicLibrary.artists.mockReturnValue(new Promise<never>(() => {}));
+
+                  const result = await ws.getMetadataAsync({
+                    id: "artists",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  // a single-item mediaCollection collapses to an object in the SOAP round-trip
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  expect(md.count).toEqual(1);
+                  const item = ([] as any[]).concat(md.mediaCollection)[0];
+                  expect(item).toEqual({
+                    itemType: "container",
+                    id: "artists",
+                    title: "Loading your artists… (open again shortly)",
+                    albumArtURI: iconArtURI(bonobUrl, "artists").href(),
+                  });
+                  // and it kicked the warm in the background
+                  expect(musicLibrary.artists).toHaveBeenCalled();
+                });
+              });
 
               describe("asking for all artists", () => {
                 it("should return them all", async () => {

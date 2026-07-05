@@ -898,6 +898,12 @@ function bindSmapiSoapServiceToExpress(
                           itemType: "albumList",
                         },
                         {
+                          id: "favouriteSongs",
+                          title: "Favourite Songs",
+                          albumArtURI: albumArtURI(iconArtURI(bonobUrl, "heart").href()),
+                          itemType: "trackList",
+                        },
+                        {
                           id: "starredAlbums",
                           title: lang("topRated"),
                           albumArtURI: albumArtURI(iconArtURI(bonobUrl, "star").href()),
@@ -979,7 +985,29 @@ function bindSmapiSoapServiceToExpress(
                         },
                       ],
                     });
-                  case "artists":
+                  case "artists": {
+                    // The full artist list is a multi-second cold fetch (~6-13s for a big library);
+                    // blocking on it blows the Sonos ~5s timeout ("not responding" the first time,
+                    // works the second). If it is not warm yet, kick the warm in the background and
+                    // return a bounded placeholder; the next browse serves real artists from the
+                    // now-warm cache. Mirrors the cold album-index handling.
+                    if (!musicLibrary.peekArtists()) {
+                      void musicLibrary.artists(paging).catch(() => undefined);
+                      return getMetadataResult({
+                        mediaCollection: [
+                          {
+                            itemType: "container",
+                            id: "artists",
+                            title: "Loading your artists… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "artists").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    }
                     return musicLibrary.artists(paging).then((result) => {
                       return getMetadataResult({
                         mediaCollection: result.results.map((it) =>
@@ -989,6 +1017,7 @@ function bindSmapiSoapServiceToExpress(
                         total: result.total,
                       });
                     });
+                  }
                   case "albums": {
                     const albumsPlaceholder = () =>
                       getMetadataResult({
@@ -1318,6 +1347,19 @@ function bindSmapiSoapServiceToExpress(
                         getMetadataResult({
                           mediaMetadata: page.map((it) =>
                             // /art needs the access token (bat), same as album art
+                            topSongMetadata(urlWithToken(apiKey), it)
+                          ),
+                          index: paging._index,
+                          total,
+                        })
+                      );
+                  case "favouriteSongs":
+                    return musicLibrary
+                      .starredSongs()
+                      .then(slice2(paging))
+                      .then(([page, total]) =>
+                        getMetadataResult({
+                          mediaMetadata: page.map((it) =>
                             topSongMetadata(urlWithToken(apiKey), it)
                           ),
                           index: paging._index,

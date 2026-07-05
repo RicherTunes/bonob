@@ -205,6 +205,9 @@ export interface MusicLibrary {
   // Non-blocking peek at the album count: undefined until the artist list is warm, so a live
   // Albums browse never blocks on a multi-second cold getArtists.
   peekAlbumCount(): Promise<number> | undefined;
+  // Non-blocking peek at the artist list: undefined until warm (settled), so a cold Artists browse
+  // returns a placeholder instead of blocking on the multi-second full-artist fetch. Value unused.
+  peekArtists(): Promise<unknown> | undefined;
   album(id: string): Promise<Album>;
   track(trackId: string): Promise<Track>;
   genres(): Promise<Genre[]>;
@@ -231,6 +234,8 @@ export interface MusicLibrary {
   removeFromPlaylist(playlistId: string, indicies: number[]): Promise<boolean>
   similarSongs(id: string): Promise<TrackSummary[]>;
   topSongs(artistId: string): Promise<TrackSummary[]>;
+  // The user's starred/favourite tracks (getStarred2 songs), as playable summaries.
+  starredSongs(): Promise<TrackSummary[]>;
   radioStation(id: string): Promise<RadioStation>
   radioStations(): Promise<RadioStation[]>
 }
