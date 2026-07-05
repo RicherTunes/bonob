@@ -9,6 +9,7 @@ import {
   randomBytes,
 } from "crypto";
 import { isIP } from "net";
+import { promises as dnsPromises } from "dns";
 import { generateRandomString } from "./random";
 import {
   Credentials,
@@ -97,7 +98,20 @@ const isPrivateIPv6 = (host: string): boolean => {
   if (h === "::" || h === "::1") return true;
   if (h.startsWith("::ffff:")) {
     const mapped = h.slice("::ffff:".length);
+    // dotted IPv4-mapped form, e.g. ::ffff:127.0.0.1
     if (isIP(mapped) === 4) return isPrivateIPv4(mapped);
+    // hex-hextet IPv4-mapped form (how Node/WHATWG canonicalizes it), e.g. ::ffff:7f00:1
+    const hextets = mapped.split(":");
+    if (hextets.length === 2) {
+      const hi = Number.parseInt(hextets[0] || "", 16);
+      const lo = Number.parseInt(hextets[1] || "", 16);
+      if (Number.isFinite(hi) && Number.isFinite(lo)) {
+        return isPrivateIPv4(
+          `${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`
+        );
+      }
+    }
+    return true;
   }
   const first = Number.parseInt(h.split(":")[0] || "0", 16);
   if (!Number.isFinite(first)) return true;
@@ -799,7 +813,32 @@ const imageFetcherWith =
 // Generic external art is server-fetched from third-party metadata: refuse redirects so a
 // safe-looking URL cannot 30x to an internal address. The URL is also validated at sign time and
 // again in the /art route via isSafeExternalImageUrl.
-export const axiosImageFetcher = imageFetcherWith({ maxRedirects: 0 });
+// SSRF: before fetching generic external art, resolve the host and refuse if any resolved address
+// is private/loopback/link-local/metadata. This guards DNS names (e.g. 169.254.169.254.nip.io) that
+// pass the literal-IP host check but resolve to an internal address. maxRedirects:0 stops a 30x to
+// an internal host. (A residual DNS-rebind TOCTOU between this check and the socket connect remains;
+// pinning the connection to the validated address would fully close it.)
+const externalImageFetcher = imageFetcherWith({ maxRedirects: 0 });
+
+export const resolvedExternalHostIsSafe = async (url: string): Promise<boolean> => {
+  try {
+    const addresses = await dnsPromises.lookup(new URL(url).hostname, {
+      all: true,
+    });
+    return (
+      addresses.length > 0 &&
+      !addresses.some((a) => isUnsafeExternalImageHost(a.address))
+    );
+  } catch {
+    return false;
+  }
+};
+
+export const axiosImageFetcher: ImageFetcher = async (url) => {
+  if (!isSafeExternalImageUrl(url) || !(await resolvedExternalHostIsSafe(url)))
+    return undefined;
+  return externalImageFetcher(url);
+};
 
 // Deezer art must NOT follow redirects: the SSRF allowlist only validates the initial *.dzcdn.net
 // URL, so a manipulated/compromised response that 30x-es to an internal address would otherwise be

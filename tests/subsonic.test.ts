@@ -26,6 +26,7 @@ import { URLBuilder } from "../src/url_builder";
 import {
   isValidImage,
   isSafeExternalImageUrl,
+  resolvedExternalHostIsSafe,
   t,
   DODGY_IMAGE_NAME,
   asURLSearchParams,
@@ -45,6 +46,7 @@ import {
   TranscodeDecision,
 } from "../src/subsonic";
 
+import { promises as dnsPromises } from "dns";
 import { getArtistJson, getArtistInfoJson, asArtistsJson, getAlbumListJson } from "./subsonic_music_library.test";
 
 import { b64Encode } from "../src/b64";
@@ -115,6 +117,50 @@ describe("isSafeExternalImageUrl (SSRF guard for server-fetched external art)", 
     expect(isSafeExternalImageUrl("not a url")).toBe(false);
     expect(isSafeExternalImageUrl(undefined)).toBe(false);
     expect(isSafeExternalImageUrl(42)).toBe(false);
+  });
+
+  it("blocks IPv4-mapped IPv6 (hex-hextet + dotted) that alias an internal address", () => {
+    for (const url of [
+      "http://[::ffff:7f00:1]/a.jpg",
+      "http://[::ffff:127.0.0.1]/a.jpg",
+      "http://[::ffff:a9fe:a9fe]/meta",
+    ]) {
+      expect(isSafeExternalImageUrl(url)).toBe(false);
+    }
+  });
+});
+
+describe("resolvedExternalHostIsSafe (DNS-resolution SSRF guard)", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("refuses a hostname that resolves to a private/metadata address (nip.io-style)", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "169.254.169.254", family: 4 }] as any);
+    expect(
+      await resolvedExternalHostIsSafe(
+        "https://169.254.169.254.nip.io/latest/meta-data"
+      )
+    ).toBe(false);
+  });
+
+  it("allows a hostname that resolves only to public addresses", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }] as any);
+    expect(
+      await resolvedExternalHostIsSafe("https://images.example.com/a.jpg")
+    ).toBe(true);
+  });
+
+  it("refuses if ANY resolved address is unsafe (rebind-style split answer)", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockResolvedValue([
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ] as any);
+    expect(
+      await resolvedExternalHostIsSafe("https://mixed.example.com/a.jpg")
+    ).toBe(false);
   });
 });
 
