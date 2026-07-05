@@ -123,6 +123,7 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       name: artist.name,
       image: artistImageURN({
         artistId: artist.id,
+        name: artist.name,
         artistImageURL: [
           artist.artistImageUrl,
           // todo: subsonic.artistInfo should just return a valid image or undefined, then the music lib just chooses first undefined

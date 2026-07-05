@@ -67,6 +67,14 @@ describe("BUrn", () => {
           parseableTopLevel: false,
         },
         {
+          // deezer burns carry an artist name and are resolved server-side; like external they
+          // are only honoured via the signed encrypted wrapper (refused at the top level).
+          burn: { system: "deezer", resource: "Radiohead" },
+          asString: "bnb:deezer:Radiohead",
+          shorthand: "bnb:d:Radiohead",
+          parseableTopLevel: false,
+        },
+        {
           burn: { system: "subsonic", resource: "art:1234" },
           asString: "bnb:subsonic:art:1234",
           shorthand: "bnb:s:art:1234",

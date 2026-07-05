@@ -36,6 +36,7 @@ import { DEFAULT_LOGIN_THEME } from './config'
 import _ from "underscore";
 import morgan from "morgan";
 import { parse, BUrn } from "./burn";
+import { deezerArtistImageUrl } from "./deezer";
 import { axiosImageFetcher, ImageFetcher } from "./subsonic";
 import {
   JWTSmapiLoginTokens,
@@ -103,6 +104,8 @@ export type ServerOpts = {
   version: string;
   smapiAuthTokens: SmapiAuthTokens;
   externalImageResolver: ImageFetcher;
+  // Resolve an artist name to a real photo URL (Deezer). Cached at the app boundary.
+  deezerArtistImage: (name: string) => Promise<string | undefined>;
   loginTheme: string;
   enableS1: boolean;
 };
@@ -123,6 +126,7 @@ const DEFAULT_SERVER_OPTS: ServerOpts = {
     DEFAULT_TIMEOUT
   ),
   externalImageResolver: axiosImageFetcher,
+  deezerArtistImage: deezerArtistImageUrl,
   loginTheme: DEFAULT_LOGIN_THEME,
   enableS1: false,
 };
@@ -631,7 +635,14 @@ function server(
     return musicService
       .login(serviceToken)
       .then((musicLibrary) => {
-        if (urn.system == "external") {
+        if (urn.system == "deezer") {
+          // Resolve the artist name to a real Deezer photo URL (cached), then proxy the image.
+          return serverOpts
+            .deezerArtistImage(urn.resource)
+            .then((url) =>
+              url ? serverOpts.externalImageResolver(url) : undefined
+            );
+        } else if (urn.system == "external") {
           return serverOpts.externalImageResolver(urn.resource);
         } else {
           return musicLibrary.coverArt(urn, size);

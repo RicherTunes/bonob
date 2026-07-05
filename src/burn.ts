@@ -38,7 +38,8 @@ const SHORTHAND_MAPPINGS: Record<string, string> = {
   "external": "e",
   "subsonic": "s",
   "navidrome": "n",
-  "encrypted": "x"
+  "encrypted": "x",
+  "deezer": "d"
 }
 const REVERSE_SHORTHAND_MAPPINGS: Record<string, string> = Object.keys(SHORTHAND_MAPPINGS).reduce((ret, key) => {
   ret[SHORTHAND_MAPPINGS[key] as unknown as string] = key;
@@ -86,7 +87,7 @@ export const format = (
 };
 
 export const formatForURL = (burn: BUrn) => {
-  if(burn.system == "external") return format(burn, { shorthand: true, encrypt: true })
+  if(burn.system == "external" || burn.system == "deezer") return format(burn, { shorthand: true, encrypt: true })
   else return format(burn, { shorthand: true })
 }
 
@@ -111,10 +112,10 @@ export const parse = (burn: string, opts: { allowExternal?: boolean } = {}): BUr
         (z) => parse(z, { allowExternal: true })
       )
     );
-  } else if (x.system == "external" && !opts.allowExternal) {
-    // A client-supplied (unsigned) external burn would let the /art handler
-    // fetch an arbitrary URL (SSRF). Only accept external via the encrypted path.
-    throw new Error(`Refusing to resolve an unsigned external burn: '${burn}'`);
+  } else if ((x.system == "external" || x.system == "deezer") && !opts.allowExternal) {
+    // A client-supplied (unsigned) external/deezer burn would let the /art handler
+    // fetch/resolve on a client's behalf. Only accept these via the encrypted (signed) path.
+    throw new Error(`Refusing to resolve an unsigned ${x.system} burn: '${burn}'`);
   } else {
     return x;
   }
