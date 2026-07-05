@@ -287,6 +287,44 @@ const pingJson = (pingResponse: Partial<PingResponse> = {}) => ({
 
 
 describe("artistImageURN", () => {
+  describe("when Deezer artist art is preferred (opt-in)", () => {
+    it("returns a deezer URN keyed by the artist name, overriding the Navidrome image", () => {
+      expect(
+        artistImageURN(
+          {
+            artistId: "someArtistId",
+            artistImageURL: "http://example.com/image.jpg",
+            name: "Radiohead",
+          },
+          true
+        )
+      ).toEqual({ system: "deezer", resource: "Radiohead" });
+    });
+
+    it("falls back to the Navidrome image when there is no name", () => {
+      expect(
+        artistImageURN(
+          {
+            artistId: "someArtistId",
+            artistImageURL: "http://example.com/image.jpg",
+            name: undefined,
+          },
+          true
+        )
+      ).toEqual({ system: "external", resource: "http://example.com/image.jpg" });
+    });
+
+    it("is off by default, so a name does not change the resolved image", () => {
+      expect(
+        artistImageURN({
+          artistId: "someArtistId",
+          artistImageURL: "http://example.com/image.jpg",
+          name: "Radiohead",
+        })
+      ).toEqual({ system: "external", resource: "http://example.com/image.jpg" });
+    });
+  });
+
   describe("when artist URL is", () => {
     describe("a valid external URL", () => {
       it("should return an external URN", () => {

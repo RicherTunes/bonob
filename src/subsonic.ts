@@ -274,18 +274,34 @@ export const coverArtURN = (coverArt: string | undefined): BUrn | undefined =>
     O.getOrElseW(() => undefined)
   );
 
+// Opt-in: resolve artist photos from Deezer instead of Navidrome. Off by default so we never
+// clobber real artist art a Navidrome instance already has; enable with BNB_DEEZER_ARTIST_ART=true
+// (recommended when Navidrome only serves the placeholder star).
+export const PREFER_DEEZER_ART =
+  process.env["BNB_DEEZER_ARTIST_ART"] === "true";
+
 export const artistImageURN = (
   spec: Partial<{
     artistId: string | undefined;
     artistImageURL: string | undefined;
-  }>
+    name: string | undefined;
+  }>,
+  preferDeezer: boolean = PREFER_DEEZER_ART
 ): BUrn | undefined => {
   const deets = {
     artistId: undefined,
     artistImageURL: undefined,
+    name: undefined,
     ...spec,
   };
-  if (deets.artistImageURL && isValidImage(deets.artistImageURL)) {
+  // When enabled, prefer a real Deezer photo (resolved lazily by name in the /art route); the
+  // Navidrome external URL and library cover art remain the fallbacks.
+  if (preferDeezer && deets.name && deets.name.trim().length > 0) {
+    return {
+      system: "deezer",
+      resource: deets.name,
+    };
+  } else if (deets.artistImageURL && isValidImage(deets.artistImageURL)) {
     return {
       system: "external",
       resource: deets.artistImageURL,
@@ -878,6 +894,7 @@ export class Subsonic {
             image: artistImageURN({
               artistId: artist.id,
               artistImageURL: artist.artistImageUrl,
+              name: artist.name,
             }),
           })
         );

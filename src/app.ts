@@ -20,6 +20,7 @@ import { SystemClock } from "./clock";
 import { JWTSmapiLoginTokens } from "./smapi_auth";
 import { SwrCache } from "./swr_cache";
 import { fileStore } from "./swr_cache_file_store";
+import { deezerArtistImageUrl } from "./deezer";
 import ms from "ms";
 
 const config = readConfig();
@@ -92,6 +93,12 @@ const subsonic = new SubsonicMusicService(
   config.subsonic.transcode
 );
 
+// Resolve artist names to real Deezer photos, cached per-artist for a day. High cap (one entry
+// per artist) so a large library isn't evicted; in-memory only (cheap to rebuild lazily).
+const deezerCache = new SwrCache(clock, 24 * 60 * 60 * 1000, { maxEntries: 100_000 });
+const cachedDeezerArtistImage = (name: string) =>
+  deezerCache.get(`deezer:${name}`, () => deezerArtistImageUrl(name));
+
 const featureFlagAwareMusicService: MusicService = {
   generateToken: subsonic.generateToken,
   refreshToken: subsonic.refreshToken,
@@ -138,6 +145,7 @@ const app = server(
     version,
     smapiAuthTokens: new JWTSmapiLoginTokens(clock, config.secret, config.authTimeout),
     externalImageResolver: artistImageFetcher,
+    deezerArtistImage: cachedDeezerArtistImage,
     loginTheme: config.loginTheme,
     enableS1: config.sonos.enableS1,
   }
