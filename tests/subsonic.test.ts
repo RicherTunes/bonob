@@ -1027,6 +1027,16 @@ describe("Subsonic", () => {
           }
         );
       });
+
+      it("albumCount sums the album counts across all artists", async () => {
+        const count = await subsonic.albumCount(credentials);
+        expect(count).toEqual(
+          [artist1, artist2, artist3, artist4].reduce(
+            (total, it) => total + it.albums.length,
+            0
+          )
+        );
+      });
     });
   });
 

@@ -199,6 +199,9 @@ export interface MusicLibrary {
   // Non-blocking peek: the index if already built, else undefined (browse falls back while
   // the multi-minute scan runs). Returns the already-resolved promise when warm.
   peekAlbumIndex(): Promise<AlbumIndex<AlbumSummary>> | undefined;
+  // Total album count, cheap from the cached artist list. Used to decide whether the catalog
+  // is large enough to need the bucketed A-Z index at all (small libraries serve the flat list).
+  albumCount(): Promise<number>;
   album(id: string): Promise<Album>;
   track(trackId: string): Promise<Track>;
   genres(): Promise<Genre[]>;

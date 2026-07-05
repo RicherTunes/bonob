@@ -115,6 +115,8 @@ export class InMemoryMusicService implements MusicService {
               .sort((x, y) => x.name.localeCompare(y.name)),
           ])
         ),
+      albumCount: () =>
+        Promise.resolve(this.artists.flatMap((a) => a.albums).length),
       album: (id: string) =>
         pipe(
           this.artists.flatMap((it) => it.albums).find((it) => it.id === id),

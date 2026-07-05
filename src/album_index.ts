@@ -24,6 +24,13 @@ export type AlbumIndex<T = { name: string }> = {
   items: T[];
 };
 
+// A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
+// and a catalog this small never builds the index at all; a larger catalog builds the snapshot and
+// is split into bounded per-letter buckets, because Sonos rejects a single browsable container
+// advertising a very large total (observed: ~23k ok, ~115k rejected).
+// TODO(config): expose as BNB_SONOS_MAX_CONTAINER_TOTAL.
+export const MAX_ALBUMS_FLAT = 20000;
+
 // Navidrome's default ND_IGNOREDARTICLES ("The El La Los Las Le Les Os As O A"): leading articles
 // stripped when sorting, so e.g. "The Doors" sorts under D and "O Bem" under B. We mirror it so
 // our buckets line up with the order Navidrome returns. A non-default list only shifts edge titles.

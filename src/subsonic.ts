@@ -927,6 +927,14 @@ export class Subsonic {
       this.fetchArtists(credentials)
     );
 
+  // Total album count, summed from the (cached) artist list - the same source getAlbumList2 uses
+  // for its total. Cheap once getArtists is warm (no extra network). Used to decide whether the
+  // catalog is large enough to need the bucketed A-Z index; small libraries skip it entirely.
+  albumCount = (credentials: Credentials): Promise<number> =>
+    this.getArtists(credentials).then((artists) =>
+      _.inject(artists, (total, artist) => total + artist.albumCount, 0)
+    );
+
   // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
   // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
   // self-contained SNAPSHOT: serving a letter never re-fetches by live offset, which would drift

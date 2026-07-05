@@ -31,7 +31,7 @@ import _ from "underscore";
 
 import logger from "./logger";
 import { assertSystem, BUrn } from "./burn";
-import { AlbumIndex } from "./album_index";
+import { AlbumIndex, MAX_ALBUMS_FLAT } from "./album_index";
 
 export class SubsonicMusicService implements MusicService {
   subsonic: Subsonic;
@@ -69,7 +69,14 @@ export class SubsonicMusicService implements MusicService {
     // background so the first browse isn't cold. Fire-and-forget; the cache coalesces +
     // refreshes lazily, and the album-index scan (multi-minute) runs off the browse path.
     this.subsonic.warmArtists(credentials);
-    this.subsonic.warmAlbumIndex(credentials);
+    // Only build the (heavy) album index for large catalogs; small libraries serve the flat
+    // Albums list live and never scan. Chain off the album count (cheap once artists warm).
+    this.subsonic
+      .albumCount(credentials)
+      .then((count) => {
+        if (count > MAX_ALBUMS_FLAT) this.subsonic.warmAlbumIndex(credentials);
+      })
+      .catch(() => undefined);
     return this.libraryFor(credentials);
   };
 
@@ -144,6 +151,9 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   albums = async (q: AlbumQuery): Promise<Result<AlbumSummary>> =>
     this.subsonic.getAlbumList2(this.credentials, q);
+
+  albumCount = (): Promise<number> =>
+    this.subsonic.albumCount(this.credentials);
 
   albumIndex = (): Promise<AlbumIndex<AlbumSummary>> =>
     this.subsonic.getAlbumIndex(this.credentials);
