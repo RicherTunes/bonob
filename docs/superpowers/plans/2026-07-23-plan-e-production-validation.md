@@ -1,219 +1,208 @@
-# Plan E — Production validation
+# Plan E — Production validation implementation plan
 
-**Plan:** E — Production validation
-**Program:** RicherTunes bonob private-fork convergence (spec `docs/superpowers/specs/2026-07-23-private-fork-convergence-design.md`, §7, §8)
-**Entry dependency (spec §1.1 row E):** Plans A–D complete **and** the intended Plan-D candidate passes its gates (per-slice exact-master artifacts + adversarial review + candidate sweep, no production promotion).
-**Exit evidence (spec §1.1 row E, criteria 18–21):** verified backup/restore evidence, read-only public gate, read-only physical Sonos S2 gate (incl. ≥2h playback soak), rollback rehearsed, and the initial digest completes 24 continuous hours of observation.
-**Scope guard (this plan, spec §7.2, §8):** this plan **defines and prepares** the exact, ordered, machine-checked gates for promotion. **It authorizes no live action in this document-writing turn.** Every live action (backup, restore rehearsal, container recreation, promotion, gates, rollback) is a separately approved, operator-executed step gated on explicit user approval and prior-step success. Automation stops on the first failed command and never silently substitutes a tag, cache, credential source, endpoint, or architecture (spec §9).
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
----
+**Goal:** Validate one proven Plan-D immutable candidate through rehearsed rollback, separately approved promotion, read-only public/physical acceptance, and a 24-hour observation window.
 
-## Invariants every step obeys
+**Architecture:** Repository work first creates a secret-free evidence schema and validators. A separate user authorization is a hard prerequisite to every operator/live task; after the verified backup and isolated restore rehearsal, a second explicit user approval authorizes only container recreation. Post-promotion checks are read-only and any blocker follows the pre-recorded rollback path.
 
-- **Separate evidence layers (spec §7.2):** promotion requires all three — (1) synthetic candidate gate, (2) read-only public production gate *after* promotion, (3) physical Sonos S2 gate. No sidecar result is described as S2 end-to-end success.
-- **Maintenance window (spec §8):** Bonob's in-memory API-token map invalidates `bat` values and link codes on process restart; SMAPI tokens and secret-signed artwork survive restart until expiry while the same `BNB_SECRET` is retained. Initial promotions stop playback and re-browse/requeue. Promotion changes **only** the Bonob image reference; it does **not** rotate `BNB_SECRET`, change proxy policy, migrate Navidrome, or mutate the production cache in the same step (spec §8).
-- **Exact digest (spec §4, §8):** the promoted reference is the tested immutable digest `ghcr.io/richertunes/bonob@sha256:<manifest-digest>` with tag `sha-<40 hex>`. The VPS verifies the OCI revision label equals the intended commit and refuses on a digest/revision mismatch.
-- **Rollback is rehearsed before promotion (spec §8, criterion 18).** On any failed gate, the prior digest + secret-compatible compose + hashed prior cache snapshot are restored.
-- **Read-only public/physical gates (spec §7.2.2–7.2.3, criterion 20):** strictly read-only; no mutation of production accounts/playlists/favourites/database/cache/media.
-- **Decision table is sole policy (spec §9):** 1–4 same integration/outcome in 60s → attribute/investigate, retry only an idempotent read under policy; ≥5 in 60s → release blocker; any secret/data-integrity/crash/unhealthy/restart → nonwaivable blocker.
+**Tech Stack:** TypeScript/Jest evidence validators, Docker Compose and OCI/Docker inspection executed only by the approved operator, Plan-C candidate harness and diagnostics, Sonos S2 physical acceptance matrix.
 
----
+## Global Constraints
 
-## Slice E.0 — Pre-flight: approval, candidate digest, and evidence manifest (no live action)
-
-Goal: bind the exact candidate digest and assemble the approval + evidence manifest *before* any production touch. This step produces documents/checks only.
-
-- [ ] **E.0.1 — Record the exact candidate digest and exit evidence from Plans A–D.**
-  - [ ] Create `docs/superpowers/evidence/2026-07-23-plan-e-candidate-manifest.md` recording: the exact Plan-D candidate full SHA, the `sha-<40 hex>` tag, the `sha256:<digest>`, the Plan-B build/audit/scan run/artifact IDs, the candidate sweep + adversarial-review references, and confirmation that Plans A–D exit criteria are met.
-  - Gate (proves the manifest is non-empty and carries the required identity fields):
-    ```bash
-    grep -E 'sha-[0-9a-f]{40}|sha256:' docs/superpowers/evidence/2026-07-23-plan-e-candidate-manifest.md
-    ```
-    Expected: both the tag and digest are present (exit `0`).
-  - Atomic commit: `git commit -m "docs(plan-e): record exact Plan-D candidate digest and exit evidence"`.
-
-- [ ] **E.0.2 — Obtain explicit, separately-announced user approval for the risky deployment gate.**
-  - Per spec §8: "Production container recreation is a separately announced risky deployment gate. It requires explicit user approval after the exact candidate digest, evidence summary, maintenance impact, verified VPS backup, and rollback command have been presented. Approval of this design does not authorize a future container recreation."
-  - [ ] Present to the user: exact candidate digest (E.0.1), evidence summary, maintenance impact (playback stops; users re-browse/requeue), the verified backup plan (E.1), and the exact rollback command sequence (E.4). Record the approval reference in the manifest.
-  - **No subsequent live step (E.1+) executes until this approval is recorded.** This is a hard gate.
-  - Atomic commit: `git commit -m "docs(plan-e): record explicit user approval for promotion gate"`.
+- “Production container recreation is a separately announced risky deployment gate. It requires explicit user approval after the exact candidate digest, evidence summary, maintenance impact, verified VPS backup, and rollback command have been presented. Approval of this design does not authorize a future container recreation” (spec §8).
+- “Promotion changes only the Bonob image reference to the tested digest” and does not rotate `BNB_SECRET`, change proxy policy, migrate Navidrome, or mutate the production cache (spec §8).
+- “A dry run is insufficient, and the rehearsal must pass” (spec §8).
+- Public and physical production gates are strictly read-only (spec §7.2).
+- A failed post-promotion gate restores the previous digest, secret-compatible compose, and hashed cache snapshot unless recorded equality proves every required cache property is identical (spec §8).
+- The §9 decision table is the sole auth/429/5xx release policy; a five-in-60-second same integration/outcome burst is a blocker (spec §9).
+- The initial digest requires 24 continuous hours with no §9 blocker; Plan F requires seven continuous days on the same digest, three distinct physical sessions, zero rollback, zero blocker, and zero unattributed production error (criteria 21 and 23).
 
 ---
 
-## Slice E.1 — Verified backup (operator-executed, root-only)
+**Non-negotiable authorization rule:** This plan does not grant approval. Before E.1, the operator must receive and record a separate user authorization for backup/rehearsal only. Before E.3, the operator must receive and record the separate §8 user approval for container recreation. Do not treat a plan checkbox, a prior design approval, or an agent message as either authorization. This document never runs a live command itself.
 
-Spec §8 (before any production container recreation) + criterion 18. Capture and verify every restorable artifact with hashes; no secret values are printed.
+**Persisted evidence contract:** all public records contain only hashes, identifiers, commands with paths replaced by operator-inventory keys, and pass/fail outcomes; raw inventories, credentials, host identifiers, and restore media remain root-readable outside Git.
 
-- [ ] **E.1.1 — Retain the current image and configuration with hashes.**
-  - [ ] Retain a checksummed image archive **or** a proven immutable pullable digest for the exact current image; record its hash.
-  - [ ] Save the effective compose configuration and the actual nginx file, with hashes.
-  - [ ] Save the proxy target, container inspection, Docker networks, resource limits, security settings, and health configuration.
-  - Gate (each artifact present + hashed, no value printed):
-    ```bash
-    # operator inventory (root-readable); the public record stores only hashes/outcome
-    ```
-    Expected: every required artifact has a recorded hash and a pass outcome in the evidence manifest.
-  - Atomic commit (hashes/outcome only): `git commit -m "docs(plan-e): retain current image/compose/proxy/security state with hashes"`.
+```ts
+type PlanEEvidence = {
+  candidate: { sourceSha: string; digest: string; tag: string; revision: string };
+  authorization: { backupRehearsalRef?: string; recreationRef?: string };
+  backup: Record<string, { sha256: string; present: boolean }>;
+  rehearsal: { commandRecordHash: string; checkpoints: Record<string, boolean> };
+  promotion?: { beforeDigest: string; afterDigest: string; changedFields: ["bonob.image"] };
+  gates: { publicReadOnly?: boolean; physicalReadOnly?: boolean; observation24h?: boolean };
+  rollback?: { performed: boolean; cacheEqualityProofHash?: string; restoredSnapshotHash?: string };
+};
+```
 
-- [ ] **E.1.2 — Back up secret-compatible environment/credentials (no values printed) and record fingerprints.**
-  - [ ] Back up the secret-compatible environment/credential files without printing values; record root-only fingerprints so rollback reuses the same `BNB_SECRET` (spec §8).
-  - Gate: the evidence manifest records a fingerprint + "no value printed" outcome; a secret in any output stops work and triggers rotation (spec §8).
-  - Atomic commit: `git commit -m "docs(plan-e): record secret-compatible credential fingerprints (no values)"`.
+`digest` must satisfy `^sha256:[0-9a-f]{64}$`, `tag` must satisfy `^sha-[0-9a-f]{40}$`, and `revision` must equal `sourceSha`. A missing/invalid field is a hard failure.
 
-- [ ] **E.1.3 — Capture cache snapshot + run + verify the VPS backup.**
-  - [ ] Capture cache envelope/schema, semantic-validation result, file count/bytes, ownership/mode, per-file/tree hashes, and a writer-quiesced snapshot.
-  - [ ] Run and verify the VPS backup; record the successful backup/snapshot identifier.
-  - [ ] Validate the backup *contains* the saved proxy configuration, container inspection, Docker network/resource/security/health settings, checksummed image archive or immutable digest, compose configuration, secret-compatible environment/credentials, and hashed cache snapshot (spec §8/criterion 18).
-  - Gate (validation checklist all pass):
-    ```bash
-    # evidence manifest records pass for: proxy, container, networks, resources, security,
-    # health, image, compose, env/creds, cache snapshot
-    ```
-    Expected: all entries pass. A missing entry fails E.1.
-  - Atomic commit: `git commit -m "docs(plan-e): verified VPS backup with cache snapshot (criterion 18)"`.
+### Task E.0: Prepare and validate the non-live release record
 
----
+**Files:**
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `tests/plan_e_evidence.test.ts`
+- Modify: `docs/superpowers/plans/2026-07-23-plan-e-production-validation.md`
 
-## Slice E.2 — Mandatory isolated restore rehearsal (must pass; dry run insufficient)
+**Interfaces:**
+- Consumes Plan-D `closeout.json` and its exact candidate digest.
+- Produces a `PlanEEvidence` record with no `promotion` field and no claimed authorization.
 
-Spec §8 + criterion 18: perform a mandatory isolated restore rehearsal using a recorded exact command sequence. A dry run is insufficient, and the rehearsal **must pass**.
+- [ ] **Step 1: Write the failing evidence validator.**
 
-- [ ] **E.2.1 — Define the exact restore-rehearsal command sequence (recorded, replayable).**
-  - [ ] Write `docs/superpowers/evidence/2026-07-23-plan-e-restore-rehearsal.md` with the exact ordered commands that: restore **disposable copies** of the saved proxy/compose/environment/cache state; load the exact checksummed image archive or pull and verify the immutable digest; run the proxy configuration test; start the previous image in a **non-production project/loopback binding**; then verify secret compatibility, health, `/`, `/about`, authentication, SMAPI, artwork, byte-range headers/body, stream playback, cache semantic/hash integrity, and a clean stop.
-  - Gate (sequence is complete and ordered):
-    ```bash
-    grep -cE 'restore|load|verify|start|stop' docs/superpowers/evidence/2026-07-23-plan-e-restore-rehearsal.md
-    ```
-    Expected: each required verb present (exit `0`).
-  - Atomic commit: `git commit -m "docs(plan-e): record exact isolated restore-rehearsal command sequence"`.
+```ts
+import { readFileSync } from "fs";
+const record = JSON.parse(readFileSync("docs/superpowers/evidence/2026-07-23-plan-e-record.json", "utf8"));
+test("Plan E record starts unapproved and validates candidate identity", () => {
+  expect(record.authorization.backupRehearsalRef).toBeUndefined();
+  expect(record.authorization.recreationRef).toBeUndefined();
+  expect(record.promotion).toBeUndefined();
+  expect(record.candidate.digest).toMatch(/^sha256:[0-9a-f]{64}$/);
+  expect(record.candidate.tag).toMatch(/^sha-[0-9a-f]{40}$/);
+  expect(record.candidate.revision).toBe(record.candidate.sourceSha);
+});
+```
 
-- [ ] **E.2.2 — Execute the rehearsal against disposable copies; it must pass.**
-  - [ ] Operator executes E.2.1 against **disposable** restored copies in a non-production project/loopback binding. No production state is touched.
-  - [ ] Verify every checkpoint: secret compatibility, health, `/`, `/about`, authentication, SMAPI, artwork, byte-range headers/body, stream playback, cache semantic/hash integrity, clean stop.
-  - Gate (per spec §8): every checkpoint passes; a single failure stops promotion and the finding is fixed/re-run.
-    ```bash
-    # evidence manifest records pass for: secret-compat, health, /, /about, auth, SMAPI,
-    # artwork, byte-range, stream playback, cache integrity, clean stop
-    ```
-    Expected: all pass.
-  - Atomic commit (hashes/outcome only): `git commit -m "docs(plan-e): isolated restore rehearsal passed (criterion 18)"`.
+- [ ] **Step 2: Run the red test.** Run `npx jest tests/plan_e_evidence.test.ts --runInBand`. Expected: FAIL because the record is absent.
 
-- [ ] **E.2.3 — Confirm previous public health and current physical Sonos baseline.**
-  - [ ] Record the previous public health (`/`, `/about`, TLS) and the current physical Sonos browse/play baseline as the pre-promotion reference for rollback comparison.
-  - Atomic commit: `git commit -m "docs(plan-e): record pre-promotion public + physical baseline"`.
+- [ ] **Step 3: Add the minimal record from Plan D.** Copy the actual `sourceSha`, immutable digest, SHA tag, and OCI revision from Plan-D closeout evidence; initialize empty `backup`, `rehearsal.checkpoints`, and `gates`. Do not add approval references or execute an operator command.
 
----
+- [ ] **Step 4: Run green validation and commit.** Run `npx jest tests/plan_e_evidence.test.ts --runInBand && npm run build`. Expected: PASS and exit `0`. Commit with `git add docs/superpowers/evidence/2026-07-23-plan-e-record.json tests/plan_e_evidence.test.ts docs/superpowers/plans/2026-07-23-plan-e-production-validation.md && git commit -m "docs(plan-e): prepare unapproved production-validation record"`.
 
-## Slice E.3 — Promotion (single image-reference change only; maintenance window)
+### Task E.0.2: Separate user authorization for backup and restore rehearsal
 
-Spec §8: "Promotion changes only the Bonob image reference to the tested digest unless a separately reviewed configuration change is essential. It does not rotate `BNB_SECRET`, change proxy policy, migrate Navidrome, or mutate the production cache in the same step. After graceful stop and recreation, the public and physical gates run immediately."
+**Files:**
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-authorization.md`
 
-- [ ] **E.3.1 — Define and gate the exact single-change promotion command.**
-  - [ ] In the evidence manifest, record the exact command that updates **only** the Bonob image reference to `ghcr.io/richertunes/bonob@sha256:<digest>` (tag `sha-<40 hex>`), with the VPS verifying the OCI revision label equals the intended commit and refusing on mismatch.
-  - [ ] Assert the command makes **no** other change (no secret rotation, no proxy policy change, no Navidrome change, no cache mutation).
-  - Gate (command is single-purpose; pre-flight equals current digest, target equals candidate digest):
-    ```bash
-    # pre-flight: current image digest != candidate; after: current == candidate; nothing else changes
-    ```
-    Expected: only the image reference differs before/after.
-  - Atomic commit: `git commit -m "docs(plan-e): record single-image-reference promotion command"`.
+**Interfaces:**
+- Consumes the validated E.0 candidate identity.
+- Produces `authorization.backupRehearsalRef`, which authorizes only E.1–E.2 and explicitly does not authorize promotion.
 
-- [ ] **E.3.2 — Execute graceful stop + recreation within the announced maintenance window.**
-  - [ ] Stop playback (maintenance window), graceful-stop Bonob (Plan-C graceful shutdown must quiesce cache + drain registries within the Docker grace period), recreate with the candidate digest, then run public + physical gates **immediately** (spec §8).
-  - Gate: graceful shutdown completes within the compose stop grace period; recreation uses the verified digest.
-  - Atomic commit (outcome only): `git commit -m "docs(plan-e): promoted candidate digest via single-reference change"`.
+- [ ] **Step 1: Present the non-live request.** Present the exact candidate digest, proposed backup/rehearsal scope, maintenance impact statement, and the fact that no container recreation is authorized. Do not run backup, copy, pull, restore, or VPS command before the user responds.
 
----
+- [ ] **Step 2: Stop at the gate.** If a separate user response is not recorded, leave `backupRehearsalRef` absent and stop. Expected state: E.1–E.7 are blocked.
 
-## Slice E.4 — Read-only public production gate (after promotion)
+- [ ] **Step 3: Record only an explicit authorization.** On an explicit user response, record its reference and permitted scope in `2026-07-23-plan-e-authorization.md`, set `backupRehearsalRef`, and retain `recreationRef` as absent.
 
-Spec §7.2.2 + criterion 21. Strictly read-only; no mutation of production state.
+- [ ] **Step 4: Validate and commit.** Run `npx jest tests/plan_e_evidence.test.ts --runInBand`. Expected: PASS after adding a test that permits backup authorization but requires `recreationRef` to be undefined. Commit `docs(plan-e): record separate backup and rehearsal authorization`.
 
-- [ ] **E.4.1 — Run the read-only public gate.**
-  - [ ] Execute: CA/TLS validation; proxy configuration test; `/` and `/about`; OAuth/login/SMAPI routes; a **strictly read-only** public sweep; rate-limit/intrusion-control sanity; upstream attribution; restart recovery.
-  - [ ] Evaluate all auth/429/5xx outcomes **only** by the §9 decision table: 1–4 in 60s → attribute/investigate + recorded disposition; ≥5 burst → release blocker (roll back per E.6); any secret/data-integrity/crash/unhealthy/restart → nonwaivable blocker.
-  - Gate (read-only sweep passes; §9 evaluation recorded):
-    ```bash
-    # read-only sweep: status classes, section counts, timings; zero mutation
-    ```
-    Expected: pass; or a §9 blocker triggers E.6 rollback.
-  - Atomic commit: `git commit -m "docs(plan-e): read-only public production gate evidence"`.
+### Task E.1: Operator backup with reproducible, secret-safe evidence
 
----
+**Files:**
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-backup.md`
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `tests/plan_e_backup_evidence.test.ts`
 
-## Slice E.5 — Physical Sonos S2 gate (read-only; operator on the LAN)
+**Interfaces:**
+- Consumes an E.0.2 authorization reference and the operator inventory keys `CURRENT_IMAGE`, `COMPOSE`, `PROXY`, `CREDENTIALS`, and `CACHE`.
+- Produces hashed evidence for image, compose, proxy, inspection, networks, resource/security/health settings, secret-compatible credential fingerprint, and writer-quiesced cache snapshot.
 
-Spec §7.2.3 + §7.2 retention (criteria 20, 21). Read-only; no mutation.
+- [ ] **Step 1: Write the failing completeness test.** Assert that `record.backup` contains non-empty SHA-256 hashes and `present: true` for `image`, `compose`, `proxy`, `inspection`, `networks`, `resourcesSecurityHealth`, `credentialsFingerprint`, `cacheSnapshot`, and `backupVerification`. Run `npx jest tests/plan_e_backup_evidence.test.ts --runInBand`. Expected: FAIL because E.0 has no backup fields.
 
-- [ ] **E.5.1 — Run the read-only physical matrix.**
-  - [ ] On the actual LAN speakers/controller, exercise: browse root + large album buckets, artists + bios, search, artwork, start playback, seek, stop, replay, read-only favourites/playlists, queued-media behavior, post-restart cache persistence.
-  - [ ] Record the retained matrix: candidate digest, Navidrome version, speaker model + firmware, controller hardware/OS/app version, version/hash + codec/bit-depth/sample-rate of each media fixture; per case: exact steps, expected vs actual, start/end time, latency, redacted evidence/log hashes.
-  - Gate (spec §7.2 retention): zero unexpected stop or rebuffer/audio dropout ≥1s outside intentional pause/seek; start and seek produce audio within 10s.
-  - Atomic commit: `git commit -m "docs(plan-e): physical Sonos S2 read-only matrix evidence"`.
+- [ ] **Step 2: Record exact operator commands without secret values.** In the root-only operator record, declare validated variables first: `candidateDigest` matches the digest regex; `priorDigest` is nonempty and differs from it; each inventory path is an existing root-owned regular file or directory. Hash saved copies with `sha256sum`; record only hashes/inventory keys in the public Markdown and JSON. Never print credential contents.
 
-- [ ] **E.5.2 — Run the ≥2h physical playback soak + defined sessions.**
-  - [ ] At least two continuous hours of physical playback soak, no mutation.
-  - [ ] At least three distinct physical sessions, separated by ≥30 min, including at least one after a controlled Bonob restart (spec §7.2 retention, criterion 20).
-  - Gate: soak + sessions pass the §9 thresholds; any blocker triggers E.6.
-  - Atomic commit: `git commit -m "docs(plan-e): physical playback soak + session matrix evidence"`.
+- [ ] **Step 3: Run the authorized backup and verify containment.** Only after E.0.2 authorization, retain the current image archive or immutable digest, effective compose/proxy/configuration, inspection/network/resource/security/health data, credential fingerprint, writer-quiesced cache snapshot, and a verified VPS backup. Verify the backup contains every listed artifact before setting every `present` value true.
 
----
+- [ ] **Step 4: Run green validation and commit.** Run `npx jest tests/plan_e_backup_evidence.test.ts --runInBand && npx jest tests/plan_e_evidence.test.ts --runInBand`. Expected: PASS. Commit secret-free evidence with `git commit -m "docs(plan-e): record verified rollback backup evidence"`.
 
-## Slice E.6 — Rollback (on any failed gate)
+### Task E.2: Mandatory isolated restore rehearsal
 
-Spec §8 (rollback) + criterion 21: "Failed gates restore exact prior state under criterion 18 before public/physical health is re-established."
+**Files:**
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-restore-rehearsal.md`
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `tests/plan_e_rehearsal_evidence.test.ts`
 
-- [ ] **E.6.1 — Execute the exact rollback command sequence on any failed post-promotion gate.**
-  - [ ] On a failed gate, unexpected 401/429/5xx increase, cache incompatibility, stream regression, or Sonos failure: (1) stop new test traffic; (2) restore the previous digest + secret-compatible compose; (3) restore the hashed prior cache snapshot — **required** unless a recorded pre-rollback equality proof shows every current file/tree hash, envelope/schema result, ownership, and mode exactly equals the saved prior snapshot (any mismatch/missing/unreadable/validation failure forces restoration); (4) recreate Bonob and verify `/`, `/about`, SMAPI, cache load, physical browse/play; (5) preserve redacted candidate logs + failed release manifest.
-  - [ ] Rollback does **not** alter Navidrome, nginx, DNS, Sonos Developer Portal registration, or the music library unless evidence identifies one as the actual fault. A secret in any output stops testing, quarantines the output, and rotates the credential (spec §8).
-  - Gate (exact prior state restored per criterion 18):
-    ```bash
-    # post-rollback: image == prior digest; cache tree hashes == saved prior; /, /about, SMAPI ok
-    ```
-    Expected: prior state re-established.
-  - Atomic commit (outcome only): `git commit -m "docs(plan-e): executed rollback to exact prior state (criterion 18)"`.
+**Interfaces:**
+- Consumes E.1 snapshot hashes and the prior image identity.
+- Produces true checkpoints for `proxyConfig`, `health`, `root`, `about`, `authentication`, `smapi`, `artwork`, `byteRange`, `streamPlayback`, `cacheIntegrity`, and `cleanStop`, executed on disposable copies and a loopback-only non-production Compose project.
 
----
+- [ ] **Step 1: Write the failing checkpoint test.** Assert all eleven named checkpoints equal `true` and `record.promotion` is absent. Run `npx jest tests/plan_e_rehearsal_evidence.test.ts --runInBand`. Expected: FAIL because the rehearsal has not run.
 
-## Slice E.7 — Initial 24-hour observation window
+- [ ] **Step 2: Persist a complete, replayable sequence.** The root-only record must validate disposable target paths before copying, restore only copies of saved proxy/compose/environment/cache state, load the checksummed prior archive or verify the prior immutable digest, bind the rehearsal project to loopback, test proxy syntax, start the prior image, execute all eleven checks, and stop it cleanly. Hash the command record into `rehearsal.commandRecordHash`; public evidence exposes only the hash and checkpoint outcomes.
 
-Spec §7.2 + criterion 21: the initial promoted digest remains under observation ≥24 continuous hours and ≥3 distinct physical Sonos sessions.
+- [ ] **Step 3: Execute only under E.0.2 authorization.** A dry run is a failure. Run the sequence on disposable copies; any failed checkpoint blocks E.3 and requires a fresh successful rehearsal after correction.
 
-- [ ] **E.7.1 — Observe 24 continuous hours against §9.**
-  - [ ] Monitor for: no container restart or unhealthy event; no new unexplained authentication/429/5xx burst; no release-blocking regression.
-  - [ ] Evaluate every auth/429/5xx signal by the §9 table; lower-severity issues require a recorded user+architect disposition before the window can pass (criterion 21).
-  - Gate (24h passes; any §9 blocker triggers E.6 then a fresh run):
-    ```bash
-    # observation: uptime == continuous 24h; §9 evaluation recorded; dispositions recorded
-    ```
-    Expected: pass; or blocker → E.6.
-  - Atomic commit: `git commit -m "docs(plan-e): initial digest completed 24h observation (criterion 21)"`.
+- [ ] **Step 4: Verify and commit.** Run `npx jest tests/plan_e_rehearsal_evidence.test.ts --runInBand && npx jest tests/plan_e_backup_evidence.test.ts --runInBand`. Expected: PASS. Commit `docs(plan-e): record passed isolated restore rehearsal`.
 
-- [ ] **E.7.2 — Hand off to Plan F field-stability threshold.**
-  - [ ] Record that the same digest must next complete seven continuous days, ≥3 physical sessions, zero rollback, zero blocker, zero unattributed production error before Plan F may begin (spec §5.4, criterion 23). Plan F is blocked until that threshold is met.
-  - Atomic commit: `git commit -m "docs(plan-e): hand off to Plan F seven-day field-stability threshold"`.
+### Task E.2.4: Separate §8 approval for container recreation
 
----
+**Files:**
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-authorization.md`
 
-## Plan E exit checklist (spec §1.1 row E, criteria 18–21)
+**Interfaces:**
+- Consumes passed E.1/E.2 evidence, candidate digest, maintenance impact, and root-only rollback command-record hash.
+- Produces `authorization.recreationRef`; no other field grants promotion authority.
 
-- [ ] Verified backup proves exact proxy/container/network/resource/security/health/compose/secret/cache/image state (criterion 18).
-- [ ] Isolated restore rehearsal executed (not dry-run) and passed: auth/SMAPI/art/range/stream/cache restore verified (criterion 18).
-- [ ] Explicit, separately-announced user approval recorded for container recreation (criterion 19).
-- [ ] Promotion changed only the Bonob image reference to the tested digest; no secret/proxy/Navidrome/cache change in the same step.
-- [ ] Read-only public gate passed; §9 evaluation recorded (criterion 21).
-- [ ] Read-only physical Sonos gate passed: full matrix + ≥2h soak + 3 sessions incl. one after restart (criterion 20).
-- [ ] Rollback rehearsed and available; on any failed gate, exact prior state restored per criterion 18.
-- [ ] Initial digest completed 24 continuous hours with no §9 blocker; lower-severity dispositions recorded (criterion 21).
-- [ ] Seven-day field-stability threshold recorded as the entry gate for Plan F (criterion 23).
+- [ ] **Step 1: Present required approval material.** Present the exact candidate digest, Plan-D evidence summary, playback/re-browse maintenance impact, verified backup outcome, passed restore-rehearsal outcome, and rollback command-record hash.
 
-## Adversarial-review focus for Plan E (report to Codex)
+- [ ] **Step 2: Stop unless the user separately approves recreation.** Without a new explicit user response, retain no `recreationRef`; E.3–E.7 are blocked. Approval for E.0.2 does not satisfy this task.
 
-- Any step that performs a live action **before** E.0.2 explicit approval (hard stop).
-- Any promotion that changes more than the image reference (secret/proxy/Navidrome/cache) — a §8 violation.
-- Any restore-rehearsal accepted as a dry run rather than a real pass (criterion 18).
-- Any rollback that skips cache restoration without a recorded exact pre-rollback equality proof (criterion 18).
-- Any public/physical gate that mutates production state (spec §7.2.2–7.2.3, criterion 20).
-- Any auth/429/5xx signal evaluated outside the single §9 decision table (spec §9).
-- Any 24h-window pass recorded despite a §9 blocker without rollback+fresh-run (criterion 21).
-- Reuse of a candidate digest/artifact across a changed code SHA (criterion 8) — should already be impossible post-Plan-D but re-checked at E.0.1.
+- [ ] **Step 3: Record explicit approval and validate.** Record the response reference, timestamp, and scope “recreate Bonob with the named digest only.” Extend `tests/plan_e_evidence.test.ts` to require all backup/rehearsal validators pass before a recreation reference is accepted. Run `npx jest tests/plan_e_evidence.test.ts tests/plan_e_backup_evidence.test.ts tests/plan_e_rehearsal_evidence.test.ts --runInBand`. Expected: PASS.
+
+- [ ] **Step 4: Commit.** Run `git add docs/superpowers/evidence/2026-07-23-plan-e-* tests/plan_e_* && git commit -m "docs(plan-e): record separate approved container recreation gate"`.
+
+### Task E.3: Single-reference promotion and read-only public gate
+
+**Files:**
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-public-gate.md`
+- Create: `tests/plan_e_promotion_evidence.test.ts`
+
+**Interfaces:**
+- Consumes `candidate.digest`, matching OCI revision, `authorization.recreationRef`, and the pre-promotion snapshot.
+- Produces `promotion.changedFields` exactly equal to `["bonob.image"]` and `gates.publicReadOnly: true` only after the post-promotion checks pass.
+
+- [ ] **Step 1: Write the failing promotion evidence test.** Assert a recreation reference exists, `beforeDigest !== afterDigest`, `afterDigest === candidate.digest`, changed fields equal exactly `["bonob.image"]`, and public gate evidence declares no mutations. Run `npx jest tests/plan_e_promotion_evidence.test.ts --runInBand`. Expected: FAIL before promotion evidence exists.
+
+- [ ] **Step 2: Validate variables before the approved action.** In the root-only command record, reject a candidate digest that fails its regex; inspect the image label and reject if OCI revision differs from `candidate.sourceSha`; compare effective configuration before/after and reject any changed field other than Bonob image. Do not substitute a tag for the digest.
+
+- [ ] **Step 3: Execute the separately approved recreation.** During the announced maintenance window, graceful-stop Bonob within the Plan-C drain limit, recreate only with the validated digest, and stop on any command failure. Then run only CA/TLS, proxy, `/`, `/about`, OAuth/login/SMAPI routes, read-only sweep, rate-limit/intrusion sanity, attribution, and restart recovery checks. Record §9 decisions; do not mutate playlists, favourites, cache, media, or accounts.
+
+- [ ] **Step 4: Verify and commit.** Run `npx jest tests/plan_e_promotion_evidence.test.ts --runInBand`. Expected: PASS only if the single-reference and read-only conditions hold. On any §9 blocker, do not mark the test green; execute E.5. Commit `docs(plan-e): record single-reference promotion and read-only public gate`.
+
+### Task E.4: Read-only physical S2 acceptance and observation
+
+**Files:**
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-physical-matrix.json`
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `tests/plan_e_physical_evidence.test.ts`
+
+**Interfaces:**
+- Consumes the promoted digest and public-gate success.
+- Produces three sessions separated by at least 30 minutes (one after a controlled restart), a two-hour read-only playback soak, fixture/controller/speaker version matrix, and `gates.physicalReadOnly: true`.
+
+- [ ] **Step 1: Write the failing physical-evidence test.** Require every case to contain steps, expected/actual result, start/end time, latency, redacted evidence hash, digest, Navidrome version, speaker firmware, controller version, and media fixture version/hash/codec/bit-depth/sample-rate. Require three sessions, one `afterRestart`, duration at least 7,200 seconds, no dropout at least one second outside pause/seek, and start/seek at most ten seconds. Run `npx jest tests/plan_e_physical_evidence.test.ts --runInBand`. Expected: FAIL before the matrix exists.
+
+- [ ] **Step 2: Execute the operator matrix read-only.** Browse root/large buckets/artists/bios/search/artwork, start/seek/stop/replay, read-only favourites/playlists, queued-media behavior, and post-restart cache persistence; run the two-hour soak. Do not create, delete, add, remove, modify, or repair production state.
+
+- [ ] **Step 3: Observe for 24 continuous hours.** Machine-evaluate all signals using only §9. A container restart/unhealthy event, unexplained auth/429/5xx burst, or release-blocking regression fails the window and invokes E.5; lower-severity issues require recorded user+architect disposition before pass.
+
+- [ ] **Step 4: Verify and commit.** Run `npx jest tests/plan_e_physical_evidence.test.ts --runInBand && npx jest tests/plan_e_* --runInBand`. Expected: PASS only after the 24-hour window has `gates.observation24h: true`. Commit `docs(plan-e): record physical S2 acceptance and 24-hour observation`.
+
+### Task E.5: Mandatory rollback on any post-promotion failure
+
+**Files:**
+- Modify: `docs/superpowers/evidence/2026-07-23-plan-e-record.json`
+- Create: `docs/superpowers/evidence/2026-07-23-plan-e-rollback.md`
+- Create: `tests/plan_e_rollback_evidence.test.ts`
+
+**Interfaces:**
+- Consumes the E.1 prior digest, compose, secret-compatible environment fingerprint, and cache snapshot.
+- Produces either `rollback.performed: true` with restored snapshot hash, or a cache-equality proof hash showing file/tree hashes, envelope/schema validation, ownership, and mode all exactly equal before skipping the copy.
+
+- [ ] **Step 1: Write the failing rollback validator.** Assert a failed-gate record has `performed === true`, the prior digest is restored, and contains either `restoredSnapshotHash` or `cacheEqualityProofHash`; reject a record that supplies both neither. Run `npx jest tests/plan_e_rollback_evidence.test.ts --runInBand`. Expected: FAIL because no rollback evidence exists.
+
+- [ ] **Step 2: On a blocker, execute only the recorded rollback sequence.** Stop new test traffic; restore prior digest and secret-compatible compose; restore the cache snapshot unless every equality property is proven; recreate; verify `/`, `/about`, SMAPI, cache load, and physical browse/play; preserve redacted logs/manifests. Do not alter Navidrome, proxy, DNS, Developer Portal registration, or music library without evidence.
+
+- [ ] **Step 3: Verify and commit.** Run `npx jest tests/plan_e_rollback_evidence.test.ts --runInBand`. Expected: PASS only after exact prior state is recorded. Commit `docs(plan-e): record exact rollback after failed production gate`.
+
+## Exit checks
+
+- [ ] Plan A–D candidate evidence is exact-SHA/digest bound; no code-SHA evidence is reused.
+- [ ] No live activity occurred before E.0.2 separate authorization; no recreation occurred before E.2.4 separate §8 approval.
+- [ ] Verified backup and actual isolated restore rehearsal passed.
+- [ ] Promotion changed exactly one image reference, every public/physical activity was read-only, and rollback is executable/proven.
+- [ ] Physical matrix, two-hour soak, and 24-hour observation pass §9; Plan F remains blocked pending its seven-day same-digest threshold.

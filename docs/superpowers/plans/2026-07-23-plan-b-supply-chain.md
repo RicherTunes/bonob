@@ -6,7 +6,20 @@
 
 **Architecture:** Two jobs form a hard supply boundary (spec §4). Job 1 (build/test/scan) has read-only repository permissions, no registry/production secret, no `packages:write`; it consumes a version-controlled closed context generated from the validated `master` SHA, pre-scans it locally for secrets/prohibited paths, builds exactly once into an OCI archive, and emits checksummed OCI/SBOM/attestations as immutable workflow artifacts under pinned IDs. Job 2 (publisher) receives `packages:write` only after protected-environment approval and artifact-read; it downloads the pinned artifacts, verifies every archive/SBOM/attestation/hash, and pushes the already-built bytes — performing no checkout, no source code execution, no build, no cache restore. The image is private amd64 only; the tag matches `^sha-[0-9a-f]{40}$`; an unauthenticated pull must fail and an authorized VPS pull must succeed (verification only, not deployment).
 
-**Tech Stack:** GitHub Actions (protected `ghcr-publication` environment, pinned actions by SHA), Docker Buildx (`--output type=oci` archive), `npm audit`/`npm ci` lockfile-deterministic install, Trivy/Grype image scan, `cosign`/SBOM attestations, GHCR private package, Node 22 / TypeScript.
+**Tech Stack:** GitHub Actions (protected `ghcr-publication` environment, immutable full-SHA action references), Docker Buildx (`--output type=oci` archive), `npm audit`/`npm ci` lockfile-deterministic install, Trivy/Grype image scan, `cosign`/SBOM attestations, GHCR private package, Node 22 / TypeScript.
+
+## Global Constraints
+
+- **Plan-A prerequisite (design §1.1, row B):** Plan A complete and approved is required before Plan B begins; it supplies the exact-master candidate and leaves no writer enabled.
+- **Closed context (design §12.5):** The deterministic allowlist covers every Dockerfile `COPY` and runtime output, replaces Git metadata with a minimal validated revision file, and emits sorted listing/archive hashes. Local secret/prohibited-path scanning passes before any remote access; no `.git`, credential, operator, or unlisted file is present.
+- **Build evidence (design §12.6):** The no-secret read-only build/test/scan job creates the exact checksummed OCI/SBOM/attestations under pinned artifact IDs. Audit/scan policy, exact-identity exception allowlist, tool/database identities, timestamps, report hashes, source SHA, and artifact digest pass.
+- **Publisher boundary (design §12.7):** Only after approval does a distinct publisher receive artifact-read plus narrowly scoped `packages:write`. It verifies pinned artifacts and executes no checkout, repository code, scripts/install/build/cache—only pinned verify/push tooling. Every other writer is removed; `master` equality at dispatch/pre-push/completion, destination-tag locking, rerun adoption, privacy/pull, digest/revision, and quarantine tests pass.
+- **No deployment (design §1.1, row B; §11):** Plan B verifies a pull only; it never recreates a production container or promotes to production.
+- **Independent review (design §12.25):** An independent adversarial/architectural re-review approves the final branch and fresh evidence set.
+
+## Required Task Cadence
+
+Every numbered task below is executed as a 2–5 minute action: first run its stated red command and record the expected non-zero exit, then make exactly the stated change, run the stated green command and require exit `0`, run the Plan-A redaction gate, and create the task's stated atomic commit. For an out-of-band or git-only gate, the red command is its rejected-precondition command and the green evidence is recorded in the adjacent evidence-file commit; never create an empty commit merely to satisfy this cadence.
 
 ---
 
@@ -23,7 +36,7 @@
 - Plan A delivers the integrated `master` SHA. Plan B begins by capturing that exact SHA as `B_MASTER` (Task B.0). Every artifact in this plan binds to `B_MASTER`.
 - Dockerfile `COPY` sources that the closed allowlist must enumerate (`Dockerfile:19,23,24,25,26,57,58,59,60,61,62`): `package.json`, `package-lock.json`, `.npmrc`, `tsconfig.json`, `jest.config.js`, `register.js`, `src/`, `typings/`, `.git` (removed by Plan A), `web/`, `src/Sonoswsdl-1.19.6-20231024.wsdl`. Plan A removed `COPY .git ./.git`; the allowlist must not re-add it.
 - `package.json` dependency install is `npm ci` from `package-lock.json` (deterministic). `npm run gitinfo` writes `.gitinfo` via `git describe --tags` (spec §3.2 requires replacing Git metadata with a generated minimal revision file).
-- Target registry: `ghcr.io/richertunes/bonob`; tag form `sha-<40 lowercase hex>`; digest form `@sha256:<manifest-digest>` (spec §4).
+- Target registry: `ghcr.io/richertunes/bonob`; tag form is `sha-` followed by the validated 40-lowercase-hex source SHA; digest form is the validated 64-lowercase-hex SHA-256 digest emitted in the release manifest (spec §4).
 
 ## Nonwaivable invariants every step obeys
 
@@ -45,6 +58,8 @@
 - **Create:** `tools/build_context.mjs` — generator: from a clean exact-SHA checkout, materializes a deterministic context dir, emits sorted listing (path, mode, size, sha256) + archive hash; fails on any required-but-unlisted file; replaces `.git`-derived metadata with a minimal `.gitinfo`-replacement.
 - **Create:** `tools/scan_context.mjs` — local prohibited-path + secret scan of the generated context; must pass before any remote access.
 - **Create:** `.github/workflows/exception-allowlist.json` — versioned audit/scan exception list keyed to exact advisory/component identity (initially empty).
+- **Create:** `tools/node-base-lock.json` — reviewed immutable Node base-image manifest digest used by Task B.4.
+- **Create:** `docs/superpowers/evidence/plan-b-input.json` — immutable Plan-A master input record consumed by every local Plan-B command.
 - **Create:** `.github/workflows/build-test-scan.yml` — Job 1: read-only, no secret, no `packages:write`; build once -> OCI archive + SBOM + attestations + hash manifest under pinned artifact IDs.
 - **Create:** `.github/workflows/publish-ghcr.yml` — Job 2: protected `ghcr-publication` environment; artifact-read + narrowly scoped `packages:write`; verify-then-push only.
 - **Create:** `tests/build_context.test.ts` — Jest test for the context generator (allowlist exhaustiveness, deterministic hash, `.git` exclusion).
@@ -58,7 +73,8 @@
 
 ## Task B.0 — Capture the exact Plan-A integrated master
 
-**Files:** none (git operation + recording).
+**Files:**
+- Create: `docs/superpowers/evidence/plan-b-input.json`.
 
 - [ ] **B.0.1 — Verify Plan A is integrated and the validator passed.**
 
@@ -77,13 +93,24 @@ Expected: `master` at the Plan-A integrated SHA; `DESIGN_SHA` is an ancestor (ex
 Run:
 ```bash
 B_MASTER=$(git rev-parse master)
+printf '%s' "${B_MASTER}" | grep -Eq '^[0-9a-f]{40}$' || { echo "master is not a full lowercase SHA" >&2; exit 1; }
+mkdir -p docs/superpowers/evidence
+printf '{\n  "schema": "plan-b-input/v1",\n  "sourceSha": "%s"\n}\n' "${B_MASTER}" > docs/superpowers/evidence/plan-b-input.json
+test "$(node -p "require('./docs/superpowers/evidence/plan-b-input.json').sourceSha")" = "${B_MASTER}"
 echo "B_MASTER=${B_MASTER}"
 git checkout -b supply-chain/b
 git merge-base --is-ancestor "${B_MASTER}" HEAD ; echo "bmaster_ancestor=$?"
 ```
-Expected: `B_MASTER` printed; branch `supply-chain/b` created; the recorded SHA is an ancestor (exit `0`). Every artifact in later tasks binds to `B_MASTER`.
+Expected: `B_MASTER` printed; the JSON record has schema `plan-b-input/v1` and the same SHA; branch `supply-chain/b` created; the recorded SHA is an ancestor (exit `0`). Every artifact in later tasks reads this record rather than accepting an operator-supplied SHA.
 
-**Definition of done for B.0:** Plan A integrated and writer-free; `B_MASTER` recorded; Plan B branch started.
+- [ ] **B.0.3 — Commit the immutable Plan-B input record.**
+
+```bash
+git add docs/superpowers/evidence/plan-b-input.json
+git commit -m "docs(plan-b): record exact Plan-A master input"
+```
+
+**Definition of done for B.0:** Plan A integrated and writer-free; `B_MASTER` is persisted in the committed input record; Plan B branch started.
 
 ---
 
@@ -488,9 +515,21 @@ Expected: `PASS`, 2 tests.
 
 - [ ] **B.3.6 — Update direct dependencies in smallest compatible groups.**
 
-For each group, update `package.json` + `package-lock.json` and rerun the full gate (spec §3.3 step 4). Example for one compatible group:
+Update runtime minors and development-tool minors as two independent, atomic groups; the commands below make no major-version change and do not use an operator-selected package or version:
 ```bash
-npm install --save <pkg>@<version>   # one compatible group at a time
+set -euo pipefail
+npx npm-check-updates --target minor --dep prod --filter '/^(axios|dayjs|eta|express|fp-ts|jsonwebtoken|morgan|sharp|soap|underscore|winston)$/' --upgrade
+npm install --package-lock-only --ignore-scripts
+npm ci
+npm run build
+npm test
+npm audit --omit=dev
+```
+Then run the separate development-tool group:
+```bash
+set -euo pipefail
+npx npm-check-updates --target minor --dep dev --filter '/^(@swc\/core|@swc\/jest|@types\/jest|jest|nodemon|npm-check-updates|supertest|ts-node|typescript)$/' --upgrade
+npm install --package-lock-only --ignore-scripts
 npm ci
 npm run build
 npm test
@@ -502,7 +541,12 @@ Expected after each group: build + tests pass; production audit (`--omit=dev`) h
 
 ```bash
 git add package.json package-lock.json .github/workflows/exception-allowlist.json tests/exception_allowlist.test.ts
-git commit -m "fix(plan-b): rebaseline <group> deps to zero high/critical (spec §3.3)"
+git commit -m "fix(plan-b): rebaseline runtime dependency minors"
+```
+After the development-tool command passes its redaction gate, commit it separately:
+```bash
+git add package.json package-lock.json
+git commit -m "build(plan-b): rebaseline development-tool dependency minors"
 ```
 
 **Definition of done for B.3:** production audit reports zero unapproved high/critical; exception allowlist schema enforced by test; every group committed atomically.
@@ -517,31 +561,41 @@ Goal: the Dockerfile uses digest-pinned bases, no `apt upgrade` blanket, reads t
 **Files:**
 - Modify: `Dockerfile` (current `FROM node:22-bookworm-slim` at `Dockerfile:1` and `:50`; `apt-get -y upgrade` at `:9` and `:53`; `RUN npm run gitinfo` at `:28`).
 
-- [ ] **B.4.1 — Pin the base images by digest.**
+- [ ] **B.4.1 — Pin the base images by the reviewed manifest digest.**
 
-Replace both `FROM node:22-bookworm-slim` lines with the digest-pinned form. The operator fills the reviewed digest from the official Node image manifest:
+Resolve and record the canonical manifest digest before editing; the command fails if the registry output is not a SHA-256 digest. This plan records the reviewed result `sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3` from `node:22-bookworm-slim`:
+```bash
+set -euo pipefail
+NODE_BASE_DIGEST="$(docker buildx imagetools inspect node:22-bookworm-slim --format '{{.Manifest.Digest}}')"
+printf '%s' "${NODE_BASE_DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$' || { echo "invalid Node manifest digest" >&2; exit 1; }
+test "${NODE_BASE_DIGEST}" = "sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3" || { echo "reviewed Node manifest moved; stop for re-review" >&2; exit 1; }
+printf '{\n  "image": "node:22-bookworm-slim",\n  "manifestDigest": "%s"\n}\n' "${NODE_BASE_DIGEST}" > tools/node-base-lock.json
+```
+Create `tools/node-base-lock.json` exactly as produced above, then use the recorded digest in both stages:
 ```dockerfile
-FROM node:22-bookworm-slim@sha256:<NODE_DIGEST> AS build
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS build
 ...
-FROM node:22-bookworm-slim@sha256:<NODE_DIGEST>
+FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3
 ```
 Gate:
 ```bash
 grep -nE 'FROM node:22-bookworm-slim$' Dockerfile
 ```
-Expected: **no matches** (only digest-pinned `FROM` lines remain). `<NODE_DIGEST>` is replaced in B.4.5.
+Expected: **no matches** (only digest-pinned `FROM` lines remain).
 
 - [ ] **B.4.2 — Remove blanket `apt-get upgrade`.**
 
-Delete the `apt-get -y upgrade` lines in both stages (`Dockerfile:9`, `Dockerfile:53`). Replace pinned OS packages with a recorded snapshot/index identity (spec §4):
+Delete the `apt-get -y upgrade` lines in both stages (`Dockerfile:8`, `Dockerfile:49` in the current worktree). Pin APT to the exact Debian snapshot recorded here, then install the existing package set without a blanket upgrade (spec §4):
 ```dockerfile
-RUN apt-get update && \
+RUN printf '%s\n' 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/20260723T000000Z bookworm main' > /etc/apt/sources.list && \
+    rm -f /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Check-Valid-Until=false update && \
     apt-get -y install --no-install-recommends \
-        libvips-dev=<version> \
-        python3=<version> \
-        make=<version> \
-        git=<version> \
-        g++=<version> && \
+        libvips-dev \
+        python3 \
+        make \
+        git \
+        g++ && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 ```
@@ -573,38 +627,48 @@ grep -n '"gitinfo": "git describe' package.json
 ```
 Expected: **no matches**.
 
-- [ ] **B.4.5 — Replace remaining `<NODE_DIGEST>` placeholders and add OCI labels.**
+- [ ] **B.4.5 — Validate the recorded base lock and add OCI labels.**
 
-Fill `<NODE_DIGEST>` with the exact reviewed `sha256:` digest. Add OCI labels bound to the exact commit in the final stage:
+Validate the persisted lock before the build, then add OCI labels bound to build arguments supplied by the validated source SHA and its commit time:
+```bash
+set -euo pipefail
+test "$(node -p "require('./tools/node-base-lock.json').manifestDigest")" = "sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
+```
 ```dockerfile
-ARG OCI_REVISION=v0.0.0
+ARG OCI_REVISION
+ARG OCI_CREATED
 LABEL   org.opencontainers.image.source="https://github.com/RicherTunes/bonob" \
         org.opencontainers.image.revision="${OCI_REVISION}" \
-        org.opencontainers.image.created="2026-07-23T00:00:00Z" \
+        org.opencontainers.image.created="${OCI_CREATED}" \
         org.opencontainers.image.description="bonob SONOS SMAPI implementation (RicherTunes fork)" \
         org.opencontainers.image.licenses="GPL-3.0-only"
 ```
 Gates:
 ```bash
-grep -nE '<NODE_DIGEST>|github\.com/simojenki' Dockerfile
+rg -n '\\x3c[A-Z_][A-Z0-9_]*>|github\.com/simojenki' Dockerfile
 grep -nE 'org.opencontainers.image.(revision|created|source)' Dockerfile
 ```
 Expected: first grep **no matches**; second grep shows `revision`, `created`, and `source` labels.
 
 - [ ] **B.4.6 — Local build gate using the generated context.**
 
-Generate the context, scan it, build from the archive (not the repo root):
+Read the persisted input record, generate the context, scan it, and build from the directory (not the repo root):
 ```bash
+B_MASTER="$(node -p "require('./docs/superpowers/evidence/plan-b-input.json').sourceSha")"
+printf '%s' "${B_MASTER}" | grep -Eq '^[0-9a-f]{40}$' || { echo "invalid recorded source SHA" >&2; exit 1; }
+export B_MASTER
 node -e "import('./tools/build_context.mjs').then(m=>{const a=m.loadAllowlist();m.generate(a,'./build-context',{revision:{commit:process.env.B_MASTER,describe:'v0.0.0'}})})"
 node -e "import('./tools/scan_context.mjs').then(m=>{const r=m.scanContext('./build-context');console.log(JSON.stringify(r));process.exit(r.ok?0:1)})"
-docker buildx build --platform linux/amd64 --load -f Dockerfile ./build-context
+OCI_CREATED="$(git show -s --format=%cI "${B_MASTER}")"
+printf '%s' "${OCI_CREATED}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$' || { echo "invalid commit timestamp" >&2; exit 1; }
+docker buildx build --platform linux/amd64 --load -f Dockerfile --build-arg "OCI_REVISION=${B_MASTER}" --build-arg "OCI_CREATED=${OCI_CREATED}" ./build-context
 ```
 Expected: scan `{"ok":true,"findings":[]}`; image builds with the OCI revision label present.
 
 - [ ] **B.4.7 — Commit.**
 
 ```bash
-git add Dockerfile package.json
+git add Dockerfile package.json tools/node-base-lock.json
 git commit -m "fix(plan-b): digest-pinned base, no apt upgrade, generated revision + OCI labels"
 ```
 
@@ -658,7 +722,7 @@ jobs:
           REMOTE=$(gh api repos/${{ github.repository }}/git/refs/heads/master --jq '.object.sha')
           test "${{ inputs.sha }}" = "${REMOTE}" || { echo "::error::requested != remote master"; exit 1; }
 
-      - uses: actions/checkout@<PINNED_SHA>
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
@@ -666,7 +730,14 @@ jobs:
       - name: Checked-out HEAD == requested SHA
         run: test "$(git rev-parse HEAD)" = "${{ inputs.sha }}"
 
-      - uses: actions/setup-node@<PINNED_SHA>
+      - name: Record validated OCI creation time from the requested commit
+        run: |
+          set -euo pipefail
+          OCI_CREATED="$(git show -s --format=%cI "${{ inputs.sha }}")"
+          printf '%s' "${OCI_CREATED}" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$' || { echo "invalid commit timestamp" >&2; exit 1; }
+          echo "OCI_CREATED=${OCI_CREATED}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -684,8 +755,8 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner -cf context.tar -C build-context .
 
       - name: Build exactly once into an OCI archive
-        uses: docker/setup-buildx-action@<PINNED_SHA>
-      - uses: docker/build-push-action@<PINNED_SHA>
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+      - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: ./build-context
           file: ./Dockerfile
@@ -695,6 +766,7 @@ jobs:
           tags: bonob:${{ inputs.sha }}
           build-args: |
             OCI_REVISION=${{ inputs.sha }}
+            OCI_CREATED=${{ env.OCI_CREATED }}
           outputs: type=oci,dest=image.oci
       - name: Archive + digest manifest
         run: |
@@ -703,7 +775,7 @@ jobs:
           cat hashes.txt
 
       - name: Image scan (zero unapproved high/critical)
-        uses: aquasecurity/trivy-action@<PINNED_SHA>
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           input: image.oci
           severity: HIGH,CRITICAL
@@ -711,14 +783,14 @@ jobs:
           ignore-unfixed: true
 
       - name: SBOM + attestation
-        uses: anchore/sbom-action@<PINNED_SHA>
+        uses: anchore/sbom-action@f8bdd1d8ac5e901a77a92f111440fdb1b593736b # v0.20.6
         with:
           path: image.oci
           artifact-name: sbom.spdx.json
           upload: true
 
       - name: Upload immutable artifacts under pinned identity
-        uses: actions/upload-artifact@<PINNED_SHA>
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: oci-build-${{ inputs.sha }}
           path: |
@@ -728,9 +800,21 @@ jobs:
             layers.json
           retention-days: 30
 ```
-Replace each `<PINNED_SHA>` with the exact reviewed commit SHA of each action (checkout, setup-node, setup-buildx-action, build-push-action, trivy-action, sbom-action, upload-artifact). Gate:
+Verify each inline immutable action commit against the canonical release tag before commit. The following complete gate validates the remotely resolved ID and fails on drift; it never accepts a substituted identifier:
 ```bash
-grep -nE '<PINNED_SHA>|packages:\s*write|secrets\.(DOCKERHUB|GHCR|BNB)|push:\s*true' .github/workflows/build-test-scan.yml
+set -euo pipefail
+verify_action() { repository="$1"; tag="$2"; expected="$3"; actual="$(git ls-remote "https://github.com/${repository}.git" "refs/tags/${tag}" | awk 'NR==1 { print $1 }')"; printf '%s' "${actual}" | grep -Eq '^[0-9a-f]{40}$' || { echo "unresolvable action tag: ${repository}@${tag}" >&2; exit 1; }; test "${actual}" = "${expected}" || { echo "action lock mismatch: ${repository}@${tag}" >&2; exit 1; }; }
+verify_action actions/checkout v4.2.2 11bd71901bbe5b1630ceea73d27597364c9af683
+verify_action actions/setup-node v4.4.0 49933ea5288caeca8642d1e84afbd3f7d6820020
+verify_action docker/setup-buildx-action v3.11.1 e468171a9de216ec08956ac3ada2f0791b6bd435
+verify_action docker/build-push-action v6.18.0 263435318d21b8e681c14492fe198d362a7d2c83
+verify_action aquasecurity/trivy-action v0.36.0 ed142fd0673e97e23eac54620cfb913e5ce36c25
+verify_action anchore/sbom-action v0.20.6 f8bdd1d8ac5e901a77a92f111440fdb1b593736b
+verify_action actions/upload-artifact v4.6.2 ea165f8d65b6e75b540449e92b4886f43607fa02
+```
+Then run the structural gate:
+```bash
+rg -n '@(v[0-9]|main|master)|\\x3c[A-Z_][A-Z0-9_]*>|packages:\s*write|secrets\.(DOCKERHUB|GHCR|BNB)|push:\s*true' .github/workflows/build-test-scan.yml
 ```
 Expected: **no matches** (no placeholder, no secret reference, no push, no packages:write).
 
@@ -849,7 +933,7 @@ jobs:
           test "${{ inputs.sha }}" = "${REMOTE}" || { echo "::error::requested != remote master at dispatch"; exit 1; }
 
       - name: Download ONLY the pinned build artifact (no checkout, no source)
-        uses: actions/download-artifact@<PINNED_SHA>
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: oci-build-${{ inputs.sha }}
           run-id: ${{ inputs.run_id }}
@@ -871,7 +955,7 @@ jobs:
           echo "pre_push_remote=${REMOTE}"
           test "${{ inputs.sha }}" = "${REMOTE}" || { echo "::error::master moved pre-push; abort without publication"; exit 1; }
 
-      - name: Load the exact archive (no rebuild) and tag sha-<40hex>
+      - name: Load the exact archive (no rebuild) and tag the validated source SHA
         run: |
           set -euo pipefail
           TAG="ghcr.io/richertunes/bonob:sha-${{ inputs.sha }}"
@@ -881,7 +965,7 @@ jobs:
           docker tag bonob:${{ inputs.sha }} "$TAG"
 
       - name: Login + push (narrowly scoped packages:write only)
-        uses: docker/login-action@<PINNED_SHA>
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -903,9 +987,16 @@ jobs:
           test "${{ inputs.sha }}" = "${REMOTE}" || { echo "::error::master moved post-push; quarantine"; exit 1; }
           echo "ghcr_digest=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
 ```
-Replace each `<PINNED_SHA>` with the exact reviewed commit SHA of `download-artifact` and `login-action`. Gates:
+Verify the two inline immutable action commits before commit. This complete gate validates the remotely resolved ID and fails on drift:
 ```bash
-grep -nE '<PINNED_SHA>|actions/checkout|npm ci|npm run build|build-push-action|cache-from|cache-to' .github/workflows/publish-ghcr.yml
+set -euo pipefail
+verify_action() { repository="$1"; tag="$2"; expected="$3"; actual="$(git ls-remote "https://github.com/${repository}.git" "refs/tags/${tag}" | awk 'NR==1 { print $1 }')"; printf '%s' "${actual}" | grep -Eq '^[0-9a-f]{40}$' || { echo "unresolvable action tag: ${repository}@${tag}" >&2; exit 1; }; test "${actual}" = "${expected}" || { echo "action lock mismatch: ${repository}@${tag}" >&2; exit 1; }; }
+verify_action actions/download-artifact v4.3.0 d3f86a106a0bac45b974a628896c90dbdf5c8093
+verify_action docker/login-action v3.4.0 74a5d142397b4f367a81961eba4e8cd7edddf772
+```
+Then run the structural gates:
+```bash
+rg -n '@(v[0-9]|main|master)|\\x3c[A-Z_][A-Z0-9_]*>|actions/checkout|npm ci|npm run build|build-push-action|cache-from|cache-to' .github/workflows/publish-ghcr.yml
 ```
 Expected: **no matches** (no checkout, no install/build, no buildx, no cache).
 
@@ -938,7 +1029,7 @@ describe("publish-ghcr workflow (spec §4, criterion 7)", () => {
     expect(wf).toContain("master moved pre-push");
     expect(wf).toContain("master moved post-push");
   });
-  it("tags sha-<40hex> and verifies OCI revision == requested SHA", () => {
+  it("tags the validated 40-hex source SHA and verifies OCI revision == requested SHA", () => {
     expect(wf).toContain("sha-[0-9a-f]{40}");
     expect(wf).toContain("org.opencontainers.image.revision");
     expect(wf).toContain("OCI revision mismatch; quarantine");
@@ -1067,7 +1158,7 @@ Expected: `ANON_FAIL=ok`; authorized pull succeeds; `REV_OK=ok` (OCI revision ==
 
 ## Adversarial-review focus for Plan B (report to Codex)
 
-- Any `<PINNED_SHA>` placeholder or floating action tag left in `build-test-scan.yml` or `publish-ghcr.yml`.
+- Any non-immutable action reference in `build-test-scan.yml` or `publish-ghcr.yml`, including a floating tag (`@v*`, `@main`, or `@master`).
 - Any secret/credential reference in Job 1, or any `packages: write` outside the `ghcr-publication` environment in Job 2.
 - Any checkout/install/build/cache step in the publisher (it must push exact bytes only).
 - Any path where the Docker build receives the repo root instead of the scanned closed context.
@@ -1083,3 +1174,13 @@ Expected: `ANON_FAIL=ok`; authorized pull succeeds; `REV_OK=ok` (OCI revision ==
 | 6 (no-secret read-only build/test/scan job, checksummed OCI/SBOM/attestations, audit/scan policy, tool identities, timestamps, hashes, digest) | B.3, B.5, B.4 |
 | 7 (protected publisher, no checkout/build, artifact verification, writer removal, master equality dispatch/pre-push/completion, tag/rerun/digest/privacy/quarantine) | B.6, B.7 |
 | Non-goals §11 (no Docker Hub, no `latest`, no non-amd64, no VPS deployment) | B.4, B.6, B.7.5 |
+
+## Interface/type-consistency map
+
+| Producer | Exact value contract | Consumer | Enforcement |
+|---|---|---|---|
+| B.0 | `docs/superpowers/evidence/plan-b-input.json.sourceSha`: lowercase 40-hex `master` commit | B.4 local build and B.7 pull verification | `git rev-parse`, JSON equality check, ancestry check, and 40-hex workflow input validation |
+| B.4.1 | `tools/node-base-lock.json.manifestDigest`: `sha256:` plus 64 lowercase hex | both Dockerfile `FROM` statements | lock-file equality check before build |
+| B.1 | generated `.revision.json.commit` and `.gitinfo`: exactly `B_MASTER`; sorted context listing/archive hashes | B.4 Docker build and B.5 artifact manifest | generator tests and pre-remote scan |
+| B.5 | `inputs.sha`, checked-out `HEAD`, remote `master`, OCI revision, artifact name, and `OCI_CREATED`: validated exact source SHA / ISO-8601 commit time | B.6 artifact download and label verification | workflow equality checks, hash manifest, and structural Jest test |
+| B.6/B.7 | GHCR tag: `sha-` plus the exact 40-hex source SHA; OCI digest: `sha256:` plus 64 lowercase hex | protected publisher and privacy/pull verifier | tag regex, `sha256sum -c`, master checks at dispatch/pre-push/post-push, and OCI revision comparison |

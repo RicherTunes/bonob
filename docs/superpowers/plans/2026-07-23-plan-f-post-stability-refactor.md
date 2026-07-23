@@ -1,230 +1,200 @@
-# Plan F — Post-stability behavior-preserving module extraction
+# Plan F — Post-stability behavior-preserving module extraction implementation plan
 
-**Plan:** F — Maintainability
-**Program:** RicherTunes bonob private-fork convergence (spec `docs/superpowers/specs/2026-07-23-private-fork-convergence-design.md`, §5.4)
-**Entry dependency (spec §1.1 row F, criterion 23):** the **same** production digest promoted in Plan E has completed **seven continuous days**, at least **three distinct physical Sonos sessions**, **zero rollback**, **zero open release blocker**, and **zero unattributed production error**. Until that field-stability threshold is met, Plan F is **blocked** and no extraction begins.
-**Exit evidence (spec §1.1 row F, §5.4):** unchanged golden SOAP/HTTP fixtures, the full unit suite green, the safe SMAPI sweep green, candidate evidence green, and a **new field-stability cycle** begins before any further extraction.
-**Scope guard (spec §5.4, §1.1):** behavior-preserving module extraction **only**. Refactoring is **never** combined with a protocol feature change or a dependency major update. Each slice changes only module boundaries; no public behavior, response byte, fault code, cache format, or URL shape may change. The extraction separates protocol serialization, authentication, browse/query orchestration, caching, upstream transport, and streaming **behind existing interfaces**.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
----
+**Goal:** Split the large SMAPI, Subsonic, cache, transport, and streaming modules behind their existing interfaces without changing any observable behavior.
 
-## Invariants every step obeys
+**Architecture:** The plan is hard-blocked until the same Plan-E production digest has seven continuous stable days. Once open, each one-boundary slice first adds an import/facade plus invariant test, then moves code verbatim behind a backward-compatible facade, proves the frozen golden corpus unchanged, and generates a fresh candidate artifact. No extraction shares a commit with a behavior, dependency, or deployment change.
 
-- **Golden contracts are immutable (spec §5.4):** every existing test — unit suite, golden SOAP/HTTP fixtures, the safe SMAPI sweep, and physical acceptance — must remain **unchanged and green** before and after each slice. A test is edited **only** if its import path moved with the extraction (same assertions, new path); assertions themselves never change.
-- **No mixed concerns (spec §1.1, §5.4):** a refactor slice contains **no** dependency change, **no** protocol behavior change, and **no** live promotion. If a slice uncovers a real defect, it is **not** fixed here — it is filed as a new Plan-D evidence-gated slice, and the refactor proceeds around the existing behavior.
-- **Exact-master + per-slice artifact (spec §4, criterion 8):** each slice starts from exact current `master` and produces its own build/audit/scan/smoke/candidate digest.
-- **Move-then-verify TDD:** for each extraction, (1) add an import-path compatibility test that asserts the moved symbol is importable from its **new** location and re-exported from the **old** location, (2) move the symbol, (3) run the full suite (must stay green), (4) remove the temporary re-export only if no consumer depends on it (verified by grep), else keep it as the stable facade.
-- **Single extraction per commit:** each slice is one module boundary; commits are atomic and reviewable in isolation.
+**Tech Stack:** TypeScript 5.9, Jest 30, existing `src/smapi.ts`, `src/subsonic.ts`, `src/swr_cache.ts`, `src/swr_cache_file_store.ts`, Plan-C safe candidate sweep and Plan-B artifact lane.
 
----
+## Global Constraints
 
-## Slice F.0 — Re-confirm field-stability threshold + establish golden baseline (no code change)
-
-Goal: gate the entire plan on the seven-day threshold and snapshot the golden contract set that must not change.
-
-- [ ] **F.0.1 — Verify the seven-day field-stability threshold (hard gate; blocks all of Plan F).**
-  - [ ] Confirm the Plan-E promoted digest has run ≥7 continuous days, ≥3 physical sessions, zero rollback, zero blocker, zero unattributed production error (spec criterion 23). Record digest + window in `docs/superpowers/evidence/2026-07-23-plan-f-field-stability.md`.
-  - Gate:
-    ```bash
-    grep -E 'sha256:|seven continuous days' docs/superpowers/evidence/2026-07-23-plan-f-field-stability.md
-    ```
-    Expected: both present (exit `0`). If absent, **stop**: Plan F is blocked.
-  - Atomic commit: `git commit -m "docs(plan-f): confirm seven-day field-stability threshold (criterion 23)"`.
-
-- [ ] **F.0.2 — Snapshot the golden contract set (must stay byte-identical across Plan F).**
-  - [ ] Record hashes of all SOAP/HTTP fixtures and the full unit-test expected outputs (where deterministic) into `docs/superpowers/evidence/2026-07-23-plan-f-golden-baseline.json`.
-  - [ ] Add `tests/golden_baseline.test.ts` that asserts current fixture/test-output hashes equal the baseline. Failing until the baseline file matches current state:
-    ```bash
-    npx jest tests/golden_baseline.test.ts
-    ```
-    Expected before: fails (baseline must be generated to match). Expected after generation: `PASS`.
-  - Atomic commit: `git commit -m "test(plan-f): snapshot immutable golden contract baseline"`.
+- “Large `smapi.ts` and `subsonic.ts` extractions begin only after field stability: seven continuous days on the same production digest, at least three distinct physical Sonos sessions, zero rollback, zero open release blocker, and zero unattributed production error” (spec §5.4).
+- “Golden SOAP/HTTP fixtures, the full unit suite, the safe sweep, and physical acceptance must remain unchanged” (spec §5.4).
+- “Refactoring is never combined with a protocol feature or dependency major update” (spec §5.4).
+- The extraction separates “protocol serialization, authentication, browse/query orchestration, caching, upstream transport, and streaming behind existing interfaces” (spec §5.4).
+- Each code-changing slice starts from exact current `master` and has a new build/audit/scan/smoke/candidate-tested digest; evidence is never reused across code SHAs (criterion 8).
+- Before further extraction, the resulting digest must complete a new seven-day field-stability cycle (spec §1.1 and §5.4).
 
 ---
 
-## Slice F.1 — Extract `subsonic` protocol serialization (`src/subsonic/serialization.ts`)
+**Hard blocker:** No source/test/facade file may be created or modified until F.0 evidence passes. If its test fails, report Plan F as blocked and stop; do not prepare an extraction branch, run a candidate build, or make an extraction commit.
 
-Seam (verified exports to move, behavior unchanged): the pure Subsonic↔domain mappers and response/error types currently in `src/subsonic.ts`:
-- types: `GetGenresResponse` (line 271), `images` (284), `song` (311), `GetAlbumResponse` (335), `GetPlaylistResponse` (341), `GetPlaylistsResponse` (353), `GetSimilarSongsResponse` (371), `GetTopSongsResponse` (375), `GetInternetRadioStationsResponse` (379), `GetSongResponse` (390), `GetStarredResponse` (394), `PingResponse` (401), `Search3Response` (408), `OpenSubsonicExtension` (416), `IdName` (431).
-- mappers: `isError` (425), `coverArtURN` (436), `artistImageURN` (444), `asTrackSummary` (482), `asTrack` (517), `asAlbumSummary` (526), `asGenre` (536), `maybeAsGenre` (541), `asYear` (551).
+**Golden/evidence interfaces:**
 
-- [ ] **F.1.1 — Add a failing import-path test.**
-  - [ ] Write `tests/subsonic_serialization_imports.test.ts` asserting each moved symbol is importable from `./src/subsonic/serialization` **and** still re-exported from `./src/subsonic` (facade).
-  - Failing test (new path does not exist yet):
-    ```bash
-    npx jest tests/subsonic_serialization_imports.test.ts
-    ```
-    Expected before: `FAIL … Cannot find module './src/subsonic/serialization'`.
-  - Atomic commit: `git commit -m "test(plan-f): assert subsonic serialization import paths"`.
+```ts
+type FieldStabilityEvidence = {
+  digest: string; startedAt: string; endedAt: string; continuousDays: number;
+  physicalSessions: Array<{ startedAt: string; afterRestart: boolean }>;
+  rollbackCount: number; openBlockerCount: number; unattributedProductionErrorCount: number;
+};
+type ExtractionEvidence = {
+  slice: string; sourceSha: string; candidateDigest: string;
+  goldenTreeSha256: string; fullSuiteExit: 0; safeSweepExit: 0; reviewReference: string;
+};
+```
 
-- [ ] **F.1.2 — Move the symbols; keep a re-export facade.**
-  - [ ] Create `src/subsonic/serialization.ts`, move the listed types/mappers verbatim (no logic change), preserving exact names and signatures.
-  - [ ] In `src/subsonic.ts`, replace the moved definitions with `export * from "./subsonic/serialization";` (or named re-exports) so every existing consumer import is unchanged.
-  - Gate:
-    ```bash
-    npx jest tests/subsonic_serialization_imports.test.ts && npx jest
-    ```
-    Expected: import-path test `PASS` and full suite green; golden baseline (F.0.2) unchanged.
-  - Atomic commit: `git commit -m "refactor(plan-f): extract subsonic serialization behind facade"`.
+`digest` and `candidateDigest` match `^sha256:[0-9a-f]{64}$`; `sourceSha` matches `git rev-parse HEAD`. The golden tree hash is generated from a sorted `sha256sum` listing of `tests/fixtures`, `tests/smapi.test.ts`, and `tests/server.test.ts`; it is immutable after F.0.
 
-- [ ] **F.1.3 — Full suite + safe sweep + candidate evidence + exact-master artifact.**
-  - [ ] Run `npx jest`, the Plan-C safe SMAPI sweep (read-only, disposable candidate), and produce a fresh exact-`master` build/audit/scan/smoke/candidate digest. Golden contracts unchanged.
-  - Atomic commit: `git commit -m "test(plan-f): F.1 full suite + safe sweep + exact-master artifact"`.
+### Task F.0: Verify field stability and freeze the golden corpus
 
----
+**Files:**
+- Create: `docs/superpowers/evidence/2026-07-23-plan-f-field-stability.json`
+- Create: `docs/superpowers/evidence/2026-07-23-plan-f-golden-tree.sha256`
+- Create: `tests/plan_f_entry_gate.test.ts`
+- Create: `tests/plan_f_golden_tree.test.ts`
 
-## Slice F.2 — Extract Subsonic authentication + token handling (`src/subsonic/auth.ts`)
+**Interfaces:**
+- Consumes Plan-E record `gates.observation24h` and same-digest physical evidence.
+- Produces a passing `FieldStabilityEvidence` and immutable golden-tree hash.
 
-Seam (verified exports to move): `t` (line 57), `t_and_s` (60), `asToken` (1026), `parseToken` (1029), plus the `Credentials`/`LoginToken` types they depend on (note: `Credentials`/`LoginToken` are also referenced by `smapi.ts`; move to a shared `src/credentials.ts` only if both files need them — otherwise keep in `subsonic.ts` and re-export from `auth.ts`).
+- [ ] **Step 1: Write the failing seven-day gate.** Assert `continuousDays >= 7`, three sessions, one `afterRestart`, and all three counters equal `0`. Run `npx jest tests/plan_f_entry_gate.test.ts --runInBand`. Expected: FAIL because the evidence file is absent or fails the threshold.
 
-- [ ] **F.2.1 — Add a failing import-path test** (mirrors F.1.1 for `./src/subsonic/auth`). Failing first:
-    ```bash
-    npx jest tests/subsonic_auth_imports.test.ts
-    ```
-    Expected before: `FAIL` (module missing). Atomic commit: `git commit -m "test(plan-f): assert subsonic auth import paths"`.
+- [ ] **Step 2: Stop unless genuine evidence exists.** Populate the JSON only from Plan-E observation/physical evidence for one digest. A missing timestamp, digest mismatch, discontinuity, or nonzero counter leaves the test failing and hard-blocks the entire plan.
 
-- [ ] **F.2.2 — Move the symbols; keep facade re-export** (mirrors F.1.2; no logic change). Gate:
-    ```bash
-    npx jest tests/subsonic_auth_imports.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, golden baseline unchanged. Atomic commit: `git commit -m "refactor(plan-f): extract subsonic auth behind facade"`.
+- [ ] **Step 3: Write the failing golden-tree test.** Add a test that regenerates the sorted hash listing and expects byte equality with `2026-07-23-plan-f-golden-tree.sha256`. Run `npx jest tests/plan_f_golden_tree.test.ts --runInBand`. Expected: FAIL because the baseline is absent.
 
-- [ ] **F.2.3 — Full suite + safe sweep + candidate evidence + exact-master artifact** (mirrors F.1.3). Atomic commit accordingly.
+- [ ] **Step 4: Freeze the baseline and verify.** Generate the listing from the named paths, commit it unchanged, then run `npx jest tests/plan_f_entry_gate.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`. Expected: PASS.
 
----
+- [ ] **Step 5: Commit.** Run `git add docs/superpowers/evidence/2026-07-23-plan-f-* tests/plan_f_entry_gate.test.ts tests/plan_f_golden_tree.test.ts && git commit -m "test(plan-f): gate extraction on seven-day field stability"`.
 
-## Slice F.3 — Extract upstream transport + retry policy (`src/subsonic/transport.ts`)
+### Task F.1: Extract Subsonic serialization
 
-Seam (verified exports to move): `BROWSER_HEADERS` (41), `SUBSONIC_HTTP_TIMEOUT_MS` (49), the axios default-timeout setup (51-55), `isRetryableSubsonicError` (210), `asURLSearchParams` (603), `USER_AGENT` (601), `DEFAULT_CLIENT_APPLICATION` (600), `ClientInfo` (641), `SONOS_CLIENT_INFO` (677), and the `Subsonic` class's private `get`/`post`/`getJSON`/`getJSONWithRetry`/`postJSON` HTTP primitives (refactored to call a transport module function — **no behavior change**; retry stays bounded to reads, never mutations/4xx, per spec §9).
+**Files:**
+- Create: `src/subsonic/serialization.ts`
+- Modify: `src/subsonic.ts:271-551`
+- Create: `tests/subsonic_serialization_facade.test.ts`
+- Create: `docs/superpowers/evidence/plan-f/f1-serialization.json`
 
-- [ ] **F.3.1 — Add a failing import-path + retry-invariant test.**
-  - [ ] Assert `isRetryableSubsonicError`, `SUBSONIC_HTTP_TIMEOUT_MS`, `USER_AGENT` importable from `./src/subsonic/transport` and re-exported from `./src/subsonic`.
-  - [ ] Add `tests/subsonic_transport_invariant.test.ts` asserting the retry policy is unchanged: a real Axios 4xx rejection is **not** retryable; a network error (no response) is retryable; a 5xx is retryable; a Subsonic app-level error (valid response, `isError`) is **not** retryable (spec §9).
-  - Failing first:
-    ```bash
-    npx jest tests/subsonic_transport_imports.test.ts tests/subsonic_transport_invariant.test.ts
-    ```
-    Expected before: import test `FAIL` (module missing).
-  - Atomic commit: `git commit -m "test(plan-f): assert subsonic transport import paths + retry invariant"`.
+**Interfaces:**
+- Produces `GetGenresResponse`, `GetAlbumResponse`, `GetPlaylistResponse`, `GetPlaylistsResponse`, `GetSimilarSongsResponse`, `GetTopSongsResponse`, `GetInternetRadioStationsResponse`, `GetSongResponse`, `GetStarredResponse`, `PingResponse`, `Search3Response`, `OpenSubsonicExtension`, `isError`, `coverArtURN`, `artistImageURN`, `asTrackSummary`, `asTrack`, `asAlbumSummary`, `asGenre`, `maybeAsGenre`, and `asYear` from both `./src/subsonic/serialization` and the existing `./src/subsonic` facade.
 
-- [ ] **F.3.2 — Move the symbols; redirect the `Subsonic` class HTTP primitives to the transport module; keep facade.** No retry-rule change. Gate:
-    ```bash
-    npx jest tests/subsonic_transport_imports.test.ts tests/subsonic_transport_invariant.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, golden baseline unchanged. Atomic commit: `git commit -m "refactor(plan-f): extract subsonic transport behind facade"`.
+- [ ] **Step 1: Write red facade/mapping tests.** Import `coverArtURN`, `asTrackSummary`, and `isError` from both paths; assert identity-equivalent results for a fixture track and an error response. Run `npx jest tests/subsonic_serialization_facade.test.ts --runInBand`. Expected: FAIL because `src/subsonic/serialization.ts` is absent.
 
-- [ ] **F.3.3 — Full suite + safe sweep + candidate evidence + exact-master artifact.** Atomic commit accordingly.
+- [ ] **Step 2: Move exact definitions.** Move only the listed response types/mappers verbatim to `src/subsonic/serialization.ts`; replace their original definitions with named re-exports in `src/subsonic.ts`. Do not change mapper logic or call sites.
 
----
+- [ ] **Step 3: Run green and artifact gates.** Run `npx jest tests/subsonic_serialization_facade.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`; run the Plan-C safe sweep; record a new `ExtractionEvidence` JSON. Expected: all exits `0`.
 
-## Slice F.4 — Extract external image fetching + SSRF safety (`src/subsonic/image_fetch.ts`)
+- [ ] **Step 4: Commit.** Run `git add src/subsonic.ts src/subsonic/serialization.ts tests/subsonic_serialization_facade.test.ts docs/superpowers/evidence/plan-f/f1-serialization.json && git commit -m "refactor(plan-f): extract subsonic serialization facade"`.
 
-Seam (verified exports to move): `ImageFetcher` (828), `cachingImageFetcher` (830), `pinnedSafeExternalLookup` (886), `resolvedExternalHostIsSafe` (913), `axiosImageFetcher` (927), `deezerImageFetcher` (936), `isSafeExternalImageUrl` (191), `isValidImage` (204), `DODGY_IMAGE_NAME` (70). This isolates the SSRF-hardened fetch path behind its own module; **no** allowlist/redirect/lookup behavior may change.
+### Task F.2: Extract Subsonic authentication and upstream transport
 
-- [ ] **F.4.1 — Add a failing import-path + SSRF-invariant test.**
-  - [ ] Assert importability from `./src/subsonic/image_fetch` + facade re-export.
-  - [ ] Add `tests/subsonic_image_fetch_invariant.test.ts` asserting `isSafeExternalImageUrl` still rejects private/loopback/link-local IPs and non-https where required (mirror existing assertions; do not weaken).
-  - Failing first:
-    ```bash
-    npx jest tests/subsonic_image_fetch_imports.test.ts
-    ```
-    Expected before: `FAIL`. Atomic commit: `git commit -m "test(plan-f): assert image_fetch import paths + SSRF invariant"`.
+**Files:**
+- Create: `src/subsonic/auth.ts`
+- Create: `src/subsonic/transport.ts`
+- Modify: `src/subsonic.ts:41-60,210,600-677,1026-1029,1048-1718`
+- Create: `tests/subsonic_auth_facade.test.ts`
+- Create: `tests/subsonic_transport_invariant.test.ts`
+- Create: `docs/superpowers/evidence/plan-f/f2-auth-transport.json`
 
-- [ ] **F.4.2 — Move the symbols; keep facade.** No SSRF/redirect change. Gate:
-    ```bash
-    npx jest tests/subsonic_image_fetch_imports.test.ts tests/subsonic_image_fetch_invariant.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, golden baseline unchanged. Atomic commit: `git commit -m "refactor(plan-f): extract image fetch + SSRF safety behind facade"`.
+**Interfaces:**
+- `auth.ts` produces `t(password: string, salt: string): string`, `t_and_s(password: string): { t: string; s: string }`, `asToken(credentials: Credentials): string`, and `parseToken(token: string): Credentials`.
+- `transport.ts` produces `isRetryableSubsonicError(error: unknown): boolean`, `SUBSONIC_HTTP_TIMEOUT_MS`, `USER_AGENT`, and the client transport used by `Subsonic`.
+- Existing `src/subsonic.ts` continues to re-export all named members.
 
-- [ ] **F.4.3 — Full suite + safe sweep + candidate evidence + exact-master artifact.** Atomic commit accordingly.
+- [ ] **Step 1: Write red tests.** Assert both auth paths import from new/old modules, and assert a 404/mutation is not retryable while a network error and 503 read are retryable. Run `npx jest tests/subsonic_auth_facade.test.ts tests/subsonic_transport_invariant.test.ts --runInBand`. Expected: FAIL because both new modules are absent.
 
----
+- [ ] **Step 2: Move auth definitions without token-format change.** Move exact helpers/types to `auth.ts`, re-export them, and preserve the existing token test vectors in `tests/subsonic_token.test.ts`.
 
-## Slice F.5 — Extract SMAPI presentation mappers + auth-token helpers (`src/smapi/presentation.ts`, `src/smapi/auth_helpers.ts`)
+- [ ] **Step 3: Move transport definitions without retry-policy change.** Move headers, timeout, URL parameter utility, client data, and retry predicate into `transport.ts`; adapt `Subsonic` only to call the exported transport. Keep mutations on `getJSON`, reads on `getJSONWithRetry`, and never retry HTTP 4xx.
 
-Seam (verified exports to move from `src/smapi.ts`): presentation mappers — `ratingAsInt` (112), `ratingFromInt` (115), `MediaCollection` (120), `getMetadataResult` type (126) + function (160), `SearchResponse` (182) + `searchResult` (186), `ContainerType` (293), `Container` (295), `shouldScrobble` (327), `coverArtURI` (352), `iconArtURI` (367), `sonosifyMimeType` (372), `album` (387), `internetRadioStation` (401), `track` (408), `topSongMetadata` (434), `artist` (457), `splitId` (465), `withSplitId` (475); auth helpers — `SoapyHeaders` (482), `findLoginToken` (504). (Keep `bindSmapiSoapServiceToExpress` as the orchestrating default export in `smapi.ts`; it composes these.)
+- [ ] **Step 4: Run green/artifact gates and commit.** Run `npx jest tests/subsonic_auth_facade.test.ts tests/subsonic_transport_invariant.test.ts tests/subsonic_token.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`; safe-sweep and record f2 evidence; commit `refactor(plan-f): extract subsonic auth and transport facades`.
 
-- [ ] **F.5.1 — Add failing import-path tests** for `./src/smapi/presentation` and `./src/smapi/auth_helpers`, both re-exported from `./src/smapi`. Failing first:
-    ```bash
-    npx jest tests/smapi_presentation_imports.test.ts tests/smapi_auth_helpers_imports.test.ts
-    ```
-    Expected before: `FAIL`. Atomic commit: `git commit -m "test(plan-f): assert smapi presentation/auth_helpers import paths"`.
+### Task F.3: Extract artwork/SSRF and cache interfaces
 
-- [ ] **F.5.2 — Move the symbols into the two modules; keep facade re-export from `smapi.ts`.** The SOAP binding orchestrator continues to import them. Gate:
-    ```bash
-    npx jest tests/smapi_presentation_imports.test.ts tests/smapi_auth_helpers_imports.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, golden baseline (incl. raw SOAP fault fixtures from Plan D) unchanged. Atomic commit: `git commit -m "refactor(plan-f): extract smapi presentation + auth_helpers behind facade"`.
+**Files:**
+- Create: `src/subsonic/image_fetch.ts`
+- Create: `src/cache/swr.ts`
+- Create: `src/cache/file_store.ts`
+- Modify: `src/subsonic.ts:70,191-204,828-936`
+- Modify: `src/swr_cache.ts`
+- Modify: `src/swr_cache_file_store.ts`
+- Create: `tests/subsonic_image_fetch_facade.test.ts`
+- Create: `tests/cache_facade.test.ts`
+- Create: `docs/superpowers/evidence/plan-f/f3-image-cache.json`
 
-- [ ] **F.5.3 — Full suite + safe sweep + candidate evidence + exact-master artifact.** Atomic commit accordingly.
+**Interfaces:**
+- `image_fetch.ts` produces `isSafeExternalImageUrl`, `isValidImage`, `pinnedSafeExternalLookup`, `resolvedExternalHostIsSafe`, and `ImageFetcher`; `src/subsonic.ts` re-exports them.
+- `cache/swr.ts` produces `SwrCacheStore` and `SwrCache`; `cache/file_store.ts` produces `fileStore`; old paths remain re-export facades.
 
----
+- [ ] **Step 1: Write red import and SSRF/cache tests.** Import every named interface from new and old paths; assert loopback/private/link-local/non-HTTPS artwork URLs are rejected and a persisted cache round-trip remains unchanged. Run `npx jest tests/subsonic_image_fetch_facade.test.ts tests/cache_facade.test.ts --runInBand`. Expected: FAIL because the new paths are absent.
 
-## Slice F.6 — Extract browse/query orchestration (`src/subsonic/orchestration.ts`)
+- [ ] **Step 2: Move image code verbatim.** Move the named image/SSRF definitions to `image_fetch.ts`, retain DNS pinning/redirect behavior and existing facade exports; make no allowlist, resolver, MIME, or cache-header change.
 
-Seam: the `Subsonic` class methods that orchestrate browse/query calls (`fetchArtists`, `getAlbumList2`, `getArtistInfo2`, `getAlbum`, `getArtist`, `getSong`, `getStarred` albums/songs, `search3`, genres, years, similar/top songs, internet radio, OpenSubsonic extensions — verified call sites at `src/subsonic.ts:1194-1760`), plus the playlist CRUD methods (`createPlayList`, `deletePlayList`, `updatePlaylist`, `getPlaylists`, `getPlaylist`) and `stream`. These move into an orchestration module that the `Subsonic` class delegates to. **Behavior unchanged**: playlist mutations stay on non-retried `getJSON`; reads stay on `getJSONWithRetry`; `stream` stays a stream-response GET.
+- [ ] **Step 3: Move cache types/classes verbatim.** Move `SwrCacheStore`/`SwrCache` and `fileStore` to the named cache files; preserve all existing exports and Plan-C quiesce/envelope behavior.
 
-- [ ] **F.6.1 — Add failing import-path + orchestration-invariant tests.**
-  - [ ] Assert the orchestration module exports the moved methods and the `Subsonic` class delegates to them.
-  - [ ] Add `tests/subsonic_orchestration_invariant.test.ts` re-asserting: `createPlayList`/`deletePlayList`/`updatePlaylist` invoke the transport primitive **exactly once** (no retry) on a transient error; `getArtists`/reads may retry once; `stream` returns the same `{status, headers, stream}` shape.
-  - Failing first:
-    ```bash
-    npx jest tests/subsonic_orchestration_imports.test.ts
-    ```
-    Expected before: `FAIL`. Atomic commit: `git commit -m "test(plan-f): assert orchestration import paths + invariants"`.
+- [ ] **Step 4: Run green/artifact gates and commit.** Run `npx jest tests/subsonic_image_fetch_facade.test.ts tests/cache_facade.test.ts tests/swr_cache.test.ts tests/swr_cache_file_store.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`; safe-sweep and record f3 evidence; commit `refactor(plan-f): extract artwork safety and cache facades`.
 
-- [ ] **F.6.2 — Move orchestration; delegate from `Subsonic`; keep behavior.** Gate:
-    ```bash
-    npx jest tests/subsonic_orchestration_imports.test.ts tests/subsonic_orchestration_invariant.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, golden baseline unchanged. Atomic commit: `git commit -m "refactor(plan-f): extract subsonic browse/query/stream orchestration"`.
+### Task F.4: Extract SMAPI presentation and authentication helpers
 
-- [ ] **F.6.3 — Full suite + safe sweep + candidate evidence + exact-master artifact.** Atomic commit accordingly.
+**Files:**
+- Create: `src/smapi/presentation.ts`
+- Create: `src/smapi/auth_helpers.ts`
+- Modify: `src/smapi.ts:78-186,293-505`
+- Create: `tests/smapi_presentation_facade.test.ts`
+- Create: `tests/smapi_auth_helpers_facade.test.ts`
+- Create: `docs/superpowers/evidence/plan-f/f4-smapi.json`
 
----
+**Interfaces:**
+- `presentation.ts` produces `ratingAsInt`, `ratingFromInt`, `getMetadataResult`, `searchResult`, `coverArtURI`, `iconArtURI`, `album`, `track`, `artist`, `splitId`, and `withSplitId`.
+- `auth_helpers.ts` produces `LoginToken`, `Credentials`, `SoapyHeaders`, and `findLoginToken`.
+- `bindSmapiSoapServiceToExpress` stays the default export of `src/smapi.ts`; old named imports remain valid.
 
-## Slice F.7 — Final consolidation, de-duplication audit, and new field-stability cycle
+- [ ] **Step 1: Write red facade and raw-contract tests.** Import `getMetadataResult` and `findLoginToken` from new and old paths; assert the same metadata and token results, then run the Plan-D raw SOAP fixture tests. Run `npx jest tests/smapi_presentation_facade.test.ts tests/smapi_auth_helpers_facade.test.ts tests/smapi.test.ts -t "#214|#297" --runInBand`. Expected: FAIL because both modules are absent.
 
-- [ ] **F.7.1 — Facade de-duplication audit.**
-  - [ ] For each temporary re-export facade, grep consumers: if no consumer imports from the old path, the facade may be removed; otherwise it stays as the stable public surface. Do **not** force-remove a facade and break a consumer.
-  - Gate:
-    ```bash
-    rg -n "from \"\.\./src/subsonic\"|from \"\.\./src/smapi\"" tests/ src/
-    ```
-    Expected: every remaining old-path import is intentional (facade kept) or migrated.
-  - Atomic commit: `git commit -m "refactor(plan-f): facade de-duplication audit"`.
+- [ ] **Step 2: Move presentation helpers.** Transfer exactly the named pure mapping types/functions into `presentation.ts` and re-export them from `smapi.ts`; do not change serialized fields, SOAP faults, URLs, or XML sanitization.
 
-- [ ] **F.7.2 — Final golden-contract equality proof.**
-  - [ ] Re-run `tests/golden_baseline.test.ts` (F.0.2): every hash must still equal the F.0.2 baseline. Any drift is a release blocker (behavior changed during a "behavior-preserving" plan).
-  - Gate:
-    ```bash
-    npx jest tests/golden_baseline.test.ts && npx jest
-    ```
-    Expected: `PASS`, full suite green, baseline identical.
-  - Atomic commit: `git commit -m "test(plan-f): final golden-contract equality proof"`.
+- [ ] **Step 3: Move authentication helpers.** Transfer exactly the named token/header helpers into `auth_helpers.ts`, re-export them, and retain `bindSmapiSoapServiceToExpress` orchestration in `smapi.ts`.
 
-- [ ] **F.7.3 — Start a new field-stability cycle before further extraction.**
-  - [ ] Record that the post-Plan-F digest must complete a fresh seven-day field-stability cycle (criterion 23) before any **further** extraction is permitted (spec §5.4: "a new field-stability cycle before further extraction").
-  - Atomic commit: `git commit -m "docs(plan-f): require new seven-day field-stability cycle before further extraction"`.
+- [ ] **Step 4: Run green/artifact gates and commit.** Run `npx jest tests/smapi_presentation_facade.test.ts tests/smapi_auth_helpers_facade.test.ts tests/smapi.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`; safe-sweep and record f4 evidence; commit `refactor(plan-f): extract smapi presentation and auth helper facades`.
 
----
+### Task F.5: Extract browse/query orchestration and streaming adapter
 
-## Plan F exit checklist (spec §1.1 row F, §5.4)
+**Files:**
+- Create: `src/subsonic/orchestration.ts`
+- Create: `src/subsonic/streaming.ts`
+- Modify: `src/subsonic.ts:1048-1718`
+- Create: `tests/subsonic_orchestration_facade.test.ts`
+- Create: `tests/subsonic_streaming_facade.test.ts`
+- Create: `docs/superpowers/evidence/plan-f/f5-orchestration-streaming.json`
 
-- [ ] Seven-day field-stability threshold met before any extraction (criterion 23).
-- [ ] Golden SOAP/HTTP fixtures and full unit suite unchanged and green across every slice.
-- [ ] Safe SMAPI sweep green on the disposable candidate for each slice.
-- [ ] Each slice produced its own exact-`master` artifact/digest (criterion 8).
-- [ ] Protocol serialization, authentication, transport/retry, image fetch/SSRF, SMAPI presentation, and browse/query/stream orchestration are separated behind existing interfaces.
-- [ ] No slice mixed a refactor with a dependency change, protocol behavior change, or live promotion.
-- [ ] A new field-stability cycle is required before further extraction.
+**Interfaces:**
+- `orchestration.ts` produces the browse/query operations used by `Subsonic`: artists, albums, tracks, search, genres, favourites, playlists, radio, and OpenSubsonic extensions.
+- `streaming.ts` produces the existing stream operation returning `{ status: number; headers: Record<string, string>; stream: NodeJS.ReadableStream }`.
+- `Subsonic` public methods and all existing import paths remain unchanged.
 
-## Adversarial-review focus for Plan F (report to Codex)
+- [ ] **Step 1: Write red delegation/invariant tests.** Assert `Subsonic` delegates read methods to orchestration, playlist create/delete/update issue exactly one request after a transient failure, and stream preserves status/headers/body shape. Run `npx jest tests/subsonic_orchestration_facade.test.ts tests/subsonic_streaming_facade.test.ts --runInBand`. Expected: FAIL because modules/delegates are absent.
 
-- Any slice that changes a public behavior, response byte, fault code, cache format, or URL shape (§5.4 violation) — caught by F.0.2/F.7.2 golden drift.
-- Any slice that bundles a dependency bump or protocol fix (§1.1 violation).
-- Any retry-policy drift in F.3/F.6 (mutation retried, 4xx retried) — caught by the invariant tests.
-- Any SSRF allowlist weakening in F.4 — caught by the SSRF-invariant test.
-- Any facade removal that breaks a consumer (F.7.1).
-- Any extraction begun before the seven-day threshold (F.0.1 hard gate).
-- Any slice that reuses an earlier-SHA artifact/digest (criterion 8).
+- [ ] **Step 2: Extract reads and mutations.** Move browse/query methods into an injected orchestration dependency; preserve every input/output type, keep reads on bounded retry, and keep create/delete/update non-retried.
+
+- [ ] **Step 3: Extract stream adapter.** Move only stream request/response shaping into `streaming.ts`; preserve HEAD/range behavior, token authorization, now-playing rules, and downstream close cleanup.
+
+- [ ] **Step 4: Run green/artifact gates and commit.** Run `npx jest tests/subsonic_orchestration_facade.test.ts tests/subsonic_streaming_facade.test.ts tests/server.test.ts -t "HEAD" tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`; safe-sweep and record f5 evidence; commit `refactor(plan-f): extract subsonic orchestration and streaming adapters`.
+
+### Task F.6: Final proof and new field-stability cycle
+
+**Files:**
+- Create: `docs/superpowers/evidence/plan-f/closeout.json`
+- Create: `tests/plan_f_closeout.test.ts`
+- Create: `docs/superpowers/evidence/2026-07-23-plan-f-next-stability.md`
+
+**Interfaces:**
+- Consumes all five `ExtractionEvidence` records and the F.0 golden hash.
+- Produces closeout with all slice evidence, unchanged hash, a final exact-master candidate digest, and a statement that further extraction is blocked pending a new seven-day cycle.
+
+- [ ] **Step 1: Write the failing closeout test.** Require f1–f5 evidence, one current source SHA/digest relationship per slice, exact golden-tree hash equality, full-suite/safe-sweep zero exits, and review references. Run `npx jest tests/plan_f_closeout.test.ts --runInBand`. Expected: FAIL because closeout is absent.
+
+- [ ] **Step 2: Produce final candidate proof.** From exact current `master`, run `npm run build`, `npx jest --runInBand`, and the Plan-C safe sweep; record the real final digest and all review references. Do not promote it in this plan.
+
+- [ ] **Step 3: Start, but do not satisfy, the next stability requirement.** Record the final digest and a zero-day start in `2026-07-23-plan-f-next-stability.md`; state that no further extraction may start until a new seven-day same-digest evidence record passes the F.0 gate.
+
+- [ ] **Step 4: Verify and commit.** Run `npx jest tests/plan_f_closeout.test.ts tests/plan_f_golden_tree.test.ts --runInBand && npx jest --runInBand`. Expected: PASS. Commit `docs(plan-f): close extraction evidence and require new stability cycle`.
+
+## Exit checks
+
+- [ ] F.0 passed before any source extraction; otherwise Plan F remains hard-blocked.
+- [ ] Serialization, authentication, transport, artwork/SSRF, caching, SMAPI presentation/auth, browse/query orchestration, and streaming are separated behind backward-compatible interfaces.
+- [ ] Golden corpus, raw SOAP/HTTP contracts, full suite, and safe sweep remain unchanged and green for every slice.
+- [ ] No slice contains a dependency upgrade, protocol behavior change, or production promotion.
+- [ ] The final digest has a new required seven-day stability cycle before further extraction.
