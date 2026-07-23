@@ -6,7 +6,20 @@
 
 **Architecture:** A human operator performs an out-of-band fail-closed GitHub freeze (Actions disabled, every GHCR/Docker Hub writer and automation credential inventoried and revoked) and records a freeze record outside the repo. On `perf/artist-list-cache`, a single safety commit removes all `simojenki/*` and Docker Hub publication, points every future image target at `ghcr.io/richertunes/bonob`, splits read-only PR validation from trusted publication, pins Actions by SHA, and adds a master-only manual `workflow_dispatch` validator that binds `master`, the event SHA, checked-out `HEAD`, and the executing workflow blob. After local gates pass, `master` is advanced with `--ff-only` and the validator runs once against the exact integrated SHA.
 
-**Tech Stack:** GitHub Actions (workflow YAML, `actions/checkout@<sha>`), Git linear history (`--ff-only`), `git log`/`git rev-parse` for SHA/blob ancestry checks, Jest for the redaction-gate test, Node 22 / TypeScript.
+**Tech Stack:** GitHub Actions (workflow YAML, immutable full-SHA action references), Git linear history (`--ff-only`), `git log`/`git rev-parse` for SHA/blob ancestry checks, Jest for the redaction-gate test, Node 22 / TypeScript.
+
+## Global Constraints
+
+- **Approval (design §12.1):** The user and architect approve this design before Plan A implementation.
+- **Freeze (design §12.2):** Before safety work is pushed, every queued/running job is cancelled or drained, Actions is disabled, all direct/inherited GHCR/Docker Hub writer/admin permissions and automation credentials are inventoried and revoked, freeze evidence is retained, and no artifact is published.
+- **Plan-A workflow binding (design §12.3):** Plan A is read-only with `persist-credentials: false`. Its master-only manual dispatch proves event/ref/SHA, requested SHA, checked-out `HEAD`, remote `master`, and executing/requested workflow-blob equality. Negative branch/tag/ref/event-SHA/HEAD/workflow-blob tests pass. Active templates/operator docs reject `simojenki/*`, Docker Hub, `latest`, and predictable secrets.
+- **Lineage (design §12.4):** Historical lineage before this amendment is proven 51 commits ahead of `68a73b9`: 48 pre-spec commits through `4db3d75`, then `af60e93`, `5a83fb4`, and `5349e5f`. After final approval, the latest commit touching this specification path is dynamically recorded as `DESIGN_SHA` with file hash; it equals the approval record and is an ancestor of both safety and `master`. Any later path change invalidates approval.
+- **Redaction (design §12.24):** Plan A records redaction policy version/hash and known-clean baseline commit/hash. Full-file and baseline-diff gates pass for every public update; attestations retain only content/diff/policy/baseline hashes and outcome, with zero private operational identifier.
+- **Independent review (design §12.25):** An independent adversarial/architectural re-review approves the final branch and fresh evidence set.
+
+## Required Task Cadence
+
+Every numbered task below is executed as a 2–5 minute action: first run its stated red command and record the expected non-zero exit, then make exactly the stated change, run the stated green command and require exit `0`, run the Plan-A redaction gate, and create the task's stated atomic commit. For an out-of-band or git-only gate, the red command is its rejected-precondition command and the green evidence is recorded in the adjacent evidence-file commit; never create an empty commit merely to satisfy this cadence.
 
 ---
 
@@ -51,7 +64,7 @@ Run `git rev-parse HEAD` at start. It MUST equal the value below; if it does not
 - **Modify:** `package.json` — `repository` -> `https://github.com/RicherTunes/bonob`.
 - **Modify:** `README.md` — replace `docker.io/simojenki/bonob`, `ghcr.io/simojenki/bonob`, `simojenki/bonob:latest` with RicherTunes guidance; reject `latest` and predictable `BNB_SECRET`.
 - **Modify:** `docs/sonos-s1-setup.md` — replace `simojenki/bonob` references with RicherTunes image guidance.
-- **Modify:** `etc/docker-compose.yaml` — replace `simojenki/bonob:latest` with `ghcr.io/richertunes/bonob:sha-<40hex>` guidance and a non-predictable `BNB_SECRET` note.
+- **Modify:** `etc/docker-compose.yaml` — remove the obsolete `simojenki/bonob:latest` example, require an approved immutable GHCR reference from Plan-B release evidence, and replace the predictable `BNB_SECRET` example.
 
 > **Out-of-band (operator, not a code step):** disabling GitHub Actions, revoking writers/credentials, and producing the freeze record are manual GitHub/web actions outside this repository. They are Task A.1 prerequisites and are recorded in `docs/superpowers/plans/freeze-record.md`; this plan edits no GitHub setting programmatically.
 
@@ -84,26 +97,26 @@ git merge-base --is-ancestor 3d45ad2 HEAD ; echo "exit=$?"
 ```
 Expected: on `perf/artist-list-cache`; `3d45ad2` is an ancestor (exit `0`). If the branch has diverged, stop — report `needs_parent`.
 
-- [ ] **A.0.3 — Create the freeze-record template (documentation only).**
+- [ ] **A.0.3 — Create the freeze record from validated private-evidence identifiers (documentation only).**
 
-Create `docs/superpowers/plans/freeze-record.md` with the structure the operator fills out-of-band (names only, never values):
-```markdown
+The private evidence bundle must exist before this command. It must contain no credential value and its SHA-256 must be supplied by the operator's approved evidence system. Generate, validate, and persist the public-safe record with this complete command:
+```bash
+set -euo pipefail
+FREEZE_AT_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+FREEZE_EVIDENCE_SHA256="$(approved-freeze-evidence sha256 --repository RicherTunes/bonob)"
+test -n "${FREEZE_AT_UTC}"
+printf '%s' "${FREEZE_EVIDENCE_SHA256}" | grep -Eq '^[0-9a-f]{64}$' || { echo "freeze evidence hash must be 64 lowercase hex" >&2; exit 1; }
+cat > docs/superpowers/plans/freeze-record.md <<EOF
 # Publication freeze record (Plan A)
 
-- **Frozen at (UTC):** <operator fills, e.g. 2026-07-23T20:00:00Z>
-- **Actor (GitHub handle):** <operator fills>
-- **Actions state:** disabled for RicherTunes/bonob
-- **Queued/running jobs:** drained; none active
-- **Writers/admins revoked (names, not values):**
-  - GHCR package `ghcr.io/richertunes/bonob` writers/admins: <list or "none">
-  - Docker Hub namespace authority: revoked
-  - Repository, org, team, inherited package perms: <exports referenced, not embedded>
-  - Actions/environment secrets: <names>
-  - PATs: <names>
-  - Deploy keys: <names>
-  - GitHub Apps / OIDC trust / external bots: <names>
-- **Actions defaults after re-enable:** read-only (`contents: read`); package write unavailable
-- **Evidence retained at:** <private operator location outside the repo>
+- **Frozen at (UTC):** ${FREEZE_AT_UTC}
+- **Repository:** RicherTunes/bonob
+- **Actions state:** disabled; queued and running jobs drained
+- **Publication authority:** GHCR, Docker Hub, repository, organization, team, inherited package permissions, Actions/environment secrets, PATs, deploy keys, GitHub Apps, OIDC trusts, and external bots inventoried and revoked
+- **Actions defaults after re-enable:** `contents: read`; package write unavailable
+- **Private evidence SHA-256:** ${FREEZE_EVIDENCE_SHA256}
+- **Evidence location:** retained only in the approved private evidence system; no operational identifier or credential is stored in this repository
+EOF
 ```
 Atomic commit: `git add docs/superpowers/plans/freeze-record.md && git commit -m "docs(plan-a): add publication freeze record template"`.
 
@@ -326,10 +339,10 @@ jobs:
       contents: read
     steps:
       - name: Check out the repo (no credential persistence)
-        uses: actions/checkout@<PINNED_SHA>
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: actions/setup-node@<PINNED_SHA>
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - run: npm ci
@@ -345,20 +358,20 @@ jobs:
       contents: read
     steps:
       - name: Check out the repo (no credential persistence)
-        uses: actions/checkout@<PINNED_SHA>
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@<PINNED_SHA>
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
       - name: Build image only (push disabled)
-        uses: docker/build-push-action@<PINNED_SHA>
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           platforms: linux/amd64
           push: false
           load: true
 ```
-`<PINNED_SHA>` is replaced in A.3.4 with the exact reviewed full commit SHA of each action (fetched by the operator from the action's release tags; this plan does not fetch them — see A.3.4). Until pinned, the grep below still matches the placeholder and the step is not done.
+The immutable commits are recorded inline and are re-verified against the named release tags in A.3.4 before they are committed. A mismatch fails closed; no action reference is substituted.
 
 - [ ] **A.3.2 — Remove Docker Hub login/push, QEMU multi-arch, and `simojenki` metadata.**
 
@@ -372,17 +385,24 @@ grep -nE 'simojenki|DOCKERHUB|docker\.io|login-action|build-push-action.*push|gh
 ```
 Expected: **no matches** (exit code 1 from grep). Before the change this printed the matches from A.1.3.
 
-- [ ] **A.3.4 — Pin Actions by exact SHA (replace placeholders).**
+- [ ] **A.3.4 — Verify the reviewed action lock before commit.**
 
-For each `<PINNED_SHA>` in `ci.yml`, the operator fills the reviewed full 40-char commit SHA of: `actions/checkout`, `actions/setup-node`, `docker/setup-buildx-action`, `docker/build-push-action` (spec §3.2: "pin third-party GitHub Actions to reviewed full commit SHAs"). Example final form:
-```yaml
-uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-```
-Gate (no placeholder remains):
+Run this complete comparison. It resolves each release tag from its canonical Git repository, validates a full lowercase 40-hex object ID, and fails unless it equals the immutable value already used by the workflow:
 ```bash
-grep -nE '<PINNED_SHA>|@v[0-9]|@master|@main' .github/workflows/ci.yml
+set -euo pipefail
+verify_action() {
+  repository="$1"; tag="$2"; expected="$3"
+  actual="$(git ls-remote "https://github.com/${repository}.git" "refs/tags/${tag}" | awk 'NR==1 { print $1 }')"
+  printf '%s' "${actual}" | grep -Eq '^[0-9a-f]{40}$' || { echo "unresolvable action tag: ${repository}@${tag}" >&2; exit 1; }
+  test "${actual}" = "${expected}" || { echo "action lock mismatch: ${repository}@${tag}" >&2; exit 1; }
+}
+verify_action actions/checkout v4.2.2 11bd71901bbe5b1630ceea73d27597364c9af683
+verify_action actions/setup-node v4.4.0 49933ea5288caeca8642d1e84afbd3f7d6820020
+verify_action docker/setup-buildx-action v3.11.1 e468171a9de216ec08956ac3ada2f0791b6bd435
+verify_action docker/build-push-action v6.18.0 263435318d21b8e681c14492fe198d362a7d2c83
+rg -n '@(v[0-9]|main|master)|\\x3c[A-Z_][A-Z0-9_]*>' .github/workflows/ci.yml && exit 1 || true
 ```
-Expected: **no matches**. (Floating tags and the literal placeholder are both forbidden.)
+Expected: the four `verify_action` calls exit `0`; the final grep prints nothing and exits `0` through the explicit `|| true` branch.
 
 - [ ] **A.3.5 — Fix the Dockerfile `.git` copy and source label.**
 
@@ -477,43 +497,39 @@ Goal: active docs/templates reject `simojenki/*`, Docker Hub, `latest`, and pred
 
 - [ ] **A.4.1 — Replace `README.md` image references.**
 
-Replace the "Running bonob" block (`README.md:30-44`) so it reads:
+Replace the "Running bonob" block (`README.md:30-44`) so it reads. Plan A deliberately gives no pull command because this plan publishes no image; the exact immutable reference is introduced only by Plan B's release manifest:
 ```markdown
 ## Running bonob
 
-bonob is published by RicherTunes as a private OCI image to the GitHub Container Registry.
+RicherTunes does not publish an image during Plan A. Do not use Docker Hub, `simojenki/bonob`, `latest`, or a floating tag.
 
-> The public Docker Hub image `simojenki/bonob` and the `latest` tag are **not** supported by the RicherTunes fork. Always pull a pinned digest, for example `ghcr.io/richertunes/bonob@sha256:<manifest-digest>` or `ghcr.io/richertunes/bonob:sha-<40 lowercase hex>`.
-
-```bash
-docker run ghcr.io/richertunes/bonob:sha-<40 lowercase hex>
-```
+> After Plan B, use only the exact immutable GHCR digest recorded in the approved release manifest. A digest is not guessed, abbreviated, or substituted.
 
 tag | description
 --- | ---
-sha-<40 hex> | Immutable build from an exact commit (supported). `latest` and floating tags are not published.
+No Plan-A image | Publication is disabled. `latest` and floating tags are never published.
 ```
 
 - [ ] **A.4.2 — Replace `docs/sonos-s1-setup.md` image references.**
 
-Replace every `simojenki/bonob` occurrence with `ghcr.io/richertunes/bonob:sha-<40 lowercase hex>` and add a one-line note near the first occurrence: `# Do not use simojenki/bonob or the latest tag; pull a pinned RicherTunes digest.`
+Replace every `simojenki/bonob` occurrence with the following exact explanatory text, and add it near the first command: `# Plan A publishes no image. After Plan B, use only the exact immutable GHCR digest from approved release evidence; never use Docker Hub, simojenki/bonob, latest, or a floating tag.` Do not add a fabricated GHCR image reference to an S1 command while publication is disabled.
 
 - [ ] **A.4.3 — Replace the compose example `BNB_SECRET`.**
 
-In `etc/docker-compose.yaml`, change line 19 image to `ghcr.io/richertunes/bonob:sha-<40 lowercase hex>` and replace the predictable secret:
+In `etc/docker-compose.yaml`, remove the obsolete image value and make the compose file fail closed until an approved immutable image digest is injected by the private deployment process. Replace the predictable secret:
 ```yaml
   bonob:
-    image: ghcr.io/richertunes/bonob:sha-<40 lowercase hex>
+    image: ${BONOB_IMAGE_DIGEST:?set this only to the approved exact ghcr.io/richertunes/bonob@sha256 digest from Plan-B release evidence}
     # ...
     environment:
-      BNB_SECRET: ${BNB_SECRET}  # long random value from a gitignored root-readable file; never "changeme"
+      BNB_SECRET: ${BNB_SECRET:?provide a long random secret from a gitignored root-readable file; never changeme}
 ```
 
 - [ ] **A.4.4 — Gates.**
 
 Run:
 ```bash
-grep -rnE 'simojenki|docker\.io/simojenki|BNB_SECRET: changeme|bonob:latest' README.md docs/sonos-s1-setup.md etc/docker-compose.yaml
+grep -rnE 'simojenki|docker\.io/simojenki|BNB_SECRET: changeme|bonob:latest|sha-<|@sha256:<' README.md docs/sonos-s1-setup.md etc/docker-compose.yaml
 ```
 Expected: **no matches**. Then the redaction gate:
 ```bash
@@ -580,7 +596,7 @@ jobs:
           test "${{ inputs.sha }}" = "${REMOTE_MASTER}" || { echo "::error::requested != remote master"; exit 1; }
 
       - name: Checkout exactly the requested SHA (no credential persistence)
-        uses: actions/checkout@<PINNED_SHA>
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ inputs.sha }}
           persist-credentials: false
@@ -605,7 +621,7 @@ jobs:
           echo "workflow_blob_sha256=${STORED_BLOB}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run the local gates on the exact SHA (no publication)
-        uses: actions/setup-node@<PINNED_SHA>
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
       - run: npm ci
@@ -613,16 +629,16 @@ jobs:
       - run: npm test
       - run: npm audit --omit=dev
       - name: Build image only (push never available here)
-        uses: docker/build-push-action@<PINNED_SHA>
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           platforms: linux/amd64
           push: false
           load: true
 ```
-Replace each `<PINNED_SHA>` with the exact reviewed commit SHA (same SHAs chosen in A.3.4). Gate (no placeholder, no push:true, no login):
+The three immutable action commits are the verified lock from A.3.4. Gate (no floating reference, no push:true, no login):
 ```bash
-grep -nE '<PINNED_SHA>|push: true|login-action|packages: write' .github/workflows/validate-master.yml
+rg -n '@(v[0-9]|main|master)|\\x3c[A-Z_][A-Z0-9_]*>|push: true|login-action|packages: write' .github/workflows/validate-master.yml
 ```
 Expected: **no matches**.
 
@@ -760,7 +776,7 @@ gh workflow run validate-master.yml --ref master -f sha="${INTEGRATED}"
 gh run watch
 gh run view --log | grep -E 'workflow_blob_sha256|requested=|stored_blob='
 ```
-Expected: run reaches `success`; the summary prints `workflow_blob_sha256=<64 hex>` and the requested/event/remote/HEAD SHAs are all equal.
+Expected: run reaches `success`; the summary prints `workflow_blob_sha256=` followed by 64 lowercase hexadecimal characters, and the requested/event/remote/HEAD SHAs are all equal.
 
 - [ ] **A.7.3 — Negative-case coverage (spec §3.1).**
 
@@ -804,7 +820,7 @@ Using A.2 hashes, record (in the private freeze record, or a public attestation 
 ## Adversarial-review focus for Plan A (report to Codex)
 
 - Any residual `simojenki`, Docker Hub, `latest`, `DOCKERHUB_*`, or `packages: write` anywhere under `.github/`, `Dockerfile`, or docs.
-- Any `<PINNED_SHA>` placeholder left in `ci.yml` or `validate-master.yml`, or any floating action tag (`@v*`, `@main`).
+- Any non-immutable action reference in `ci.yml` or `validate-master.yml`, including a floating tag (`@v*`, `@main`, or `@master`).
 - `COPY .git` or any `.git`/credential/operator path still reachable by the Docker build.
 - A `validate-master` job that can publish, login, or run on push/PR.
 - `master` advanced by anything other than `--ff-only`, or `DESIGN_SHA` not an ancestor of the integrated SHA.
@@ -818,3 +834,12 @@ Using A.2 hashes, record (in the private freeze record, or a public attestation 
 | 3 (read-only workflow, exact SHA/ref/HEAD + executing-workflow-blob binding, negatives) | A.3.1, A.5, A.7.2, A.7.3 |
 | 24 (redaction policy version/hash, baseline, full-file + diff gates, hash-only attestation) | A.2, A.3.9, A.4.4, A.7.5 |
 | Non-goals §11 (no Docker Hub, no `latest`, no non-amd64, no upstream PR) | A.3, A.4 |
+
+## Interface/type-consistency map
+
+| Producer | Exact value contract | Consumer | Enforcement |
+|---|---|---|---|
+| A.0 | `DESIGN_SHA`: lowercase 40-hex Git commit; spec blob: lowercase 40-hex Git object | A.6 ancestry gate | `git merge-base --is-ancestor` and `git hash-object` |
+| A.0/A.1 | `freeze-record.md`: UTC timestamp plus 64-lowercase-hex private-evidence hash; no credential or operational identifier | A.7 attestation | shell regex validation before record creation |
+| A.3.4 | action reference: immutable lowercase 40-hex Git object | A.3.1 and A.5.1 workflow `uses:` lines | canonical tag comparison and no-floating-reference gate |
+| A.5.1 | `inputs.sha`, `github.sha`, `REMOTE_MASTER`, and checked-out `HEAD`: the same lowercase 40-hex commit; workflow blob digest: lowercase 64-hex SHA-256 | A.7 dispatch/evidence | regex plus exact `test` equality checks |
