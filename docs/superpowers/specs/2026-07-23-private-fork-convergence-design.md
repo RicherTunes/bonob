@@ -1,6 +1,6 @@
 # RicherTunes bonob private-fork convergence design
 
-**Status:** Awaiting adversarial re-review
+**Status:** Awaiting re-review
 
 **Date:** 2026-07-23
 
@@ -44,7 +44,8 @@ Plan C's graceful-shutdown and attribution/redaction gates are prerequisites for
 
 - RicherTunes `master` is upstream bonob `v0.12.0` at `68a73b9`.
 - The pre-spec stack is exactly 48 linear commits after `68a73b9` and ends at `4db3d75`.
-- The documentation-only commit that adds this specification follows `4db3d75`; therefore the branch is 49 commits ahead of `master` before safety work begins. The design does not depend on that documentation commit's hash.
+- The design history then contains `af60e93` and its non-amending correction `5a83fb4`; immediately before the amendment containing this text, the branch is exactly 50 commits ahead of `68a73b9`.
+- Counts are historical context, not the safety gate. After adversarial approval, Plan A discovers `DESIGN_SHA` with `git log -1 --format=%H -- docs/superpowers/specs/2026-07-23-private-fork-convergence-design.md`, records that exact SHA and file hash in the approval, and requires it to be an ancestor of both the safety commit and final `master`. Any later modification of this path invalidates the approval and requires another adversarial review before safety work.
 - The stack contains the S2 authentication fixes, large-library browse/index work, XML sanitization, artwork and SSRF hardening, token scoping, cache persistence, timeout/retry behavior, and supporting tests already exercised on the VPS.
 - Existing CI is unsafe for this fork: its publishing job targets `simojenki/bonob` on Docker Hub and GHCR. This must be corrected before `master` moves.
 - Old feature and experiment branches are not an integration queue. Superseded branches are omitted. A dependency branch, including an Axios bump, is re-evaluated against the converged lockfile and current audit output rather than blindly cherry-picked.
@@ -82,6 +83,10 @@ The previous 189-section SMAPI sweep cannot currently be repeated because its ex
 
 These two gaps—safe repeatable authentication and redacted upstream attribution—are repaired before heavy live testing.
 
+### 2.4 Public redaction gate
+
+Every change to this public specification or public evidence runs a nonwaivable full-file and diff-aware redaction/secret scan before commit or publication. The versioned deny policy rejects exact hostnames, IP addresses, service/container/network names, host/VPS paths, credential locations or values, and other topology identifiers. Operator inventories and raw evidence remain outside the repository. The public attestation records only content/diff/policy hashes and pass/fail outcome; it never records matched values. A finding fails the gate and is remediated privately before rescanning.
+
 ## 3. Branch convergence and repository ownership
 
 ### 3.1 Fail-closed repository freeze
@@ -104,8 +109,10 @@ The first implementation commit is made on `perf/artist-list-cache`, before `mas
 - exclude `.git`, `.git/credentials`, `.env*`, credential/secret files, operator inventories, and build outputs from the Docker build context;
 - use deterministic dependency installation from the committed lockfile;
 - run type compilation, the complete test suite, production dependency audit, container build, and a non-secret container smoke check before publication;
-- correct active RicherTunes repository/image metadata and remove examples that use a predictable `BNB_SECRET`;
+- correct active RicherTunes repository/image metadata; make active templates/operator documentation reject `simojenki/*`, Docker Hub, `latest`, and predictable `BNB_SECRET` examples;
 - emit OCI source, revision, and creation labels that bind an image to its exact commit.
+
+The Docker input is not the repository root. A version-controlled closed allowlist generates a deterministic context from the clean exact-SHA checkout and fails on any required but unlisted file. It emits a sorted listing of normalized relative path, mode, size, and content hash plus a deterministic archive hash. A local prohibited-path and secret scan of that generated context must pass before any remote builder, registry, or cache is contacted; failures produce no remote access. The builder receives only the scanned archive. `.git`, `.git/credentials`, operator files, credentials, and any non-allowlisted path cannot enter the context.
 
 The safety commit is reviewed and all local gates pass on `perf/artist-list-cache`. Only then is `master` fast-forwarded with `--ff-only`. No squash, merge commit, rebase, or force-push is used, preserving the reviewed linear history. Plan A ends only after the non-publishing dispatch validates the exact integrated `master` SHA; every registry writer remains revoked until Plan B establishes the protected publisher.
 
@@ -131,6 +138,8 @@ ghcr.io/richertunes/bonob@sha256:<manifest-digest>
 ```
 
 Plan B builds exactly once from the validated `master` SHA into a checksummed OCI layout/archive. Source tests run from that checkout; image smoke tests, SBOM generation, and image scans run against that exact manifest. The workflow pushes the same retained bytes without rebuilding, then verifies the registry manifest digest and OCI revision against the local artifact and source SHA. Dockerfile base images are pinned by digest. Blanket or nondeterministic `apt upgrade` is prohibited; any OS package install uses a recorded snapshot/index identity and pinned package versions.
+
+The Plan B publisher accepts only a full SHA that equals the remote `master` ref at dispatch. It re-fetches and requires `master == requested SHA` immediately before protected-environment publication and again after registry digest/revision verification. A pre-push mismatch aborts without publication. A post-push mismatch fails and quarantines the artifact from deployment pending a fresh exact-master run and recorded disposition.
 
 Build caches are private, trusted-branch-only, scoped by destination SHA and build-definition/lockfile hashes, and never restored from or written by an untrusted pull request. Secrets never enter build arguments, environment, layers, cache mounts, metadata, or intermediate stages. Exported caches and intermediates are treated as sensitive artifacts, access-controlled, retained for a bounded period, and included in secret/provenance scanning before reuse.
 
@@ -221,7 +230,7 @@ A sweep is not started while an index refresh is in progress. The harness aborts
 
 ### 7.1 Isolated candidate
 
-Each candidate runs on a new loopback port and Docker project name, using the exact GHCR digest intended for production. It uses unique service/network aliases on a dedicated candidate network and reaches Navidrome only through a dedicated egress attachment/proxy; it does not join the production Bonob ingress network. Captured Docker network inspection and in-container DNS results must prove candidate aliases resolve only candidate endpoints. A corresponding edge-proxy lookup and network inspection must prove the production Bonob upstream resolves only the production container. It never mounts the production Bonob cache read-write.
+Each candidate runs on a new loopback port and Docker project name, using the exact GHCR digest intended for production. It uses unique aliases on an internal dedicated network, does not join production networks, and has no direct external route. Enforceable network policy permits egress only to a dedicated proxy/resolver; that proxy allowlists exact approved schemes/hosts/ports, denies the production public-origin DNS names and resolved IPv4/IPv6 addresses with higher priority, and denies every unapproved destination. Negative tests must fail for production hostname, resolved production IP, direct IPv4/IPv6, alternate port, unapproved host, external DNS, and proxy-bypass attempts before the harness can run. Hashed network-policy/DNS/test evidence proves the candidate aliases resolve only candidate endpoints and the edge proxy still resolves its Bonob upstream only to production. The candidate never mounts the production cache read-write.
 
 Two candidate runs are required:
 
@@ -272,7 +281,7 @@ On any failed post-promotion gate, unexpected 401/429/5xx increase, cache incomp
 
 1. stop new test traffic;
 2. restore the previous digest and its secret-compatible compose configuration;
-3. restore the previous cache state if the new process changed it incompatibly;
+3. restore the hashed prior cache snapshot. This copy may be skipped only when a recorded pre-rollback equality proof shows that every current file and tree hash, envelope/schema result, ownership, and mode exactly equals the saved prior snapshot; any mismatch, missing value, unreadable file, or validation failure requires restoration;
 4. recreate Bonob, verify `/`, `/about`, SMAPI, cache load, and a physical browse/play;
 5. preserve redacted candidate logs and the failed release manifest for diagnosis.
 
@@ -320,29 +329,30 @@ Model output is never treated as verification. Each change requires executable t
 
 ## 12. Acceptance criteria
 
-Every criterion below is required. Repository freeze/credential revocation, CI credential containment, exact-artifact provenance/audit/scan, registry writer/immutability/privacy, root-only smoke credentials, lifecycle/shutdown, candidate-production isolation/sentinel, cache integrity, error/soak thresholds, verified backup/restore, explicit deployment approval, and rollback are core safety gates and cannot be waived or marked not applicable. A non-core criterion may be marked not applicable only when its reason and scope are recorded and both the user and architect approve before execution.
+Every criterion below is required. Repository freeze/credential revocation, CI/build-context credential containment, exact-artifact provenance/audit/scan, registry writer/immutability/privacy, root-only smoke credentials, lifecycle/shutdown, candidate-production isolation/sentinel, cache integrity, public redaction, error/soak thresholds, verified backup/restore, explicit deployment approval, and rollback are core safety gates and cannot be waived or marked not applicable. A non-core criterion may be marked not applicable only when its reason and scope are recorded and both the user and architect approve before execution.
 
 1. The user and architect approve this design before Plan A implementation.
 2. Before safety work is pushed, every queued/running job is cancelled or drained, Actions is disabled, all direct/inherited GHCR/Docker Hub writer/admin permissions and automation credentials are inventoried and revoked, freeze evidence is retained, and no artifact is published.
-3. Plan A has read-only permissions, `persist-credentials: false`, build-context credential exclusions, and a non-publishing `workflow_dispatch` that proves its full-SHA input equals integrated `master` and checked-out `HEAD`. It passes before Plan B creates a protected publisher.
-4. Before safety work, the branch is proven 49 commits ahead of `68a73b9`: 48 pre-spec commits ending at `4db3d75` plus the commit that added this path. `master` fast-forwards through both and the safety commit; ancestry checks for `4db3d75` and the specification commit discovered from this path succeed.
-5. Plan B pins bases by digest, performs no nondeterministic OS upgrade, and builds one OCI artifact from exact `master`; source tests and exact-manifest smoke/SBOM/audit/scan pass; the same bytes are pushed. Private caches/intermediates contain no credentials and satisfy trusted-scope, provenance, scan, and retention policy.
+3. Plan A has read-only permissions, `persist-credentials: false`, and a non-publishing `workflow_dispatch` that proves its full-SHA input equals integrated `master` and checked-out `HEAD`. Active templates/operator docs reject `simojenki/*`, Docker Hub, `latest`, and predictable secrets. Plan A passes before Plan B creates a protected publisher.
+4. Historical lineage before this amendment is proven 50 commits ahead of `68a73b9`: 48 pre-spec commits through `4db3d75`, then `af60e93` and `5a83fb4`. After final approval, the latest commit touching this specification path is recorded as `DESIGN_SHA` with its file hash; it must equal the approval record and be an ancestor of both the safety commit and `master`. Any later path change invalidates approval, making omission impossible.
+5. A deterministic closed allowlist generates a sorted, hashed Docker context from exact `master`; a local secret/prohibited-path scan passes before any remote builder/cache/registry access, and the scanned archive contains no `.git`, credentials, operator file, or unlisted path. Plan B then pins bases by digest, performs no nondeterministic OS upgrade, builds one OCI artifact, runs source and exact-manifest gates, and pushes the same bytes. Private caches/intermediates satisfy credential, scope, provenance, scan, and retention policy.
 6. Audit and image scan report zero high/critical findings or the machine-enforced exact-identity allowlist contains every required field, unexpired user+architect approval, and no broader match. The manifest records tool/database identities, versions/timestamps, policies, raw-report hashes, source SHA, and artifact digest.
-7. Plan B removes every other writer. Publication concurrency is keyed by destination repository plus SHA tag with cancellation disabled; conflicting tags fail; matching reruns adopt and verify without rebuild; post-push digest/revision match local/source. The package is private, anonymous pull fails, authorized read-only VPS pull succeeds, and digest is authoritative.
+7. Plan B removes every other writer. Its requested SHA equals remote `master` at dispatch, immediately before push, and after verification; mismatch aborts or quarantines. Publication concurrency is keyed by destination repository plus SHA tag with cancellation disabled; conflicting tags fail; matching reruns adopt and verify without rebuild; post-push digest/revision match local/source. The package is private, anonymous pull fails, authorized read-only VPS pull succeeds, and digest is authoritative.
 8. Every code-changing Plan C/D slice starts from exact current `master` and produces a new build/audit/scan/smoke/candidate-tested digest; evidence is never reused across code SHAs.
 9. The smoke account and test data are isolated as specified. Credential file/FD is root-owned and root-readable only; no-follow open plus post-open `fstat` rejects symlink, non-regular, non-root, or group/world-accessible input; disable/rotate/replace/re-authenticate behavior is demonstrated with accurate token-revocation wording.
 10. Plan C first supplies the app factory/lifecycle coordinator, shared cancellation, cache quiescence, and active request/stream/socket/background registries with invariant tests.
-11. Candidate network/DNS evidence proves unique isolated aliases/egress and that edge proxy resolution still targets production only. Every generated Bonob URL, including `getAppLink.regUrl`, passes exact-origin validation/rewrite; candidate sentinels all appear at candidate and zero appear at production.
+11. Default-deny candidate network policy permits only the allowlisting egress proxy/resolver and explicitly denies production origin names/IPs and unapproved destinations. Negative hostname/direct-IP/IPv4/IPv6/port/DNS/proxy-bypass tests pass; edge proxy resolution still targets production only. Every generated Bonob URL, including `getAppLink.regUrl`, passes exact-origin validation/rewrite; candidate sentinels all appear at candidate and zero appear at production.
 12. Cache files pass versioned envelope and record-kind semantic validation/diagnostics. Writer-quiesced production source per-file/tree hashes are identical before and after cold/snapshot candidate runs.
 13. The harness persists no token, emits aggregate-only output, passes cold and disposable snapshot tests, attributes/redacts a forced 429, and never writes production state.
 14. Graceful shutdown broadcasts cancellation, quiesces cache, drains/bounds registries, preserves valid cache, and restarts within the Docker grace period. Plan C evidence precedes every post-convergence promotion.
 15. The automated soak meets duration/cycle/sampling windows; at least 99.5% expected-success cycles pass with zero response/body/range correctness error; defined p95/p99 latencies pass; final-load and post-cooldown RSS are within 64 MiB; handle/socket cooldown thresholds pass; and unhandled rejection/crash/cache corruption is zero.
 16. The §9 decision table is machine-evaluated for candidate/soak/production evidence, including the five-in-60-second burst rule and dispositions for lower-severity nonfunctional issues.
 17. Issue #297 raw SOAP proves the exact root and individual-playlist attributes in §5.3 against the official Sonos contract and disposable mutation passes; #284 is fixture-classified; #229 remains regression-covered; #214 is raw-SOAP asserted; #246/#254/#255 have corrected diagnostics; #164 meets soak thresholds.
-18. Backup validation includes proxy configuration, container/network/resource/security/health inspection, compose, root-only secret-compatible state, validated cache hashes, and a checksummed image archive or proven pullable digest. The recorded exact command sequence restores disposable state, loads the exact artifact, passes proxy config test, auth, SMAPI, artwork, range/body, stream playback, cache integrity, and clean stop.
+18. Backup validation includes proxy configuration, container/network/resource/security/health inspection, compose, root-only secret-compatible state, validated cache hashes, and a checksummed image archive or proven pullable digest. The recorded exact command sequence restores disposable state, loads the exact artifact, passes proxy config test, auth, SMAPI, artwork, range/body, stream playback, cache integrity, and clean stop. Every actual rollback restores the hashed prior cache snapshot unless a pre-rollback proof shows exact per-file/tree hash, schema, ownership, and mode equality; any missing/mismatch restores.
 19. The user explicitly approves the separately announced container recreation after reviewing exact digest, evidence, maintenance impact, verified backup, and rehearsed rollback.
 20. Physical evidence retains the full speaker/controller/firmware/media matrix, steps/results/timestamps/log hashes, zero prohibited dropout/abort, start/seek latency, two-hour playback soak, and three distinctly defined sessions including one after restart.
-21. The initial digest completes 24 continuous hours without a §9 blocker; every lower-severity issue has disposition. Any failed gate restores exact prior artifact/configuration/cache and re-establishes public and physical health.
+21. The initial digest completes 24 continuous hours without a §9 blocker; every lower-severity issue has disposition. Any failed gate restores the exact prior artifact/configuration and applies the criterion-18 cache rule before re-establishing public and physical health.
 22. Restart/rotation tests prove process-local `bat`/link-code invalidation, same-secret SMAPI/burn continuity until expiry, and secret-rotation invalidation without overstating password-change revocation.
 23. Before Plan F, the same digest completes seven continuous days, at least three distinct physical sessions, zero rollback, zero blocker, and zero unattributed production error.
-24. An independent adversarial/architectural re-review approves the final branch and fresh evidence set.
+24. Full-file and diff-aware redaction gates pass for this specification and every public evidence update; public attestations retain only content/diff/policy hashes and outcome, with zero exact host/IP/service/network/path/credential/topology identifier.
+25. An independent adversarial/architectural re-review approves the final branch and fresh evidence set.
