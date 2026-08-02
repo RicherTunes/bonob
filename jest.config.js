@@ -1,15 +1,18 @@
 module.exports = {
-  testEnvironment: 'node',
+  testEnvironment: "node",
   setupFilesAfterEnv: ["<rootDir>/tests/setup.js"],
   modulePathIgnorePatterns: [
-    '<rootDir>/node_modules',
-    '<rootDir>/build',
+    "<rootDir>/node_modules",
+    "<rootDir>/build",
+  ],
+  testPathIgnorePatterns: [
+    "<rootDir>/build",
   ],
   transform: {
-    '^.+\\.tsx?$': ['@swc/jest', {
+    "^.+\\.tsx?$": ["@swc/jest", {
       jsc: {
-        parser: { syntax: 'typescript', tsx: false, decorators: true },
-        target: 'es2022',
+        parser: { syntax: "typescript", tsx: false, decorators: true },
+        target: "es2022",
       },
     }],
   },
