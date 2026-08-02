@@ -2989,8 +2989,9 @@ describe("SubsonicMusicLibrary", () => {
     });
 
     // A song-driven listing resolves its album from the song record, so the album summary carries
-    // the song's own year and art rather than the album document's. asSongJson emits year: "" and
-    // the track's coverArt, so this is what the mapping legitimately produces.
+    // the song's own year (asSongJson emits year: "") rather than the album document's. Art is the
+    // exception: it is derived from the ALBUM id, so every track of an album shares one art url and
+    // cover-art coalescing still works.
     const albumAsSeenFromSong = (track: Track) => ({
       ...track,
       album: {
@@ -3000,7 +3001,7 @@ describe("SubsonicMusicLibrary", () => {
         genre: track.genre,
         artistId: track.artist.id,
         artistName: track.artist.name,
-        coverArt: track.coverArt,
+        coverArt: { system: "subsonic", resource: `art:${track.album.id}` },
       },
     });
 
@@ -3037,6 +3038,38 @@ describe("SubsonicMusicLibrary", () => {
         expect(mockGET).toHaveBeenCalledTimes(1);
       });
 
+      it("gives every track of one album the SAME art url, so cover art still coalesces", async () => {
+        // Regression guard. Deriving the album summary's art from song.coverArt looked harmless but
+        // multiplied cover-art fetches by up to 20x for a track search: Navidrome returns a
+        // PER-SONG art id (mf-<songId>_<hash>) while the album's is shared (al-<albumId>_<hash>),
+        // so 20 hits from one album produced 20 distinct /art urls, 20 distinct coalescing keys and
+        // zero coalescing - in the same branch that added admission control to protect that
+        // subsystem. Verified against the live server: getCoverArt resolves the raw albumId to
+        // byte-identical artwork, and that form is standard Subsonic rather than Navidrome-specific.
+        const album = anAlbum({ id: "album1", name: "Burnin" });
+        const artist = anArtist({ id: "artist1", name: "Bob Marley", albums: [album] });
+        const tracks = Array.from({ length: 5 }, (_, i) =>
+          aTrack({
+            id: `track${i}`,
+            artist: artistToArtistSummary(artist),
+            album: albumToAlbumSummary(album),
+          })
+        );
+
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(ok(getSearchResult3Json({ tracks })))
+        );
+
+        const result = await subsonic.searchTracks("foo");
+
+        const artUrns = new Set(result.map((t) => JSON.stringify(t.album.coverArt)));
+        expect(artUrns.size).toEqual(1);
+        expect(result[0]!.album.coverArt).toEqual({
+          system: "subsonic",
+          resource: "art:album1",
+        });
+      });
+
       it("still resolves every album field from the song alone", async () => {
         const pop = asGenre("Pop");
         const album = anAlbum({ id: "album1", name: "Burnin", genre: pop });
@@ -3061,7 +3094,11 @@ describe("SubsonicMusicLibrary", () => {
         expect(result!.album.name).toEqual(expected.name);
         expect(result!.album.artistId).toEqual(expected.artistId);
         expect(result!.album.artistName).toEqual(expected.artistName);
-        expect(result!.album.coverArt).toEqual(track.coverArt);
+        // Derived from the album id, not the song's own art id - see the coalescing test above.
+        expect(result!.album.coverArt).toEqual({
+          system: "subsonic",
+          resource: `art:${expected.id}`,
+        });
       });
     });
 

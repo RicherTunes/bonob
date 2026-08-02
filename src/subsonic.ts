@@ -922,9 +922,14 @@ export const asTrack = (
 //   - artistId/artistName are the TRACK's artist, which on a compilation differs from the album
 //     artist. For a song-driven listing that is the more useful attribution, and it is the only
 //     artist a song record carries.
-//   - coverArt is the song's own art id, which every Subsonic server resolves to the album artwork.
-//     It is used verbatim rather than derived from albumId, because servers namespace these ids
-//     (Navidrome uses al-/mf- prefixes) and a synthesized id would not resolve.
+//   - coverArt is derived from the ALBUM id, not from song.coverArt. That matters for load, not
+//     just tidiness: Navidrome returns a per-song art id (mf-<songId>_<hash>) while the album's is
+//     shared (al-<albumId>_<hash>), so using the song's would give 20 search hits from one album 20
+//     distinct /art urls, 20 distinct coalescing keys, and no coalescing at all - multiplying
+//     cover-art fetches by up to 20x. getCoverArt takes an album id per the Subsonic API, so the
+//     raw albumId is both server-agnostic and shared by every track of the album. Verified against
+//     the live server: albumId, al-<albumId>, al-<albumId>_<hash> and the song's own art id all
+//     return byte-identical artwork.
 export const albumSummaryFromSong = (song: song): AlbumSummary => ({
   id: song.albumId || "",
   name: song.album || "",
@@ -932,7 +937,7 @@ export const albumSummaryFromSong = (song: song): AlbumSummary => ({
   genre: maybeAsGenre(song.genre),
   artistId: song.artistId,
   artistName: song.artist,
-  coverArt: coverArtURN(song.coverArt),
+  coverArt: coverArtURN(song.albumId),
 });
 
 export const asAlbumSummary = (album: album): AlbumSummary => ({
