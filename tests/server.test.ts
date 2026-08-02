@@ -20,6 +20,8 @@ import makeServer, {
   RangeBytesFromFilter,
   rangeFilterFor,
   redactAccessTokenFromUrl,
+  redactAccessTokenFromReferrer,
+  sanitizeLogValue,
 } from "../src/server";
 
 describe("redactAccessTokenFromUrl", () => {
@@ -37,6 +39,81 @@ describe("redactAccessTokenFromUrl", () => {
 
   it("handles an undefined url", () => {
     expect(redactAccessTokenFromUrl(undefined)).toEqual("");
+  });
+});
+
+describe("redactAccessTokenFromReferrer", () => {
+  // A client that follows a link from a bonob page carrying ?bat=<token> sends that page's URL
+  // back in the Referer header. morgan's stock :referrer logged it verbatim, which defeated
+  // :redacted-url completely - the token still landed in the access log, just one field over.
+  it("masks the bat access token in an absolute referrer", () => {
+    const redacted = redactAccessTokenFromReferrer(
+      "https://sonos.alexricher.com/art/some-burn/size/180?bat=SUPERSECRETTOKEN"
+    );
+    expect(redacted).toContain(`${BONOB_ACCESS_TOKEN_HEADER}=*****`);
+    expect(redacted).not.toContain("SUPERSECRETTOKEN");
+  });
+
+  it("keeps the origin, which is the part with diagnostic value", () => {
+    expect(
+      redactAccessTokenFromReferrer("https://sonos.alexricher.com/login?bat=SECRET")
+    ).toContain("https://sonos.alexricher.com/login");
+  });
+
+  it("masks the token in a relative referrer too", () => {
+    const redacted = redactAccessTokenFromReferrer("/art/x/size/180?bat=SECRET");
+    expect(redacted).toContain(`${BONOB_ACCESS_TOKEN_HEADER}=*****`);
+    expect(redacted).not.toContain("SECRET");
+  });
+
+  it("leaves a referrer without a bat token unchanged apart from URL normalisation", () => {
+    expect(redactAccessTokenFromReferrer("https://example.com/x")).toContain(
+      "https://example.com/x"
+    );
+  });
+
+  it("handles an undefined referrer", () => {
+    expect(redactAccessTokenFromReferrer(undefined)).toEqual("");
+  });
+
+  it("does not throw on a referrer that is not a URL at all", () => {
+    expect(() => redactAccessTokenFromReferrer("(╯°□°)╯")).not.toThrow();
+  });
+});
+
+describe("sanitizeLogValue", () => {
+  // morgan 1.10.1 was vulnerable to log forging through :remote-user (GHSA-4vj7-5mj6-jm8m). 1.11.0
+  // fixes that one field only - :referrer and :user-agent are just as client-controlled and are
+  // still emitted raw, so bonob neutralizes them itself.
+  it("escapes CRLF so a client cannot forge additional log lines", () => {
+    const forged = sanitizeLogValue(
+      'Mozilla\r\n127.0.0.1 - admin [01/Jan/2026:00:00:00 +0000] "GET /pwned"'
+    );
+    expect(forged).not.toContain("\r");
+    expect(forged).not.toContain("\n");
+    expect(forged).toContain("\\x0d");
+    expect(forged).toContain("\\x0a");
+  });
+
+  it("escapes the quote that delimits morgan's quoted fields", () => {
+    expect(sanitizeLogValue('a"b')).toEqual('a\\"b');
+  });
+
+  it("escapes the escape character itself so the encoding stays unambiguous", () => {
+    expect(sanitizeLogValue("a\\b")).toEqual("a\\\\b");
+  });
+
+  it("escapes C1 controls as well as C0", () => {
+    expect(sanitizeLogValue("a\u0085b")).toEqual("a\\x85b");
+  });
+
+  it("leaves ordinary text alone", () => {
+    expect(sanitizeLogValue("Sonos/78.1 (ZPS12)")).toEqual("Sonos/78.1 (ZPS12)");
+  });
+
+  it("handles undefined and empty", () => {
+    expect(sanitizeLogValue(undefined)).toEqual("");
+    expect(sanitizeLogValue("")).toEqual("");
   });
 });
 

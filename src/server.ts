@@ -141,8 +141,47 @@ export const redactAccessTokenFromUrl = (value: string | undefined): string => {
   }
 };
 
+// The Referer is a full absolute URL, so it keeps its origin (that is the diagnostic value) while
+// the access token inside it is redacted exactly as it is in the request line. Without this,
+// :redacted-url was pointless: a client that follows a link from a bonob page carrying ?bat=<token>
+// sends that same token back in the Referer header, and morgan logged it verbatim.
+export const redactAccessTokenFromReferrer = (value: string | undefined): string => {
+  if (!value) return "";
+  try {
+    const parsed = new URL(value);
+    if (parsed.searchParams.has(BONOB_ACCESS_TOKEN_HEADER)) {
+      parsed.searchParams.set(BONOB_ACCESS_TOKEN_HEADER, "*****");
+    }
+    return parsed.href;
+  } catch {
+    // Not an absolute URL. Fall through to the path-relative redactor, which has its own regex
+    // backstop for values that do not parse as a URL at all.
+    return redactAccessTokenFromUrl(value);
+  }
+};
+
+// Every request-supplied field in an access log is attacker-controlled. A CR/LF inside one lets a
+// client forge whole additional log lines, and a bare quote lets it escape a quoted field - the
+// same defect class morgan 1.11.0 fixed for :remote-user, and which it does NOT fix for :referrer
+// or :user-agent. Escape control characters, the quote, and the escape character itself, so a
+// logged value can never be mistaken for log structure.
+export const sanitizeLogValue = (value: string | undefined): string => {
+  if (!value) return "";
+  let out = "";
+  for (const ch of value) {
+    const code = ch.charCodeAt(0);
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    // C0 and C1 control characters, including the CR/LF that would forge a new log line.
+    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f))
+      out += "\\x" + code.toString(16).padStart(2, "0");
+    else out += ch;
+  }
+  return out;
+};
+
 const MORGAN_REDACTED_COMBINED =
-  ':remote-addr - :remote-user [:date[clf]] ":method :redacted-url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"';
+  ':remote-addr - :remote-user [:date[clf]] ":method :redacted-url HTTP/:http-version" :status :res[content-length] ":redacted-referrer" ":safe-user-agent"';
 
 const DEFAULT_SERVER_OPTS: ServerOpts = {
   linkCodes: () => new InMemoryLinkCodes(),
@@ -186,7 +225,20 @@ function server(
 
   if (serverOpts.logRequests) {
     morgan.token("redacted-url", (req) =>
-      redactAccessTokenFromUrl(req.url)
+      sanitizeLogValue(redactAccessTokenFromUrl(req.url))
+    );
+    // A client that followed a link from a bonob page sends that page's URL back in Referer -
+    // including its ?bat=<token>. Logging it raw defeated :redacted-url entirely.
+    morgan.token("redacted-referrer", (req) =>
+      sanitizeLogValue(
+        redactAccessTokenFromReferrer(
+          (req.headers["referer"] ?? req.headers["referrer"]) as string | undefined
+        )
+      )
+    );
+    // Fully client-controlled and never redacted by morgan; neutralize it for the same reason.
+    morgan.token("safe-user-agent", (req) =>
+      sanitizeLogValue(req.headers["user-agent"])
     );
     app.use(morgan(MORGAN_REDACTED_COMBINED));
   }
