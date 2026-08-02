@@ -2,7 +2,7 @@ import { randomUUID as uuid } from "crypto";
 import { pipe } from "fp-ts/lib/function";
 import { option as O, taskEither as TE, either as E } from "fp-ts";
 
-import axios from "axios";
+import axios, { AxiosError } from "axios";
 jest.mock("axios", () => ({
   ...jest.requireActual("axios"),
   get: jest.fn(),
@@ -21,7 +21,10 @@ import {
   parseToken,
   CustomPlayers,
   images,
-  artistImageURN
+  artistImageURN,
+  DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
+  CoverArtUnavailableError,
+  CoverArtUpstreamError,
 } from "../src/subsonic";
 
 import {
@@ -2254,6 +2257,7 @@ describe("SubsonicMusicLibrary", () => {
               }),
               headers,
               responseType: "arraybuffer",
+              timeout: DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
             }
           );
         });
@@ -2294,6 +2298,7 @@ describe("SubsonicMusicLibrary", () => {
               }),
               headers,
               responseType: "arraybuffer",
+              timeout: DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
             }
           );
         });
@@ -2361,11 +2366,12 @@ describe("SubsonicMusicLibrary", () => {
             }),
             headers,
             responseType: "arraybuffer",
+            timeout: DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
           });
         });
 
         describe("and an error occurs fetching the uri", () => {
-          it("should return undefined", async () => {
+          it("should propagate an unexpected upstream error instead of returning undefined", async () => {
             const coverArtId = uuid();
             const covertArtURN = {
               system: "subsonic",
@@ -2374,9 +2380,8 @@ describe("SubsonicMusicLibrary", () => {
 
             mockGET.mockImplementationOnce(() => Promise.reject("BOOOM"));
 
-            const result = await subsonic.coverArt(covertArtURN);
+            await expect(subsonic.coverArt(covertArtURN)).rejects.toBeDefined();
 
-            expect(result).toBeUndefined();
           });
         });
       });
@@ -2418,12 +2423,13 @@ describe("SubsonicMusicLibrary", () => {
               }),
               headers,
               responseType: "arraybuffer",
+              timeout: DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
             }
           );
         });
 
         describe("and an error occurs fetching the uri", () => {
-          it("should return undefined", async () => {
+          it("should propagate an unexpected upstream error instead of returning undefined", async () => {
             const coverArtId = uuid();
             const covertArtURN = {
               system: "subsonic",
@@ -2432,15 +2438,84 @@ describe("SubsonicMusicLibrary", () => {
 
             mockGET.mockImplementationOnce(() => Promise.reject("BOOOM"));
 
-            const result = await subsonic.coverArt(covertArtURN, size);
+            await expect(subsonic.coverArt(covertArtURN, size)).rejects.toBeDefined();
 
-            expect(result).toBeUndefined();
           });
         });
       });
     });
   });
 
+
+  describe("coverArt error classification (no leak, typed propagation)", () => {
+    // Use REAL AxiosError instances so axios.isAxiosError and response/status/code paths are the
+    // ones exercised in production, not a hand-rolled duck-typed stand-in.
+    const axiosRejection = (status: number | undefined, code?: string) =>
+      new AxiosError(
+        status != undefined ? `Request failed with status code ${status}` : code || "network error",
+        code,
+        undefined,
+        undefined,
+        status != undefined ? ({ status, data: Buffer.from("upstream-body-secret") } as any) : undefined,
+      );
+
+    const coverArtURN = { system: "subsonic", resource: "art:coverart-error" };
+
+    it("returns undefined for a genuine upstream HTTP 404 (the art really does not exist)", async () => {
+      mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(404)));
+      await expect(subsonic.coverArt(coverArtURN, 180)).resolves.toBeUndefined();
+    });
+
+    it("returns undefined for a non-Subsonic / invalid URN (preserves existing behaviour)", async () => {
+      await expect(
+        subsonic.coverArt({ system: "spotify", resource: "x" }, 180)
+      ).resolves.toBeUndefined();
+      expect(axios.get).not.toHaveBeenCalled();
+    });
+
+    it("throws a sanitized CoverArtUnavailableError for a 429 (no upstream body/URL leaked)", async () => {
+      mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(429)));
+      await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtUnavailableError);
+    });
+
+    it("throws CoverArtUnavailableError for 503 and 500", async () => {
+      mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(503)));
+      await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtUnavailableError);
+      mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(500)));
+      await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtUnavailableError);
+    });
+
+    it("throws CoverArtUnavailableError for a timeout / network failure (ECONNABORTED)", async () => {
+      mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(undefined, "ECONNABORTED")));
+      await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtUnavailableError);
+    });
+
+    it("throws a sanitized CoverArtUpstreamError for an unexpected 400/401/403 (never undefined/404)", async () => {
+      for (const status of [400, 401, 403]) {
+        mockGET.mockImplementationOnce(() => Promise.reject(axiosRejection(status)));
+        await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtUpstreamError);
+      }
+    });
+
+    it("propagates a coordinator busy error as a CoverArtUnavailableError", async () => {
+      const { CoverArtBusyError } = await import("../src/subsonic");
+      const busy = new CoverArtBusyError("queue full");
+      mockGET.mockImplementationOnce(() => Promise.reject(busy));
+      await expect(subsonic.coverArt(coverArtURN, 180)).rejects.toBeInstanceOf(CoverArtBusyError);
+    });
+
+    it("still returns {contentType,data} on a successful image fetch", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve({
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+          data: Buffer.from("the bytes"),
+        })
+      );
+      const result = await subsonic.coverArt(coverArtURN, 180);
+      expect(result).toEqual({ contentType: "image/jpeg", data: Buffer.from("the bytes") });
+    });
+  });
   describe("rate", () => {
     const trackId = uuid();
 

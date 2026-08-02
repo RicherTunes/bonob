@@ -46,6 +46,7 @@ import {
   deezerImageFetcher,
   ImageFetcher,
   isSafeExternalImageUrl,
+  CoverArtUnavailableError,
 } from "./subsonic";
 import {
   JWTSmapiLoginTokens,
@@ -667,19 +668,19 @@ function server(
     let urn: BUrn;
     try {
       urn = parse(req.params["burn"]!);
-    } catch (e) {
-      logger.warn(`Invalid art burn '${req.params["burn"]}': ${e}`);
+    } catch {
+      logger.warn("rejected art request: malformed or unparseable burn");
       res.setHeader("Cache-Control", "no-store");
       return res.status(400).send();
     }
 
     if (urn.system == "external" && !isSafeExternalImageUrl(urn.resource)) {
-      logger.warn(`Refusing unsafe external art URL '${urn.resource}'`);
+      logger.warn("rejected art request: unsafe external resource");
       res.setHeader("Cache-Control", "no-store");
       return res.status(400).send();
     }
 
-    logger.debug(`Getting art '${JSON.stringify(urn)}' in size ${size}`)
+    logger.debug(`Getting art for system ${urn.system} in size ${size}`)
 
     return musicService
       .login(serviceToken)
@@ -714,16 +715,22 @@ function server(
           res.setHeader("Cache-Control", "private, max-age=86400");
           return res.send(coverArt.data);
         } else {
-          logger.warn(`Invalid content type of ${coverArt.contentType}, detected for ${JSON.stringify(urn)}`);
+          logger.warn(`Refusing to serve a 200 response with a non-image content type (${coverArt.contentType}) as art`);
           res.setHeader("Cache-Control", "no-store");
           return res.status(502).send();
         }
     })
       .catch((e: Error) => {
-        logger.error(`Failed fetching image ${JSON.stringify(urn)} (size=${size})`, {
-          cause: e,
-        });
+        // Do NOT log the raw urn / id / username / upstream body: a transient throttle is
+        // expected and identifiers must not leak. A CoverArtUnavailableError (429/5xx/timeout/
+        // network/coordinator busy) is a capacity failure -> 503 + no-store + a small Retry-After
+        // so clients/caches back off without retry-storming. Anything else is an unexpected
+        // programming error -> 500 + no-store.
         res.setHeader("Cache-Control", "no-store");
+        if (e instanceof CoverArtUnavailableError) {
+          res.setHeader("Retry-After", "5");
+          return res.status(503).send();
+        }
         return res.status(500).send();
       });
   });
