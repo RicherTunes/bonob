@@ -750,6 +750,100 @@ describe("Subsonic.getCoverArt (bounded timeout + coordinator wiring)", () => {
   };
   const headers = { "User-Agent": "bonob" };
 
+  // The coalescing key and the upstream request must agree on the size, or two calls that ask the
+  // server for DIFFERENT things can share one key and whichever starts first serves both. The key
+  // mapped any non-positive size to 0 while the request still sent the raw value, so
+  // getCoverArt(id, -5) and getCoverArt(id) collided. /art rejects size <= 0 today, so this was
+  // latent rather than live - but the coordinator must not depend on a caller-side guard to be
+  // correct, and getCoverArt is public API reachable from elsewhere.
+  describe("size normalization is shared by the key and the request", () => {
+    // Compare the params EXPLICITLY by their entries. `expect.objectContaining({ params })` does
+    // NOT compare URLSearchParams contents - it passes against completely different params - so an
+    // assertion written that way is vacuous. (A bare object argument does compare correctly; it is
+    // objectContaining specifically that is blind here.)
+    const sentParams = (call: unknown[]) =>
+      [...((call[1] as { params: URLSearchParams }).params).entries()].sort();
+
+    const expectedParams = (extra: Record<string, string> = {}) =>
+      [...asURLSearchParams({ ...authParams, id: "art:42", ...extra }).entries()].sort();
+
+    it.each([
+      ["a negative size", -5],
+      ["zero", 0],
+      ["NaN", Number.NaN],
+      ["Infinity", Number.POSITIVE_INFINITY],
+    ])("treats %s as 'no size' in the request, matching the key", async (_label, size) => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve({
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+          data: Buffer.from("img"),
+        })
+      );
+
+      await new Subsonic(url).getCoverArt(credentials, "art:42", size as number);
+
+      // No size parameter at all - exactly what the key encodes for these values.
+      expect(sentParams(mockGET.mock.calls[0]!)).toEqual(expectedParams());
+    });
+
+    it("sends a positive size unchanged", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve({
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+          data: Buffer.from("img"),
+        })
+      );
+
+      await new Subsonic(url).getCoverArt(credentials, "art:42", 300);
+
+      expect(sentParams(mockGET.mock.calls[0]!)).toEqual(expectedParams({ size: "300" }));
+    });
+
+    it("coalesces a non-positive size with an absent size, since both fetch the same thing", async () => {
+      const subsonic = new Subsonic(url);
+      const block = deferred<void>();
+      mockGET.mockImplementation(() =>
+        block.promise.then(() => ({
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+          data: Buffer.from("img"),
+        }))
+      );
+
+      const a = subsonic.getCoverArt(credentials, "art:42", -5);
+      const b = subsonic.getCoverArt(credentials, "art:42");
+      await Promise.resolve();
+
+      expect(mockGET).toHaveBeenCalledTimes(1);
+
+      block.resolve(undefined);
+      await Promise.all([a, b]);
+    });
+
+    it("still distinguishes two DIFFERENT positive sizes", async () => {
+      const subsonic = new Subsonic(url);
+      const block = deferred<void>();
+      mockGET.mockImplementation(() =>
+        block.promise.then(() => ({
+          status: 200,
+          headers: { "content-type": "image/jpeg" },
+          data: Buffer.from("img"),
+        }))
+      );
+
+      const a = subsonic.getCoverArt(credentials, "art:42", 180);
+      const b = subsonic.getCoverArt(credentials, "art:42", 300);
+      await Promise.resolve();
+
+      expect(mockGET).toHaveBeenCalledTimes(2);
+
+      block.resolve(undefined);
+      await Promise.all([a, b]);
+    });
+  });
+
   it("sends the cover-art http timeout (shorter than the global 30s) while preserving headers/params/arraybuffer", async () => {
     mockGET.mockImplementationOnce(() =>
       Promise.resolve({

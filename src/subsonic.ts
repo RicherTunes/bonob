@@ -335,13 +335,21 @@ export type CoverArtCoordinatorOptions = {
 // user's cached art to a new one. Only the opaque hex digest is ever stored.
 const LENGTH_PREFIX = (s: string) => `${s.length}:`;
 
+// The single definition of "what size is this request for". A size is only meaningful if it is a
+// finite positive number; everything else (undefined, 0, negative, NaN, Infinity) means "no size",
+// and must mean that identically to the coalescing key and to the upstream request. Keeping this in
+// one place is the point: when the key and the request each normalized separately they disagreed,
+// and two calls that fetched different images shared a cache slot.
+export const normalizedCoverArtSize = (size?: number): number | undefined =>
+  typeof size === "number" && Number.isFinite(size) && size > 0 ? size : undefined;
+
 export const coverArtKey = (
   username: string,
   password: string,
   artId: string,
   size?: number
 ): string => {
-  const normalizedSize = size && size > 0 ? size : 0;
+  const normalizedSize = normalizedCoverArtSize(size) ?? 0;
   const encoded =
     LENGTH_PREFIX(username) + username +
     LENGTH_PREFIX(password) + password +
@@ -1787,9 +1795,16 @@ export class Subsonic {
     // user/art/size coalesce onto ONE upstream call, and distinct requests are bounded
     // (concurrency cap + FIFO queue). The coordinator does NOT retry, so a 429/5xx failure
     // releases the slot and a later identical request starts a fresh upstream call.
-    const key = coverArtKey(credentials.username, credentials.password, id, size);
+    // Normalize ONCE, then use the same value for both the coalescing key and the request. These
+    // were normalized separately and disagreed: the key mapped any non-positive size to 0 while the
+    // request sent the raw value, so getCoverArt(id, -5) and getCoverArt(id) shared a key but asked
+    // the server for different things - whichever landed first served both. Infinity was worse
+    // still, being truthy it reached the wire as "size=Infinity". /art rejects size <= 0 today so
+    // this was latent, but getCoverArt is public and must not rely on a caller-side guard.
+    const effectiveSize = normalizedCoverArtSize(size);
+    const key = coverArtKey(credentials.username, credentials.password, id, effectiveSize);
     const fetch = () =>
-      this.get(credentials, "/rest/getCoverArt", size ? { id, size } : { id }, {
+      this.get(credentials, "/rest/getCoverArt", effectiveSize ? { id, size: effectiveSize } : { id }, {
         headers: { "User-Agent": "bonob" },
         responseType: "arraybuffer",
         // getCoverArt is small + high-volume: give it its own bound shorter than the global 30s
