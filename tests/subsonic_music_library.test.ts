@@ -3200,13 +3200,43 @@ describe("SubsonicMusicLibrary", () => {
 
         const result = await subsonic.searchTracks("orphan");
 
+        // Dropped, not rendered. Search results become album tiles, and a tile with an empty album
+        // id is browsable but unresolvable: tapping it asks getMetadata for "album:" and sticks on
+        // the "Loading, please try again" placeholder forever. A missing result beats a dead one,
+        // and the old per-song fan-out dropped these anyway.
+        expect(result).toEqual([]);
+      });
+
+      it("keeps the songs that DO have an album when only some are orphaned", async () => {
+        const album = anAlbum({ id: "album1", name: "Burnin" });
+        const artist = anArtist({ id: "artist1", name: "Bob Marley", albums: [album] });
+        const good = aTrack({
+          artist: artistToArtistSummary(artist),
+          album: albumToAlbumSummary(album),
+        });
+
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(
+            ok(
+              subsonicOK({
+                searchResult3: {
+                  artist: [],
+                  album: [],
+                  song: [
+                    { id: "orphan", title: "Orphan", contentType: "audio/mp3" },
+                    ...(getSearchResult3Json({ tracks: [good] }) as any)["subsonic-response"]
+                      .searchResult3.song,
+                  ],
+                },
+              })
+            )
+          )
+        );
+
+        const result = await subsonic.searchTracks("mixed");
+
         expect(result).toHaveLength(1);
-        expect(result[0]!.id).toEqual("song-with-no-album");
-        expect(result[0]!.name).toEqual("Orphan");
-        // Degraded but structurally valid, so the SMAPI layer can still render it.
-        expect(result[0]!.album.id).toEqual("");
-        expect(result[0]!.album.name).toEqual("");
-        expect(result[0]!.album.coverArt).toBeUndefined();
+        expect(result[0]!.id).toEqual(good.id);
       });
     });
 

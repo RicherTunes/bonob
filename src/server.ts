@@ -534,10 +534,16 @@ function server(
             `${trace} bnb<- stream response from music service for ${id}, status=${stream.status}, headers=(${JSON.stringify(stream.headers)})`
           );
 
-          // An upstream 200 with no content-type used to throw here (undefined.split). Collapse it
-          // to "" so the header is simply omitted by respondWith rather than crashing the stream.
+          // An upstream 200 with no content-type used to throw here (undefined.split), and
+          // collapsing it to "" then shipped a bare `Content-Type:` header. Omitting it is not the
+          // answer either: Express then supplies its own default of "text/html; charset=utf-8",
+          // which is actively wrong for an audio stream and could have a client try to render it.
+          // Answer "bytes of unknown type" explicitly instead, which is true and misleads nobody -
+          // Sonos still has the mimeType SMAPI declared for the track.
           const sonosisfyContentType = (contentType: string | undefined) =>
-            (contentType ?? "")
+            contentType === undefined || contentType === ""
+              ? "application/octet-stream"
+              : contentType
               .split(";")
               .map((it) => it.trim())
               .map(sonosifyMimeType)

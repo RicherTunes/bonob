@@ -351,7 +351,13 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       // rejecting the search, but every failure was dropped SILENTLY, so a search that lost all 20
       // fan-out calls returned an empty result indistinguishable from "nothing matched". That is
       // the reported "songs never come back". With no fan-out there is nothing to partially fail.
-      .then(({ songs }) => this.subsonic.toTracks(songs));
+      //
+      // A song with no albumId is dropped: the SMAPI search renders each hit as an album tile, and
+      // a tile with an empty album id is browsable but unresolvable - tapping it asks getMetadata
+      // for "album:" and lands on the "Loading, please try again" placeholder forever. The old
+      // per-song fan-out dropped these too (getAlbum(undefined) simply failed), so this preserves
+      // the previous user-visible behaviour rather than introducing a dead tile.
+      .then(({ songs }) => this.subsonic.toTracks(songs.filter((s) => !!s.albumId)));
 
   playlists = async () =>
     this.subsonic.playlists(this.credentials);

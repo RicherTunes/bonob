@@ -1276,6 +1276,50 @@ describe("Subsonic", () => {
         ]);
       });
 
+      it("refuses a scan that hits the safety cap rather than caching a TRUNCATED index", async () => {
+        // The cap was a hardcoded 2,000,000 and hitting it just ended the loop, so the partial
+        // result was returned, cached and persisted as though it were the whole catalog: every
+        // album past the cap silently vanished from the A-Z menu and `total` was wrong, with
+        // nothing logged. That is a correctness cliff at exactly the catalog size the cap exists
+        // for. Refusing keeps the previous good index in place and says why.
+        const indexCacheStore = { load: jest.fn(() => []), save: jest.fn() };
+        const indexCache = new SwrCache(clock, 60_000, { store: indexCacheStore });
+        // Tiny cap so the guard is reachable without mocking millions of albums.
+        const cappedSubsonic = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          SwrCache.disabled(),
+          indexCache,
+          false,
+          {},
+          1000
+        );
+        const artist = anArtist();
+        let n = 0;
+        // A server that never returns a short page - the catalog outruns the cap.
+        mockGET.mockImplementation(() => {
+          const page = Array.from({ length: 500 }, () =>
+            anAlbumSummary({ id: `album-${n++}`, name: `Album ${n}` })
+          );
+          return Promise.resolve(
+            ok(
+              getAlbumListJson(
+                page.map((album) => [artist, album] as [Artist, AlbumSummary])
+              )
+            )
+          );
+        });
+
+        await expect(cappedSubsonic.getAlbumIndex(credentials)).rejects.toThrow(
+          /safety cap/
+        );
+        await new Promise((resolve) => setImmediate(resolve));
+        // Nothing truncated was cached or persisted.
+        expect(indexCache.size()).toBe(0);
+        expect(indexCacheStore.save).not.toHaveBeenCalled();
+      });
+
       it("rejects an inconsistent album-index scan so a duplicate/missing snapshot is not cached or persisted", async () => {
         const indexCacheStore = {
           load: jest.fn(() => []),

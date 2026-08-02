@@ -1286,6 +1286,11 @@ describe("server", () => {
                   expect(res.status).toEqual(200);
                   expect(res.header["accept-ranges"]).toEqual("bytes");
                   expect(Object.keys(res.headers)).not.toContain("content-range");
+                  // Not a bare `Content-Type:` (what collapsing to "" produced), and not omitted
+                  // either - omitting lets Express substitute "text/html; charset=utf-8", which is
+                  // actively wrong for audio. Say "bytes of unknown type" and mislead nobody.
+                  // Express appends its own charset; the type is what matters here.
+                  expect(res.headers["content-type"]).toMatch(/^application\/octet-stream/);
                 });
               });
 

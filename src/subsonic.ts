@@ -292,6 +292,18 @@ export const DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS = 5_000;
 //
 // A median over the window ignores a minority of outliers outright, and only moves once slowness
 // is the common case - which is the condition admission control actually exists for.
+// Page size for the one-time album index scan. Named because the loop's terminating condition
+// depends on it: a short page means the catalog ended.
+export const ALBUM_SCAN_PAGE_SIZE = 500;
+
+// Safety cap on the index scan, to stop a runaway or pathological server walking forever. Raised
+// from a hardcoded 2,000,000 - a catalog of millions is the target, and at 2M the old cap silently
+// truncated the index rather than refusing. Override with BNB_MAX_INDEX_SCAN_ALBUMS.
+export const DEFAULT_MAX_INDEX_SCAN_ALBUMS = (() => {
+  const raw = Number.parseInt(process.env["BNB_MAX_INDEX_SCAN_ALBUMS"] || "", 10);
+  return Number.isInteger(raw) && raw > 0 ? raw : 20_000_000;
+})();
+
 export const COVER_ART_LATENCY_WINDOW = 16;
 
 // Below this many observations the guard stays dormant. Without it, one cold first fetch was
@@ -1460,6 +1472,8 @@ export class Subsonic {
   // Bounds and coalesces getCoverArt across all libraries on this instance (see CoverArtCoordinator).
   private coverArtCoordinator: CoverArtCoordinator;
 
+  private readonly maxIndexScanAlbums: number;
+
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
@@ -1473,8 +1487,13 @@ export class Subsonic {
     // Cover-art coordination options: an optional test/config object so tests can exercise real
     // coordinator behaviour (concurrency cap, queue depth, queue wait) without poking private
     // fields. All existing positional callers are preserved.
-    coverArtCoordinatorOptions: CoverArtCoordinatorOptions = {}
+    coverArtCoordinatorOptions: CoverArtCoordinatorOptions = {},
+    // Upper bound on the one-time album index scan. Injectable so the truncation guard can be
+    // tested without mocking millions of albums, and env-overridable so a very large catalog can
+    // be raised without a rebuild.
+    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS
   ) {
+    this.maxIndexScanAlbums = maxIndexScanAlbums;
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
@@ -1700,9 +1719,13 @@ export class Subsonic {
   ): Promise<AlbumIndex<AlbumSummary>> => {
     const pages: AlbumSummary[][] = [];
     const seen = new Set<string>();
-    for (let offset = 0; offset < 2_000_000; offset += 500) {
+    let complete = false;
+    for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
       const page = await this.scanAlbums(credentials, offset);
-      if (page.length === 0) break;
+      if (page.length === 0) {
+        complete = true;
+        break;
+      }
       for (const album of page) {
         if (seen.has(album.id)) {
           throw new Error(
@@ -1712,7 +1735,21 @@ export class Subsonic {
         seen.add(album.id);
       }
       pages.push(page);
-      if (page.length < 500) break;
+      if (page.length < ALBUM_SCAN_PAGE_SIZE) {
+        complete = true;
+        break;
+      }
+    }
+    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+    // partial result was returned, cached and persisted as if it were the whole catalog: every
+    // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
+    // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
+    // leaves the previous good index in place and says why, which is what the duplicate-id guard
+    // below already does for the other way a scan can be untrustworthy.
+    if (!complete) {
+      throw new Error(
+        `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
+      );
     }
     return buildAlbumIndexFromPages(pages);
   };
