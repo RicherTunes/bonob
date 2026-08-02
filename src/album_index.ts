@@ -22,8 +22,18 @@ export type AlbumIndex<T = { name: string }> = {
   // Contiguous runs in scan order. A letter may appear in more than one run when a stray title
   // sorts away from its neighbours; correctness does not depend on runs being one-per-letter.
   buckets: AlbumIndexBucket[];
-  // The scanned album snapshot, in scan order. Runs index into this array.
+  // The scanned album snapshot, in scan order. Runs index into this array. For a disk-backed
+  // (large-catalog) index this is EMPTY — the records live in `snapshotFile` and a page is read on
+  // demand via `offsets` (see readAlbumIndexPage/readAlbumIndexAll in album_snapshot.ts), so the
+  // full snapshot is never resident. Absent for in-memory (small/test) indexes.
   items: T[];
+  // Slice 1 disk-backed snapshot. `snapshotFile` is an absolute path to an IMMUTABLE, per-build
+  // file; `offsets[i]` is the byte offset of record i within it (offsets[total] = end of records).
+  // A page read opens the file and reads exactly [offsets[s], offsets[e]) for the requested slice.
+  // Because the file is never rewritten (each rebuild is a new file) offsets always resolve against
+  // the same bytes they were built from — drift is impossible across a rebuild.
+  snapshotFile?: string;
+  offsets?: Uint32Array;
 };
 
 // A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
@@ -83,6 +93,26 @@ export function albumBucketKey(
 const compareBucketKeys = (a: string, b: string): number =>
   a === b ? 0 : a === "#" ? -1 : b === "#" ? 1 : a < b ? -1 : 1;
 
+// Accumulates the contiguous-run bucket table one album at a time, in scan order. A new run starts
+// whenever the bucket key changes, so each run is an exact [offset, offset+count) slice of the
+// snapshot. Shared by the in-memory reduce (buildAlbumIndexFromPages) and the disk-streaming build
+// (Subsonic.buildAlbumIndex) so the two paths cannot diverge in how they bucket.
+export class BucketBuilder<T extends { name: string }> {
+  readonly buckets: AlbumIndexBucket[] = [];
+  private current: AlbumIndexBucket | undefined;
+  total = 0;
+
+  append(album: T, ignoredArticles?: string[]): void {
+    const key = albumBucketKey(album.name, ignoredArticles);
+    if (!this.current || this.current.key !== key) {
+      this.current = { key, label: key, offset: this.total, count: 0 };
+      this.buckets.push(this.current);
+    }
+    this.current.count++;
+    this.total++;
+  }
+}
+
 // Reduce the scanned album pages (in alphabeticalByName order) into the snapshot + contiguous runs.
 // Pure so it can be unit-tested without the Subsonic client. A new run starts whenever the bucket
 // key changes, so each run is an exact [offset, offset+count) slice of the stored `items` snapshot.
@@ -90,23 +120,13 @@ export function buildAlbumIndexFromPages<T extends { name: string }>(
   pages: T[][],
   ignoredArticles?: string[]
 ): AlbumIndex<T> {
-  const buckets: AlbumIndexBucket[] = [];
-  const items: T[] = [];
-  let offset = 0;
-  let current: AlbumIndexBucket | undefined;
+  const builder = new BucketBuilder<T>();
   for (const page of pages) {
     for (const album of page) {
-      items.push(album);
-      const key = albumBucketKey(album.name, ignoredArticles);
-      if (!current || current.key !== key) {
-        current = { key, label: key, offset, count: 0 };
-        buckets.push(current);
-      }
-      current.count++;
-      offset++;
+      builder.append(album, ignoredArticles);
     }
   }
-  return { total: offset, buckets, items };
+  return { total: builder.total, buckets: builder.buckets, items: pages.flat() };
 }
 
 // Serve one page of a letter directly from the stored snapshot: gather the letter's contiguous

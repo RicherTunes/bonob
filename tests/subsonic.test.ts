@@ -1,7 +1,7 @@
 import { option as O, either as E } from "fp-ts";
 import { randomUUID as uuid } from "crypto";
 import { createHash } from "crypto";
-import { existsSync, readFileSync, writeFileSync, mkdtempSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
 import os from "os";
 import path from "path";
 
@@ -58,6 +58,7 @@ import { SwrCache } from "../src/swr_cache";
 
 import { Album, Artist, Track, AlbumSummary, AlbumQuery, AuthFailure } from "../src/music_library";
 import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
+import { readAlbumIndexPage } from "../src/album_snapshot";
 import { BUrn } from "../src/burn";
 
 
@@ -1274,6 +1275,64 @@ describe("Subsonic", () => {
           "A:1:1",
           "B:2:1",
         ]);
+      });
+
+      it("streams a disk-backed snapshot when a snapshot dir is configured (Slice 1)", async () => {
+        const snap = mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+        try {
+          const onDisk = new Subsonic(
+            url,
+            customPlayers,
+            axiosImageFetcher,
+            SwrCache.disabled(),
+            new SwrCache(clock, 60_000),
+            false,
+            {},
+            undefined,
+            snap
+          );
+          const artist = anArtist();
+          const page: [Artist, AlbumSummary][] = [
+            [artist, anAlbumSummary({ name: "369" })],
+            [artist, anAlbumSummary({ name: "Amsterdam" })],
+            [artist, anAlbumSummary({ name: "Anthracite" })],
+            [artist, anAlbumSummary({ name: "The Beatles" })],
+          ];
+          mockGET.mockImplementation((u: string) =>
+            Promise.resolve(
+              ok(
+                u.includes("getAlbumList2")
+                  ? getAlbumListJson(page)
+                  : asArtistsJson(cached)
+              )
+            )
+          );
+          const idx = await onDisk.getAlbumIndex(credentials);
+          // Disk-backed: the snapshot is NOT resident. items is empty; a snapshot file + a Uint32Array
+          // of byte offsets are what is held instead.
+          expect(idx.items).toEqual([]);
+          expect(idx.offsets).toBeInstanceOf(Uint32Array);
+          expect(idx.offsets!.length).toBe(4 + 1);
+          expect(idx.snapshotFile).toBeDefined();
+          expect(existsSync(idx.snapshotFile!)).toBe(true);
+          expect(idx.buckets.map((b) => `${b.key}:${b.offset}:${b.count}`)).toEqual([
+            "#:0:1",
+            "A:1:2",
+            "B:3:1",
+          ]);
+          // The letter page is read from disk and matches the scanned catalog, full record intact
+          // (year + genre survive the round trip — Slice 1 does not drop fields).
+          const aPage = await readAlbumIndexPage(idx, "A", 0, 10);
+          expect(aPage.total).toBe(2);
+          expect(aPage.items.map((a) => a.name)).toEqual([
+            "Amsterdam",
+            "Anthracite",
+          ]);
+          expect(typeof aPage.items[0]!.year).toBe("string");
+          expect(aPage.items[0]!.genre).toBeDefined();
+        } finally {
+          rmSync(snap, { recursive: true, force: true });
+        }
       });
 
       it("refuses a scan that hits the safety cap rather than caching a TRUNCATED index", async () => {
