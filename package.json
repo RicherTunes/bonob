@@ -2,7 +2,7 @@
   "name": "bonob",
   "version": "0.0.1",
   "main": "index.js",
-  "repository": "https://github.com/simojenki/bonob",
+  "repository": "https://github.com/RicherTunes/bonob",
   "author": "simojenki <simojenki@users.noreply.github.com>",
   "license": "GPL-3.0-only",
   "dependencies": {

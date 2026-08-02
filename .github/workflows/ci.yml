@@ -9,6 +9,17 @@ on:
   pull_request:
     branches:
       - 'master'
+  # Publication is MANUAL ONLY (see push_to_registry). This fork inherited a workflow that
+  # published to the upstream maintainer's namespaces on every master push; nothing here may
+  # publish again until RicherTunes-owned namespaces and credentials are explicitly configured.
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: >-
+          Publish Docker images. Requires the PUBLISH_IMAGES repository variable to name
+          RicherTunes-owned targets, plus registry credentials. Leave false to only build and test.
+        type: boolean
+        default: false
 
 jobs:
 
@@ -23,7 +34,7 @@ jobs:
         with:
           node-version: 22
       -
-        run: npm install
+        run: npm ci
       -
         run: npm test
 
@@ -32,6 +43,13 @@ jobs:
     name: Push Docker image to Docker registries
     needs: build_and_test
     runs-on: ubuntu-latest
+    # Never publishes automatically. All three conditions must hold: a deliberate manual dispatch,
+    # publish explicitly requested, and PUBLISH_IMAGES set to RicherTunes-owned targets. Until that
+    # variable exists the job is skipped, so no push, tag, or release can reach a registry.
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && inputs.publish
+      && vars.PUBLISH_IMAGES != ''
     steps:
       -
         name: Check out the repo
@@ -45,27 +63,38 @@ jobs:
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       -
+        name: Refuse to publish to a namespace we do not own
+        env:
+          PUBLISH_IMAGES: ${{ vars.PUBLISH_IMAGES }}
+        run: |
+          set -euo pipefail
+          # Defence in depth behind the job-level `if`: a namespace we do not control must never be
+          # a push target, however this job came to run.
+          if printf '%s' "$PUBLISH_IMAGES" | grep -qi 'simojenki'; then
+            echo "::error::PUBLISH_IMAGES targets the upstream maintainer's namespace. Refusing."
+            exit 1
+          fi
+          printf '%s\n' "Publishing to: $PUBLISH_IMAGES"
+      -
         name: Docker meta
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: |
-            simojenki/bonob
-            ghcr.io/simojenki/bonob
+          images: ${{ vars.PUBLISH_IMAGES }}
       -
         name: Login to DockerHub
-        if: github.event_name != 'pull_request'
+        if: vars.PUBLISH_DOCKERHUB == 'true'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       -
         name: Log in to GitHub Container registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
+          # This fork's own owner, never a hardcoded upstream account.
+          username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
       -
         name: Push image
@@ -73,7 +102,7 @@ jobs:
         with:
           context: .
           platforms: linux/amd64,linux/arm/v7,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

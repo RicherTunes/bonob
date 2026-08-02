@@ -32,9 +32,13 @@ RUN npm run gitinfo && \
 
 FROM node:22-bookworm-slim
 
-LABEL   maintainer="simojenki" \
-        org.opencontainers.image.source="https://github.com/simojenki/bonob" \
-        org.opencontainers.image.description="bonob SONOS SMAPI implementation" \
+# This image is built from a MODIFIED fork. maintainer/image.source must name the fork so the
+# image is not attributed to, or linked against, the upstream maintainer's repository; the
+# description carries the GPLv3 s5(a) notice of modification. Upstream authorship is preserved in
+# LICENSE and in package.json's author field.
+LABEL   maintainer="RicherTunes" \
+        org.opencontainers.image.source="https://github.com/RicherTunes/bonob" \
+        org.opencontainers.image.description="bonob SONOS SMAPI implementation - modified fork of simojenki/bonob" \
         org.opencontainers.image.licenses="GPLv3"
 
 ENV BNB_PORT=4534
