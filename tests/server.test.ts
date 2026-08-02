@@ -1176,7 +1176,42 @@ describe("server", () => {
                   expect(stream.stream.destroyed).toBe(true);
                 });
               });
-  
+
+              describe("when the music service returns no content-type at all", () => {
+                it("should still respond, rather than throwing on undefined.split", async () => {
+                  // sonosisfyContentType used to take `string` and call .split(";") on it directly,
+                  // while TrackStream.headers claimed every header was present. An upstream 200
+                  // carrying no content-type therefore threw inside the response handler. These
+                  // headers are genuinely optional, so an absent one must simply be omitted.
+                  const stream = {
+                    status: 200,
+                    headers: {
+                      "content-type": undefined,
+                      "content-length": "22",
+                      "accept-ranges": "bytes",
+                      "content-range": undefined,
+                    },
+                    stream: streamContent(""),
+                  };
+
+                  musicService.login.mockResolvedValue(musicLibrary);
+                  musicLibrary.stream.mockResolvedValue(stream);
+                  musicLibrary.nowPlaying.mockResolvedValue(true);
+
+                  const res = await request(server)
+                    .get(
+                      bonobUrl
+                        .append({ pathname: `/stream/track/${trackId}` })
+                        .path()
+                    )
+                    .set('authorization', apiTokens.mint(serviceToken));
+
+                  expect(res.status).toEqual(200);
+                  expect(res.header["accept-ranges"]).toEqual("bytes");
+                  expect(Object.keys(res.headers)).not.toContain("content-range");
+                });
+              });
+
               describe("when the music service returns a 200", () => {
                 it("should return a 200 with the data", async () => {
                   const stream = {

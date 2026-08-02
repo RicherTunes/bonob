@@ -21,6 +21,7 @@ import {
   CoverArtUnavailableError,
   CoverArtUpstreamError,
   classifyCoverArtError,
+  headerString,
   DEFAULT_COVER_ART_CONCURRENCY,
   DEFAULT_COVER_ART_QUEUE,
   DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS,
@@ -453,6 +454,29 @@ describe("CoverArtCoordinator admission control (never promise a wait it cannot 
     block.resolve(Buffer.from("held"));
     await expect(held).resolves.toEqual(Buffer.from("held"));
     await expect(queued).resolves.toEqual(Buffer.from("q"));
+  });
+});
+
+describe("headerString (axios >= 1.19 header values are not plain strings)", () => {
+  it("passes a plain string through", () => {
+    expect(headerString("image/png")).toEqual("image/png");
+  });
+
+  it("treats an absent header as undefined, not the string 'undefined'", () => {
+    expect(headerString(undefined)).toBeUndefined();
+    expect(headerString(null)).toBeUndefined();
+  });
+
+  it("takes the first value of a repeated header", () => {
+    expect(headerString(["image/png", "image/jpeg"])).toEqual("image/png");
+  });
+
+  it("treats an empty repeated header as absent", () => {
+    expect(headerString([])).toBeUndefined();
+  });
+
+  it("stringifies a numeric header (content-length arrives as a number)", () => {
+    expect(headerString(1234)).toEqual("1234");
   });
 });
 

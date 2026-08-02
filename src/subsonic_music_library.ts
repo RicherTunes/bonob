@@ -30,6 +30,7 @@ import {
   classifyCoverArtError,
   CoverArtUnavailableError,
   CoverArtUpstreamError,
+  headerString,
 } from "./subsonic";
 import _ from "underscore";
 
@@ -283,7 +284,9 @@ export class SubsonicMusicLibrary implements MusicLibrary {
         size
       );
       return {
-        contentType: res.headers["content-type"],
+        // Absent content-type collapses to "", which fails the image/* check at the HTTP layer, so
+        // a 200 carrying no content type is refused rather than served as art of unknown type.
+        contentType: headerString(res.headers["content-type"]) ?? "",
         data: Buffer.from(res.data, "binary"),
       };
     } catch (e) {

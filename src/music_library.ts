@@ -157,7 +157,11 @@ export type StreamingHeader = "content-type" | "content-length" | "content-range
 
 export type TrackStream = {
   status: number;
-  headers: Record<StreamingHeader, string>;
+  // Each of these is genuinely optional: content-range and accept-ranges are absent on a
+  // non-range response, and an upstream can answer 200 with no content-type at all. This was
+  // previously typed `string`, which asserted a presence the code never had - the stream responder
+  // has always filtered undefined out at runtime because of it.
+  headers: Record<StreamingHeader, string | undefined>;
   stream: any;
 };
 

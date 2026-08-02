@@ -207,6 +207,22 @@ export const isValidImage = (url: string | undefined) =>
 // A READ may be retried once on a transient transport failure (network error / 5xx). Do NOT retry a
 // 4xx or a Subsonic-level application error (a valid response reporting a problem) - retrying those
 // is pointless, and the GET-based mutations must never be retried.
+// Collapse an axios response header value to the single header string we want, or undefined when
+// the header is genuinely absent.
+//
+// axios >= 1.19 types header values as AxiosHeaderValue | undefined (string | number | boolean |
+// null | string[]) rather than `string`. That is not merely a typing nicety: these values were
+// previously asserted to be `string` and assumed present, which is false for content-range and
+// accept-ranges on a non-range response, and for a 200 that carries no content-type at all. The
+// stream responder already filtered undefined out at runtime precisely because it happens.
+export const headerString = (value: unknown): string | undefined => {
+  if (value === undefined || value === null) return undefined;
+  // A repeated header arrives as an array; the first value is the effective one for the
+  // single-valued headers we read here.
+  if (Array.isArray(value)) return value.length > 0 ? String(value[0]) : undefined;
+  return String(value);
+};
+
 export const isRetryableSubsonicError = (e: unknown): boolean => {
   // Subsonic application-level error (a valid HTTP response reporting a problem) - retrying is pointless.
   if (String(e).startsWith("Subsonic error:")) return false;
@@ -1181,7 +1197,9 @@ const imageFetcherWith =
         ...extra,
       })
       .then((res) => ({
-        contentType: res.headers["content-type"],
+        // An absent content-type collapses to "", which fails the image/* check at the HTTP layer
+        // and is refused as art rather than being served as bytes of unknown type.
+        contentType: headerString(res.headers["content-type"]) ?? "",
         data: Buffer.from(res.data, "binary"),
       }))
       .catch(() => undefined);
@@ -1921,10 +1939,10 @@ export class Subsonic {
     .then((stream) => ({
       status: stream.status,
       headers: {
-        "content-type": stream.headers["content-type"],
-        "content-length": stream.headers["content-length"],
-        "content-range": stream.headers["content-range"],
-        "accept-ranges": stream.headers["accept-ranges"],
+        "content-type": headerString(stream.headers["content-type"]),
+        "content-length": headerString(stream.headers["content-length"]),
+        "content-range": headerString(stream.headers["content-range"]),
+        "accept-ranges": headerString(stream.headers["accept-ranges"]),
       },
       stream: stream.data,
     }));
@@ -1974,10 +1992,10 @@ export class Subsonic {
     .then((stream) => ({
       status: stream.status,
       headers: {
-        "content-type": stream.headers["content-type"],
-        "content-length": stream.headers["content-length"],
-        "content-range": stream.headers["content-range"],
-        "accept-ranges": stream.headers["accept-ranges"],
+        "content-type": headerString(stream.headers["content-type"]),
+        "content-length": headerString(stream.headers["content-length"]),
+        "content-range": headerString(stream.headers["content-range"]),
+        "accept-ranges": headerString(stream.headers["accept-ranges"]),
       },
       stream: stream.data,
     }));

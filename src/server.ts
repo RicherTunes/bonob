@@ -497,8 +497,10 @@ function server(
             `${trace} bnb<- stream response from music service for ${id}, status=${stream.status}, headers=(${JSON.stringify(stream.headers)})`
           );
 
-          const sonosisfyContentType = (contentType: string) =>
-            contentType
+          // An upstream 200 with no content-type used to throw here (undefined.split). Collapse it
+          // to "" so the header is simply omitted by respondWith rather than crashing the stream.
+          const sonosisfyContentType = (contentType: string | undefined) =>
+            (contentType ?? "")
               .split(";")
               .map((it) => it.trim())
               .map(sonosifyMimeType)
@@ -513,7 +515,9 @@ function server(
           }: {
             status: number;
             filter: Transform;
-            headers: Record<string, string>;
+            // Absent upstream headers are passed through as undefined and dropped below, rather
+            // than being asserted as strings and set as the literal "undefined".
+            headers: Record<string, string | undefined>;
             sendStream: boolean;
             nowPlaying: boolean;
           }) => {
