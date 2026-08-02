@@ -356,6 +356,106 @@ describe("CoverArtCoordinator coalescing + concurrency", () => {
   });
 });
 
+describe("CoverArtCoordinator admission control (never promise a wait it cannot honour)", () => {
+  // Production regime (measured on the VPS): Navidrome runs with ND_DEVARTWORKMAXREQUESTS=10 and
+  // ND_DEVARTWORKTHROTTLEBACKLOGTIMEOUT=5s, so with a cold image cache or a stalled music mount a
+  // single getCoverArt routinely takes longer than the coordinator's own queue deadline.
+  //
+  // When that happens a queued request provably CANNOT be served before its deadline, yet the
+  // queue still admits it and makes it wait the full deadline before rejecting. That is the worst
+  // of both outcomes - latency AND failure - and it pins an Express handler plus a Sonos socket for
+  // the whole wait to deliver a 503 that was knowable at admission time. Admission must be decided
+  // from observed latency, not discovered after the fact.
+  const flush = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it("rejects immediately once observed latency proves the queue cannot drain within the deadline", async () => {
+    jest.useFakeTimers();
+    try {
+      const queueTimeoutMs = 1000;
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs });
+      const slowTask = (v: string) => () =>
+        new Promise<Buffer>((res) => setTimeout(() => res(Buffer.from(v)), 2000));
+
+      // Observe one real slot hold of 2s, i.e. twice the queue deadline.
+      const seed = coord.run(coverArtKey("u", "p", "seed", 1), slowTask("seed"));
+      jest.advanceTimersByTime(2000);
+      await expect(seed).resolves.toEqual(Buffer.from("seed"));
+
+      // Re-occupy the only slot with another 2s call.
+      const held = coord.run(coverArtKey("u", "p", "held", 1), slowTask("held"));
+
+      // A request queued behind `held` would wait ~2s, but its deadline is 1s. It must reject NOW,
+      // with no timer advanced at all - not after burning the full 1s wait.
+      const doomed = coord.run(coverArtKey("u", "p", "doomed", 1), () =>
+        Promise.resolve(Buffer.from("never"))
+      );
+      const onRejected = jest.fn();
+      doomed.catch(onRejected);
+      await flush();
+
+      expect(onRejected).toHaveBeenCalledTimes(1);
+      expect(onRejected.mock.calls[0]![0]).toBeInstanceOf(CoverArtBusyError);
+
+      jest.advanceTimersByTime(2000);
+      await expect(held).resolves.toEqual(Buffer.from("held"));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("still queues normally when observed latency leaves room inside the deadline", async () => {
+    jest.useFakeTimers();
+    try {
+      const queueTimeoutMs = 1000;
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs });
+      const fastTask = (v: string) => () =>
+        new Promise<Buffer>((res) => setTimeout(() => res(Buffer.from(v)), 100));
+
+      const seed = coord.run(coverArtKey("u", "p", "seed", 1), fastTask("seed"));
+      jest.advanceTimersByTime(100);
+      await expect(seed).resolves.toEqual(Buffer.from("seed"));
+
+      // A 100ms observed latency means one turnover costs 100ms, well inside the 1s deadline, so a
+      // queued request must NOT be rejected at admission - the guard only engages under degradation.
+      const held = coord.run(coverArtKey("u", "p", "held", 1), fastTask("held"));
+      const queued = coord.run(coverArtKey("u", "p", "queued", 1), fastTask("queued"));
+      const onRejected = jest.fn();
+      queued.catch(onRejected);
+      await flush();
+      expect(onRejected).not.toHaveBeenCalled();
+
+      jest.advanceTimersByTime(100);
+      await expect(held).resolves.toEqual(Buffer.from("held"));
+      jest.advanceTimersByTime(100);
+      await expect(queued).resolves.toEqual(Buffer.from("queued"));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("admits normally before any latency has been observed (no cold-start false rejection)", async () => {
+    const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 8, queueTimeoutMs: 1000 });
+    const block = deferred<Buffer>();
+    const held = coord.run(coverArtKey("u", "p", "held", 1), () => block.promise);
+    const queued = coord.run(coverArtKey("u", "p", "queued", 1), () =>
+      Promise.resolve(Buffer.from("q"))
+    );
+    const onRejected = jest.fn();
+    queued.catch(onRejected);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onRejected).not.toHaveBeenCalled();
+
+    block.resolve(Buffer.from("held"));
+    await expect(held).resolves.toEqual(Buffer.from("held"));
+    await expect(queued).resolves.toEqual(Buffer.from("q"));
+  });
+});
+
 describe("classifyCoverArtError (honest explicit union)", () => {
   const axiosErr = (status: number | undefined, code?: string) => {
     const e = new AxiosError(

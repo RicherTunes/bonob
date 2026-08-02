@@ -263,6 +263,11 @@ export const DEFAULT_COVER_ART_CONCURRENCY = 4;
 export const DEFAULT_COVER_ART_QUEUE = 64;
 export const DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS = 5_000;
 
+// Weight of the newest sample in the observed slot-hold latency EWMA. High enough to react within
+// a few calls once the upstream degrades (which is exactly when admission control has to engage),
+// low enough that one slow outlier does not start rejecting an otherwise healthy queue.
+export const COVER_ART_LATENCY_EWMA_ALPHA = 0.3;
+
 // A transient capacity/availability signal surfaced by the coordinator: the queue is full, or a
 // queued request waited past its bounded deadline. Subclass of CoverArtUnavailableError so the HTTP
 // layer maps it to a single 503 path (one instanceof check), and so callers can classify it.
@@ -341,6 +346,9 @@ export class CoverArtCoordinator {
   private active = 0;
   private readonly inFlight = new Map<string, Promise<unknown>>();
   private readonly queue: Queued[] = [];
+  // Observed upstream slot-hold latency (EWMA, ms). Undefined until the first call settles, so a
+  // cold coordinator never rejects on an estimate it has not measured yet.
+  private latencyEwmaMs: number | undefined;
 
   constructor(opts: CoverArtCoordinatorOptions = {}) {
     const maxConcurrency = opts.maxConcurrency ?? DEFAULT_COVER_ART_CONCURRENCY;
@@ -403,6 +411,20 @@ export class CoverArtCoordinator {
       return Promise.reject(new CoverArtBusyError("cover art queue full"));
     }
 
+    // Admission control. maxQueue alone is decoupled from queueTimeoutMs and from how long a slot
+    // is actually held, so a deep queue can admit requests it provably cannot serve in time: with
+    // an upstream slower than the deadline, EVERY queued request waits the full deadline and then
+    // fails. That is the worst of both outcomes - latency AND failure - and each one pins an
+    // Express handler plus a Sonos socket for the whole wait to return a 503 that was already
+    // knowable. Reject those at admission instead; the queue then only holds requests that a
+    // measured upstream can still reach in time.
+    const estimatedWaitMs = this.estimatedWaitMs(this.queue.length);
+    if (estimatedWaitMs !== undefined && estimatedWaitMs > this.queueTimeoutMs) {
+      return Promise.reject(
+        new CoverArtBusyError("cover art queue wait would exceed the deadline")
+      );
+    }
+
     return new Promise<unknown>((resolve, reject) => {
       const entry: Queued = {
         task,
@@ -422,16 +444,50 @@ export class CoverArtCoordinator {
     });
   };
 
-  // Run a task under an active slot. A synchronous throw from the task is normalized to a rejection
-  // so the slot is always released exactly once via the settle handler.
-  private execute = (task: () => Promise<unknown>): Promise<unknown> => {
-    this.active += 1;
+  // How long a request joining the queue at `position` (0-based) would wait: it reaches a slot
+  // after ceil((position + 1) / maxConcurrency) turnovers of the observed slot-hold latency.
+  // Undefined until a latency has been measured, so a cold coordinator admits normally.
+  //
+  // This deliberately ignores how far the currently-active calls have already progressed, which
+  // makes the estimate conservative by at most one turnover. That bias is the right way round:
+  // under a degraded upstream it is better to answer "busy" at once than to hold the caller for
+  // the full deadline and answer "busy" anyway.
+  private estimatedWaitMs = (position: number): number | undefined => {
+    if (this.latencyEwmaMs === undefined) return undefined;
+    return Math.ceil((position + 1) / this.maxConcurrency) * this.latencyEwmaMs;
+  };
+
+  private recordLatency = (sampleMs: number): void => {
+    const sample = Math.max(0, sampleMs);
+    this.latencyEwmaMs =
+      this.latencyEwmaMs === undefined
+        ? sample
+        : COVER_ART_LATENCY_EWMA_ALPHA * sample +
+          (1 - COVER_ART_LATENCY_EWMA_ALPHA) * this.latencyEwmaMs;
+  };
+
+  // Start a task under an already-held slot, timing how long it holds that slot so admission
+  // control has a measured latency to work from. A synchronous throw is normalized to a rejection
+  // so the caller can always attach settle handlers exactly once.
+  private startTask = (task: () => Promise<unknown>): Promise<unknown> => {
+    const startedAt = Date.now();
     let result: Promise<unknown>;
     try {
       result = Promise.resolve(task());
     } catch (e) {
       result = Promise.reject(e);
     }
+    // A failure still consumed the slot for as long as it took, so it is a valid latency sample.
+    const record = () => this.recordLatency(Date.now() - startedAt);
+    result.then(record, record);
+    return result;
+  };
+
+  // Run a task under a newly-taken active slot. The slot is always released exactly once via the
+  // settle handler.
+  private execute = (task: () => Promise<unknown>): Promise<unknown> => {
+    this.active += 1;
+    const result = this.startTask(task);
     result.then(
       () => this.onSettled(),
       () => this.onSettled()
@@ -445,12 +501,8 @@ export class CoverArtCoordinator {
     const next = this.queue.shift();
     if (next) {
       if (next.timer) clearTimeout(next.timer);
-      let result: Promise<unknown>;
-      try {
-        result = Promise.resolve(next.task());
-      } catch (e) {
-        result = Promise.reject(e);
-      }
+      // Inherits the freed slot (no re-increment), and is timed like any other slot hold.
+      const result = this.startTask(next.task);
       result.then(next.resolve, next.reject);
       result.then(
         () => this.onSettled(),
