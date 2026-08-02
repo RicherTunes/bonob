@@ -1484,6 +1484,12 @@ export class Subsonic {
   // offsets resident (O(buckets + offsets), not O(albums)). Undefined → in-memory build (no cache
   // volume configured: nothing is persisted and the resident snapshot is acceptable).
   private readonly albumSnapshotDir: string | undefined;
+  // Global disk-bound options forwarded to each snapshot writer (see enforceSnapshotBounds).
+  private readonly albumSnapshotOpts: {
+    maxBytes?: number;
+    keepPerKey?: number;
+    protectPerKey?: number;
+  };
 
   constructor(
     url: URLBuilder,
@@ -1506,10 +1512,18 @@ export class Subsonic {
     // Directory on the cache volume for the disk-backed album snapshot (Slice 1). Injected from
     // app.ts so it shares the index cache volume with the persisted store. Defaults to undefined
     // (in-memory build) so existing test/non-cache callers are unchanged.
-    albumSnapshotDir: string | undefined = undefined
+    albumSnapshotDir: string | undefined = undefined,
+    // Global disk-bound options for the snapshot store (maxBytes / keepPerKey / protectPerKey).
+    // Defaults (see album_snapshot.ts) apply when unset, so existing positional callers are unchanged.
+    albumSnapshotOpts: {
+      maxBytes?: number;
+      keepPerKey?: number;
+      protectPerKey?: number;
+    } = {}
   ) {
     this.maxIndexScanAlbums = maxIndexScanAlbums;
     this.albumSnapshotDir = albumSnapshotDir;
+    this.albumSnapshotOpts = albumSnapshotOpts;
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
@@ -1743,8 +1757,11 @@ export class Subsonic {
     const cacheKey = `albumIndex:v3:${credentials.username}`;
     const seen = new Set<string>();
     const builder = new BucketBuilder<AlbumSummary>();
+    // Distinct release years, gathered during the same scan so the "Years" browse filter is O(1) and
+    // complete (the scan already touches every album). Persisted into the snapshot trailer.
+    const yearsSet = new Set<string>();
     const writer = this.albumSnapshotDir
-      ? new AlbumSnapshotWriter(this.albumSnapshotDir, cacheKey)
+      ? new AlbumSnapshotWriter(this.albumSnapshotDir, cacheKey, this.albumSnapshotOpts)
       : undefined;
     // `items` is only collected for the resident (no-directory) build; the disk build leaves it
     // empty and serves pages from the snapshot file via readAlbumIndexPage/readAlbumIndexAll.
@@ -1754,18 +1771,28 @@ export class Subsonic {
     // dominated by its (~N/500) HTTP round trips, not local I/O.
     const ingest = async (album: AlbumSummary): Promise<void> => {
       builder.append(album);
+      if (album.year) yearsSet.add(album.year);
       if (writer) await writer.write(album);
       else items!.push(album);
     };
     let complete = false;
+    // CUMULATIVE INGESTED-COUNT GUARD. The loop is driven by `ingested` (records actually stored),
+    // never by the raw scan offset, so it can NEVER ingest more than `maxIndexScanAlbums` records.
+    // When the cap is not a multiple of the 500-album page size, the final page would otherwise
+    // overshoot — ingesting `cap + (up to 499)` records into the resident `items` / the writer before
+    // the over-cap reject fires. Slicing the last page to the remaining allowance holds the line at
+    // exactly `cap`; a full page that still exceeds the allowance is itself proof the catalog is
+    // larger than the cap, which the probe below then turns into a refusal.
+    let ingested = 0;
     try {
-      for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
+      for (let offset = 0; ingested < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
         const page = await this.scanAlbums(credentials, offset);
         if (page.length === 0) {
           complete = true;
           break;
         }
-        for (const album of page) {
+        const remaining = this.maxIndexScanAlbums - ingested;
+        for (const album of page.slice(0, remaining)) {
           if (seen.has(album.id)) {
             throw new Error(
               `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
@@ -1773,21 +1800,23 @@ export class Subsonic {
           }
           seen.add(album.id);
           await ingest(album);
+          ingested++;
         }
+        // A short page means the catalog ended within this page (and within the cap): complete.
         if (page.length < ALBUM_SCAN_PAGE_SIZE) {
           complete = true;
           break;
         }
       }
-      // Exactly-at-the-cap is a COMPLETE catalog, not a truncated one. The loop runs while
-    // `offset < cap`, so a catalog of exactly `cap` albums fills every page and the loop runs out of
-    // offsets without ever observing the end - indistinguishable, so far, from a catalog that
-    // overflows. One extra probe settles it: an empty page at `cap` means we really did reach the
-    // end. The default cap is a multiple of the page size, so this is reachable, not theoretical.
-    if (!complete) {
-      const probe = await this.scanAlbums(credentials, this.maxIndexScanAlbums);
-      if (probe.length === 0) complete = true;
-    }
+      // Exactly-at-the-cap is a COMPLETE catalog, not a truncated one. A catalog of exactly `cap`
+      // albums fills every page up to the cap and the loop exits on `ingested === cap` without ever
+      // observing the end — indistinguishable, so far, from a catalog that overflows. One extra probe
+      // settles it: an empty page at `cap` means we really did reach the end. Reachable for any cap
+      // (multiple of the page size or not), not theoretical.
+      if (!complete) {
+        const probe = await this.scanAlbums(credentials, this.maxIndexScanAlbums);
+        if (probe.length === 0) complete = true;
+      }
 
     // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
       // partial result was returned, cached and persisted as if it were the whole catalog: every
@@ -1801,17 +1830,20 @@ export class Subsonic {
           `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
         );
       }
+      // Distinct years, sorted ascending (years() renders them newest-first by reversing).
+      const years = [...yearsSet].sort();
       if (writer) {
-        const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
+        const { snapshotFile, offsets } = await writer.finalize(builder.buckets, years);
         return {
           total: builder.total,
           buckets: builder.buckets,
           items: [],
           snapshotFile,
           offsets,
+          years,
         };
       }
-      return { total: builder.total, buckets: builder.buckets, items: items! };
+      return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {
       if (writer) await writer.abort();
       throw e;
@@ -1947,6 +1979,15 @@ export class Subsonic {
       });
     return this.coverArtCoordinator.run(key, fetch);
   };
+
+  // Fetch a single complete song record by id. Used by the bounded search-orphan recovery path:
+  // a search3 hit occasionally arrives with no albumId, and a getSong re-fetch is the cheap, bounded
+  // way to recover it (one id in, one song out) rather than render an unresolvable album tile. This
+  // is the raw record fetch — getTrack below is getSong + getAlbum, for the heavier single-track path.
+  getSong = (credentials: Credentials, id: string): Promise<song> =>
+    this.getJSONWithRetry<GetSongResponse>(credentials, "/rest/getSong", {
+      id,
+    }).then((it) => it.song);
 
   getTrack = (credentials: Credentials, id: string) =>
     this.getJSONWithRetry<GetSongResponse>(credentials, "/rest/getSong", {

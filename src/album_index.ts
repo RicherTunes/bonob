@@ -34,6 +34,11 @@ export type AlbumIndex<T = { name: string }> = {
   // the same bytes they were built from — drift is impossible across a rebuild.
   snapshotFile?: string;
   offsets?: Uint32Array;
+  // Distinct release years across the scanned catalog (sorted ascending), collected during the same
+  // scan that builds the buckets so the "Years" browse filter is O(1) and complete rather than a
+  // silently-truncated first page. Absent on a pre-change index or a small catalog that never built
+  // one (years() then falls back to a paged collection).
+  years?: string[];
 };
 
 // A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
@@ -178,13 +183,37 @@ export function albumIndexLetters(
   return letters.sort((a, b) => compareBucketKeys(a.key, b.key));
 }
 
+// A lazily-built, memoized per-letter ranges map, so looking up a letter's runs is O(1) after the
+// first access instead of an O(buckets) filter on every browse page. Memoized in a WeakMap keyed by
+// the index object: a cache-resident index (the common case — frozen and shared across every browse
+// of a user) pays the one O(buckets) build ever, and the map is garbage-collected with the index
+// when a rebuild replaces it. The index is treated as immutable (frozen when persisted; never
+// mutated by callers), so a memo built from `buckets` cannot go stale.
+const rangesByKeyCache = new WeakMap<AlbumIndex<any>, Map<string, AlbumIndexBucket[]>>();
+
+function rangesByKey(
+  index: AlbumIndex<any>
+): Map<string, AlbumIndexBucket[]> {
+  let m = rangesByKeyCache.get(index);
+  if (m === undefined) {
+    m = new Map();
+    for (const b of index.buckets) {
+      const arr = m.get(b.key);
+      if (arr) arr.push(b);
+      else m.set(b.key, [b]);
+    }
+    rangesByKeyCache.set(index, m);
+  }
+  return m;
+}
+
 // Every contiguous range that belongs to a letter (usually one, occasionally more for stray
 // titles). The leaf browse pages across these ranges so it returns exactly that letter's albums.
 export function albumIndexRangesFor(
   index: AlbumIndex<any>,
   key: string
 ): AlbumIndexBucket[] {
-  return index.buckets.filter((b) => b.key === key);
+  return rangesByKey(index).get(key) ?? [];
 }
 
 // Total number of albums in a letter (across all its runs). Used to decide whether a letter fits

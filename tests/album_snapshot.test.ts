@@ -1,6 +1,7 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { createHash } from "crypto";
 
 import { AlbumSummary } from "../src/music_library";
 import {
@@ -14,6 +15,7 @@ import {
   albumIndexStore,
   readAlbumIndexPage,
   readAlbumIndexAll,
+  enforceSnapshotBounds,
 } from "../src/album_snapshot";
 
 // Build a disk-backed index the same way Subsonic.buildAlbumIndex does: stream records to the
@@ -320,5 +322,190 @@ describe("album_snapshot: drift is impossible across a rebuild", () => {
       .readdirSync(dir)
       .filter((n) => n.startsWith("albumSnapshot.v3.") && n.endsWith(".dat"));
     expect(datFiles.length).toBeLessThanOrEqual(2);
+  });
+});
+
+// Craft a generation token with a KNOWN order, mirroring generationToken() in album_snapshot.ts
+// (9-char zero-padded base36 timestamp + 10 hex). base36's char-code order matches its digit-value
+// order, so these zero-padded tokens sort lexicographically as numbers — letting a test assert
+// eviction order deterministically without waiting on real wall-clock time.
+const gen = (ts: number) => ts.toString(36).padStart(9, "0") + "0000000000";
+const keyHashOf = (key: string) =>
+  createHash("sha1").update(key).digest("hex");
+const writeNamedSnapshot = (dir: string, key: string, ts: number, bytes: number) => {
+  const full = path.join(dir, `albumSnapshot.v3.${keyHashOf(key)}.${gen(ts)}.dat`);
+  fs.writeFileSync(full, Buffer.alloc(bytes));
+  return full;
+};
+
+describe("album_snapshot: disk bounding — generation token, not mtime; global bound across keys", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-bound-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("evicts by GENERATION token and is unmoved by a deliberately misleading mtime", async () => {
+    // The negative test for findings 1+3: ordering must ride on the token embedded in the name,
+    // never on filesystem mtimeMs. Here the OLDER generation is given the NEWER mtime — exactly the
+    // tie that made the old mtime-based pruning pick the wrong "previous" and evict the live file.
+    // A mtime-based keepPerKey=1 implementation would retain `older`; the token-based one retains
+    // `newer`.
+    const key = "albumIndex:v3:tie";
+    const older = writeNamedSnapshot(dir, key, 1_000, 500); // older TOKEN
+    const newer = writeNamedSnapshot(dir, key, 2_000, 500); // newer TOKEN
+    const t = Date.now() / 1000;
+    fs.utimesSync(older, t, t + 100); // older gen, NEWER mtime (adversarial)
+    fs.utimesSync(newer, t, t); // newer gen, OLDER mtime
+
+    await enforceSnapshotBounds(dir, { keepPerKey: 1, protectPerKey: 1 });
+
+    expect(fs.existsSync(newer)).toBe(true); // newest generation kept despite OLDER mtime
+    expect(fs.existsSync(older)).toBe(false); // older generation evicted despite NEWER mtime
+  });
+
+  it("retains the previous generation across a rebuild so an in-flight browse keeps its file", async () => {
+    // RETAIN-not-delete: with keepPerKey 2, a rebuild does not delete the immediately-previous
+    // generation. An in-flight browse that still holds the superseded AlbumIndex keeps a readable
+    // file (this is the live-reader window the snapshot's immutability exists to protect).
+    const key = "albumIndex:v3:retain";
+    const g1 = writeNamedSnapshot(dir, key, 1_000, 500);
+    const g2 = writeNamedSnapshot(dir, key, 2_000, 500); // a rebuild
+
+    await enforceSnapshotBounds(dir, { keepPerKey: 2, protectPerKey: 1 });
+
+    expect(fs.existsSync(g1)).toBe(true); // previous generation retained
+    expect(fs.existsSync(g2)).toBe(true); // newest retained
+  });
+
+  it("bounds TOTAL bytes across ALL keys, evicting the globally-oldest generation first", async () => {
+    // Two keys, each an old + new generation (1000 B each, 4000 B total). A 3500 B cap forces one
+    // eviction. The globally-oldest generation (key1's old, token 1000 — older than key2's old at
+    // 2000) is reclaimed; both keys keep their newest (the active indexes).
+    const k1 = "albumIndex:v3:k1";
+    const k2 = "albumIndex:v3:k2";
+    const k1Old = writeNamedSnapshot(dir, k1, 1_000, 1000);
+    const k1New = writeNamedSnapshot(dir, k1, 3_000, 1000);
+    const k2Old = writeNamedSnapshot(dir, k2, 2_000, 1000);
+    const k2New = writeNamedSnapshot(dir, k2, 4_000, 1000);
+
+    await enforceSnapshotBounds(dir, { maxBytes: 3500, keepPerKey: 2, protectPerKey: 1 });
+
+    expect(fs.existsSync(k1Old)).toBe(false); // globally-oldest reclaimed
+    expect(fs.existsSync(k2Old)).toBe(true); // newer than k1Old, still under cap
+    expect(fs.existsSync(k1New)).toBe(true); // active index protected
+    expect(fs.existsSync(k2New)).toBe(true); // active index protected
+  });
+
+  it("never evicts the active newest-per-key even when the cap is below the active set", async () => {
+    // A cap smaller than a single active index: reclaim everything reclaimable, but never the
+    // newest per key (protectPerKey 1) — evicting it would break every current and next read. The
+    // store logs and stays over the cap rather than corrupting serving.
+    const key = "albumIndex:v3:smallcap";
+    const old = writeNamedSnapshot(dir, key, 1_000, 1000);
+    const now = writeNamedSnapshot(dir, key, 2_000, 1000);
+
+    await enforceSnapshotBounds(dir, { maxBytes: 1, keepPerKey: 2, protectPerKey: 1 });
+
+    expect(fs.existsSync(old)).toBe(false); // reclaimable older generation evicted
+    expect(fs.existsSync(now)).toBe(true); // active newest NEVER evicted, even over the cap
+  });
+
+  it("applies BOTH layers correctly: per-key cap then global cap, with honest accounting", async () => {
+    // Three generations of one key (oldest/mid/newest), keepPerKey 2, tiny global cap. Layer 1
+    // evicts the rank-2 (oldest, beyond the per-key cap of 2); Layer 2 then evicts the rank-1
+    // (reclaimable, oldest-first) to meet the byte cap, leaving ONLY the active newest. This catches
+    // an accounting bug where Layer 2 re-counted files Layer 1 already deleted.
+    const key = "albumIndex:v3:layers";
+    const oldest = writeNamedSnapshot(dir, key, 1_000, 1000);
+    const mid = writeNamedSnapshot(dir, key, 2_000, 1000);
+    const newest = writeNamedSnapshot(dir, key, 3_000, 1000);
+
+    await enforceSnapshotBounds(dir, { maxBytes: 1, keepPerKey: 2, protectPerKey: 1 });
+
+    expect(fs.existsSync(oldest)).toBe(false); // Layer 1: beyond keepPerKey
+    expect(fs.existsSync(mid)).toBe(false); // Layer 2: reclaimable to meet the byte cap
+    expect(fs.existsSync(newest)).toBe(true); // active newest, never evicted
+  });
+
+  it("also sweeps stale .tmp files left by a build that crashed before its rename", async () => {
+    const key = "albumIndex:v3:tmp";
+    const good = writeNamedSnapshot(dir, key, 1_000, 100);
+    const staleTmp = path.join(
+      dir,
+      `albumSnapshot.v3.${keyHashOf(key)}.${gen(500)}.tmp`
+    );
+    fs.writeFileSync(staleTmp, Buffer.alloc(50));
+
+    await enforceSnapshotBounds(dir, {});
+
+    expect(fs.existsSync(good)).toBe(true);
+    expect(fs.existsSync(staleTmp)).toBe(false);
+  });
+});
+
+describe("album_snapshot: years persist in the trailer and survive a restart", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-years-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("round-trips the distinct years through finalize -> load", async () => {
+    const records = catalog(10, "yr"); // years 1970..1979
+    const builder = new BucketBuilder<AlbumSummary>();
+    const writer = new AlbumSnapshotWriter(dir, "albumIndex:v3:years");
+    await writer.open();
+    for (const album of records) {
+      builder.append(album);
+      await writer.write(album);
+    }
+    const years = [...new Set(records.map((r) => r.year!))].sort();
+    await writer.finalize(builder.buckets, years);
+
+    const loaded = albumIndexStore(dir).load();
+    expect(loaded.length).toBe(1);
+    const idx = loaded[0]!.value as any;
+    // The years persisted in the trailer are restored on the resident index (O(1) serve after a
+    // restart, not a re-scan).
+    expect(idx.years).toEqual(years);
+  });
+
+  it("loads a trailer with NO years field (back-compat) as years undefined, not rejected", async () => {
+    // buildDiskIndex finalizes without passing years, exactly like a pre-change v3 snapshot.
+    const built = await buildDiskIndex(dir, "albumIndex:v3:noyears", catalog(5, "ny"));
+    const loaded = albumIndexStore(dir).load();
+    expect(loaded.length).toBe(1);
+    expect((loaded[0]!.value as any).years).toBeUndefined();
+    expect(built.snapshotFile).toBeDefined();
+  });
+
+  it("refuses a trailer whose years field is malformed (corruption, not back-compat)", async () => {
+    const records = catalog(5, "bad");
+    const built = await buildDiskIndex(dir, "albumIndex:v3:badyears", records);
+    // Patch the trailer's JSON in place: replace the well-formed trailer by rewriting the file with a
+    // trailer whose `years` is not a string[]. The footer (last 8 bytes) and record region are kept
+    // intact by rebuilding from a fresh writer's structure is overkill; instead corrupt just the
+    // years value by hand-editing the parsed trailer and re-serializing.
+    const raw = fs.readFileSync(built.snapshotFile);
+    // Locate the trailer: it is the bytes between (size - 8 - trailerLen) and (size - 8).
+    const size = raw.length;
+    const trailerLen = raw.readUInt32LE(size - 8);
+    const trailerStart = size - 8 - trailerLen;
+    const trailer = JSON.parse(raw.subarray(trailerStart, size - 8).toString("utf8"));
+    trailer.years = "not-an-array"; // malformed
+    const newTrailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
+    // Rebuild the file: records + new trailer + a footer with the new trailer length + original magic.
+    const recordsRegion = raw.subarray(0, trailerStart);
+    const footer = Buffer.alloc(8);
+    footer.writeUInt32LE(newTrailerBuf.length, 0);
+    footer.writeUInt32LE(raw.readUInt32LE(size - 4), 4); // preserve the original magic
+    fs.writeFileSync(built.snapshotFile, Buffer.concat([recordsRegion, newTrailerBuf, footer]));
+    // offsets[total] still equals the (unchanged) record-region length, so only the years check fails.
+    expect(albumIndexStore(dir).load()).toEqual([]);
   });
 });

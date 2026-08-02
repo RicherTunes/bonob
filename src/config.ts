@@ -65,6 +65,39 @@ export const sonosMaxContainerTotal = () =>
     validationPattern: /^[1-9]\d*$/,
   });
 
+// Global bound on the total bytes used by disk-backed album index snapshots across ALL cache keys
+// (every user, every retained generation). The snapshot directory is typically a `/cache` bind
+// mount, and without a cross-key bound a busy multi-user library walks it into ENOSPC and takes the
+// whole service down. When the total exceeds this, the oldest snapshot generations are evicted
+// (never the active newest-per-key index); if the active indexes alone exceed it they are retained
+// and a warning is logged rather than breaking reads. Default 4 GiB.
+export const DEFAULT_ALBUM_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024 * 1024;
+
+export const albumSnapshotMaxBytes = () =>
+  bnbEnvVar<number>("ALBUM_SNAPSHOT_MAX_BYTES", {
+    default: DEFAULT_ALBUM_SNAPSHOT_MAX_BYTES,
+    parser: asInt,
+    validationPattern: /^[1-9]\d*$/,
+  });
+
+// Retain the newest N generations per cache key so an in-flight browse that still holds the
+// just-superseded index keeps a readable file across a rebuild. Default 2.
+export const albumSnapshotKeepPerKey = () =>
+  bnbEnvVar<number>("ALBUM_SNAPSHOT_KEEP_PER_KEY", {
+    default: 2,
+    parser: asInt,
+    validationPattern: /^[1-9]\d*$/,
+  });
+
+// Never evict the newest N generations per key under the global byte cap — that is the live set a
+// current or next browse reads. Must be <= keepPerKey. Default 1.
+export const albumSnapshotProtectPerKey = () =>
+  bnbEnvVar<number>("ALBUM_SNAPSHOT_PROTECT_PER_KEY", {
+    default: 1,
+    parser: asInt,
+    validationPattern: /^[1-9]\d*$/,
+  });
+
 export const DEFAULT_LOGIN_THEME = "classic"
 const VALID_LOGIN_THEMES = [DEFAULT_LOGIN_THEME, "navidrome-ish", "wkulhanek"]
 

@@ -15,7 +15,11 @@ import {
 import { SubsonicMusicService} from "./subsonic_music_library";
 import { InMemoryAPITokens, sha256 } from "./api_tokens";
 import { InMemoryLinkCodes } from "./link_codes";
-import readConfig from "./config";
+import readConfig, {
+  albumSnapshotMaxBytes,
+  albumSnapshotKeepPerKey,
+  albumSnapshotProtectPerKey,
+} from "./config";
 import sonos, { bonobService } from "./sonos";
 import { MusicService } from "./music_library";
 import { SystemClock } from "./clock";
@@ -118,7 +122,14 @@ const subsonic = new SubsonicMusicService(
     config.subsonic.deezerArtistArt,
     {}, // coverArtCoordinatorOptions (default)
     undefined, // maxIndexScanAlbums (default)
-    indexCacheDir // Slice 1: disk-backed album snapshot directory
+    indexCacheDir, // Slice 1: disk-backed album snapshot directory
+    // Global disk bound for the snapshot store (env-tunable). Stops a multi-user `/cache` bind mount
+    // walking into ENOSPC: see enforceSnapshotBounds in album_snapshot.ts.
+    {
+      maxBytes: albumSnapshotMaxBytes(),
+      keepPerKey: albumSnapshotKeepPerKey(),
+      protectPerKey: albumSnapshotProtectPerKey(),
+    }
   ),
   customPlayers,
   config.subsonic.transcode
