@@ -22,19 +22,31 @@ export const describeReason = (e: unknown): string => {
         ? e
         : e === null || e === undefined
           ? String(e)
-          : (() => {
-              try {
-                return JSON.stringify(e) ?? Object.prototype.toString.call(e);
-              } catch {
-                return Object.prototype.toString.call(e);
-              }
-            })();
+          : typeof e === "object"
+            ? // Describe an object rejection by SHAPE, never by content. An earlier version
+              // JSON.stringify'd it, which was a real credential leak rather than a theoretical
+              // one: the token-refresh fault this codebase throws (see smapi.ts) is a non-Error
+              // object whose detail carries a freshly minted JWT, and the length cap still let the
+              // JWT header and the leading payload through. Key names are structure and are worth
+              // keeping for diagnosis; values never are.
+              `[${(e as { constructor?: { name?: string } })?.constructor?.name ?? "object"}: ${Object.keys(
+                e as object
+              )
+                .slice(0, 5)
+                .join(", ")}]`
+            : String(e);
   return sanitizeLogValue(redactCredentials(raw)).slice(0, 300);
 };
 
 // The SMAPI handlers build their context from the browsed/searched id, which arrives straight off
 // the wire, so it is neutralized on the same terms as the reason.
 const describeContext = (context: string): string => sanitizeLogValue(context).slice(0, 120);
+
+// A SMAPI/auth fault (login failure, expired token, ...) is an object carrying a `Fault`; it MUST
+// propagate so the SOAP layer returns the proper Sonos fault, not be swallowed by the backstop.
+// Declared before withTimeout because the post-deadline follow-up has to recognise one too.
+const isSmapiFault = (e: unknown): boolean =>
+  typeof e === "object" && e !== null && "Fault" in (e as object);
 
 // Resolve to `fallback` if `p` has not settled within `ms` (and never leak the timer). Used both
 // for per-call backend enrichment caps (e.g. Last.fm) and the SMAPI-level browse deadline.
@@ -70,10 +82,17 @@ export const withTimeout = <T>(
               logger.warn(
                 `${describeContext(context)} finally succeeded after ${Date.now() - startedAt}ms, too late to be used (deadline ${ms}ms)`
               ),
-            (e) =>
+            (e) => {
+              // A SMAPI fault reaching here is not a degradation, it is the protocol working - and
+              // the token-refresh fault carries a fresh auth token, so logging it would leak a
+              // credential. faultOrFallback already stays quiet for faults; this path must match it.
+              // Past the deadline the rejection is delivered HERE rather than to faultOrFallback,
+              // so without this check the quiet guarantee silently did not apply.
+              if (isSmapiFault(e)) return;
               logger.warn(
                 `${describeContext(context)} finally failed after ${Date.now() - startedAt}ms, too late to be used (deadline ${ms}ms): ${describeReason(e)}`
-              )
+              );
+            }
           );
         }
         resolve(fallback);
@@ -86,11 +105,6 @@ export const withTimeout = <T>(
 // deadline (safely below 5s) is the catch-all safety net: any handler that hangs OR rejects past it
 // degrades to a graceful fallback instead of surfacing "something went wrong" in the Sonos app.
 export const SMAPI_BROWSE_TIMEOUT_MS = 4500;
-
-// A SMAPI/auth fault (login failure, expired token, ...) is an object carrying a `Fault`; it MUST
-// propagate so the SOAP layer returns the proper Sonos fault, not be swallowed by the backstop.
-const isSmapiFault = (e: unknown): boolean =>
-  typeof e === "object" && e !== null && "Fault" in (e as object);
 
 // Backstop catch: re-throw SMAPI/auth faults (they must reach Sonos), swallow every other
 // (backend/timeout) rejection to the graceful fallback.

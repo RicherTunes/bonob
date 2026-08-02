@@ -49,6 +49,64 @@ describe("withTimeout observability", () => {
     expect(warn).not.toHaveBeenCalled();
   });
 
+  it("does NOT log a SMAPI fault that arrives after the deadline - it carries a fresh auth token", async () => {
+    // The token-refresh fault this codebase throws (smapi.ts) is a NON-Error object whose detail
+    // carries a newly minted JWT. describeReason JSON-serialized non-Errors wholesale, and the
+    // 300-char cap still let most of the JWT header and the leading payload through. The refresh is
+    // a network round trip, so exceeding the 4.5s deadline is precisely the degraded condition this
+    // logging was added for - which means the leak fires exactly when it is most likely to be hit.
+    // faultOrFallback already stays quiet for faults; the post-deadline follow-up must too.
+    const fault = {
+      Fault: {
+        faultcode: "Client.TokenRefreshRequired",
+        faultstring: "Token has expired",
+        detail: {
+          refreshAuthTokenResult: {
+            authToken: "eyJhbGciOiJIUzI1NiJ9.SUPERSECRETJWTPAYLOAD.sig",
+            privateKey: "nonsense",
+          },
+        },
+      },
+    };
+
+    let fail!: (e: unknown) => void;
+    const slow = new Promise<string>((_, rej) => {
+      fail = rej;
+    });
+
+    await withTimeout(slow, 10, "fallback", "getMetadata:root");
+    warn.mockClear();
+
+    fail(fault);
+    await slow.catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const logged = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logged).not.toContain("SUPERSECRETJWTPAYLOAD");
+    expect(logged).not.toContain("eyJhbGciOiJIUzI1NiJ9");
+    expect(logged).not.toContain("authToken");
+  });
+
+  it("never serializes an arbitrary object rejection's contents", async () => {
+    let fail!: (e: unknown) => void;
+    const slow = new Promise<string>((_, rej) => {
+      fail = rej;
+    });
+
+    await withTimeout(slow, 10, "fallback", "search:tracks");
+    warn.mockClear();
+
+    fail({ nested: { secret: "DO-NOT-LOG-ME" }, token: "ALSO-SECRET" });
+    await slow.catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const logged = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(logged).not.toContain("DO-NOT-LOG-ME");
+    expect(logged).not.toContain("ALSO-SECRET");
+  });
+
   it("neutralizes the context, which embeds a Sonos-supplied container id", async () => {
     // The SMAPI handlers build their context from the browsed/searched id, which comes straight
     // off the wire. Interpolating it raw would hand a client the ability to forge log lines.
@@ -170,6 +228,13 @@ describe("faultOrFallback observability", () => {
   it("never lets a non-Error reason break the log call", () => {
     expect(faultOrFallback("fb", "search:albums")("Subsonic error: nope")).toBe("fb");
     expect(String(warn.mock.calls[0]![0])).toContain("Subsonic error: nope");
+  });
+
+  it("names an object rejection by shape without serializing its contents", () => {
+    faultOrFallback("fb", "search:albums")({ token: "SECRET-VALUE", nested: { a: 1 } });
+    const message = String(warn.mock.calls[0]![0]);
+    expect(message).not.toContain("SECRET-VALUE");
+    expect(message).toContain("search:albums");
   });
 
   it("does not leak credentials from an axios-style error into the log", () => {

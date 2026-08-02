@@ -381,10 +381,13 @@ describe("CoverArtCoordinator admission control (never promise a wait it cannot 
       const slowTask = (v: string) => () =>
         new Promise<Buffer>((res) => setTimeout(() => res(Buffer.from(v)), 2000));
 
-      // Observe one real slot hold of 2s, i.e. twice the queue deadline.
-      const seed = coord.run(coverArtKey("u", "p", "seed", 1), slowTask("seed"));
-      jest.advanceTimersByTime(2000);
-      await expect(seed).resolves.toEqual(Buffer.from("seed"));
+      // Observe a SUSTAINED slot hold of 2s, i.e. twice the queue deadline. A single sample is
+      // deliberately not enough for the estimator to act on.
+      for (let i = 0; i < 8; i++) {
+        const seed = coord.run(coverArtKey("u", "p", `seed-${i}`, 1), slowTask(`seed-${i}`));
+        jest.advanceTimersByTime(2000);
+        await expect(seed).resolves.toEqual(Buffer.from(`seed-${i}`));
+      }
 
       // Re-occupy the only slot with another 2s call.
       const held = coord.run(coverArtKey("u", "p", "held", 1), slowTask("held"));
@@ -468,6 +471,11 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     await expect(p).resolves.toEqual(Buffer.from(key));
   };
 
+  // The estimator only engages once it has enough evidence, so seed a full window of observations.
+  const seedSteadyLatency = async (coord: CoverArtCoordinator, ms: number, n = 8) => {
+    for (let i = 0; i < n; i++) await seedLatency(coord, ms, `steady-${ms}-${i}`);
+  };
+
   // Occupies a slot until released. Every real slot hold is bounded by the cover-art http timeout,
   // so a slot is never held indefinitely in production - see the recovery test below, which depends
   // on that invariant.
@@ -494,11 +502,76 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     return state;
   };
 
+  it("a single slow outlier does not collapse an otherwise healthy queue", async () => {
+    // The estimator was an EWMA with alpha 0.3, and the field comment claimed one outlier could not
+    // start rejecting a healthy queue. That was false. With a healthy 50ms average, ONE art fetch
+    // that stalls to the 10s http bound moved the average to ~3035ms, which at concurrency 4 and a
+    // 5s deadline collapses the admissible queue from 64 to 4; a second outlier took it to 0. The
+    // upstream would be answering in 50ms again while Sonos got 503s. A robust statistic is
+    // required, not a faster-decaying average.
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 4, maxQueue: 64, queueTimeoutMs: 5000 });
+      await seedSteadyLatency(coord, 50);
+
+      // One pathological sample at the cover-art http bound.
+      await seedLatency(coord, 10_000, "outlier");
+
+      // Fill every slot, then queue well past where a collapsed estimator would start refusing.
+      const held = [0, 1, 2, 3].map((i) => hold(coord, `held-${i}`));
+      const queued = [0, 1, 2, 3, 4, 5, 6, 7].map((i) =>
+        coord.run(coverArtKey("u", "p", `q${i}`, 1), () => Promise.resolve(Buffer.from("x")))
+      );
+      const states = await Promise.all(queued.map((q) => settledState(q)));
+
+      expect(states.filter((s) => s.rejected)).toHaveLength(0);
+      held.forEach((h) => h.release());
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("stays dormant until it has enough samples to be worth trusting", async () => {
+    // A single cold first fetch used to be adopted as the estimate outright, so one slow start
+    // could gate the queue before anything was really known about the upstream.
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 30_000, "one-slow-cold-start");
+
+      hold(coord, "held");
+      const queued = coord.run(coverArtKey("u", "p", "after-one", 1), () =>
+        Promise.resolve(Buffer.from("x"))
+      );
+      expect((await settledState(queued)).rejected).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("still engages under SUSTAINED degradation, not just a spike", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedSteadyLatency(coord, 4000);
+
+      hold(coord, "held");
+      const queued = coord.run(coverArtKey("u", "p", "doomed", 1), () =>
+        Promise.resolve(Buffer.from("x"))
+      );
+      const state = await settledState(queued);
+      expect(state.rejected).toBe(true);
+      expect(state.error).toBeInstanceOf(CoverArtBusyError);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("admits when the estimated wait exactly equals the deadline (strict >, not >=)", async () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
-      await seedLatency(coord, 1000);
+      await seedSteadyLatency(coord, 1000);
       hold(coord, "held");
 
       // ceil(1/1) * 1000 = 1000, which is not greater than the 1000ms deadline. A request that
@@ -515,7 +588,7 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
-      await seedLatency(coord, 1001);
+      await seedSteadyLatency(coord, 1001);
       hold(coord, "held");
 
       const queued = coord.run(coverArtKey("u", "p", "over", 1), () => Promise.resolve(Buffer.from("x")));
@@ -531,7 +604,7 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 2, maxQueue: 64, queueTimeoutMs: 1000 });
-      await seedLatency(coord, 600);
+      await seedSteadyLatency(coord, 600);
       hold(coord, "held-1");
       hold(coord, "held-2");
 
@@ -555,7 +628,7 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 2, maxQueue: 64, queueTimeoutMs: 1000 });
-      await seedLatency(coord, 60_000);
+      await seedSteadyLatency(coord, 60_000);
 
       // Admission control gates QUEUEING only. A free slot must always be used - otherwise a single
       // bad sample would stop the coordinator doing any work at all, and no new samples would ever
@@ -573,7 +646,7 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
-      await seedLatency(coord, 5000, "slow");
+      await seedSteadyLatency(coord, 5000);
 
       // Degraded: queueing is refused.
       const blocked = hold(coord, "held");
@@ -582,9 +655,9 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
 
       // The in-flight call finishes - which it always does within SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS,
       // the invariant this recovery depends on. Once a slot is free the guard cannot block it, so
-      // fast calls run and pull the average down (alpha 0.3) and the queue reopens unaided. Without
-      // that bound on slot-hold time a permanently hung upstream would starve the estimator and the
-      // guard would stay shut, so the http timeout is load-bearing here, not just hygiene.
+      // fast calls run and, once they are the MAJORITY of the window, move the median and reopen the
+      // queue unaided. Without that bound on slot-hold time a permanently hung upstream would starve
+      // the estimator and the guard would stay shut, so the http timeout is load-bearing here.
       blocked.release();
       await blocked.promise;
       for (let i = 0; i < 12; i++) {
@@ -604,14 +677,16 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
 
-      const failing = coord.run(coverArtKey("u", "p", "slow-fail", 1), () =>
-        new Promise<Buffer>((_, rej) => setTimeout(() => rej(new Error("upstream")), 4000))
-      );
-      failing.catch(() => {});
-      jest.advanceTimersByTime(4000);
-      await expect(failing).rejects.toBeDefined();
+      for (let i = 0; i < 8; i++) {
+        const failing = coord.run(coverArtKey("u", "p", `slow-fail-${i}`, 1), () =>
+          new Promise<Buffer>((_, rej) => setTimeout(() => rej(new Error("upstream")), 4000))
+        );
+        failing.catch(() => {});
+        jest.advanceTimersByTime(4000);
+        await expect(failing).rejects.toBeDefined();
+      }
 
-      // A 4s failure is evidence the upstream is slow, not evidence it is fast.
+      // A run of 4s failures is evidence the upstream is slow, not evidence it is fast.
       hold(coord, "held");
       const queued = coord.run(coverArtKey("u", "p", "after-fail", 1), () => Promise.resolve(Buffer.from("x")));
       expect((await settledState(queued)).rejected).toBe(true);
@@ -624,7 +699,7 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
     jest.useFakeTimers();
     try {
       const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 5000 });
-      await seedLatency(coord, 100);
+      await seedSteadyLatency(coord, 100);
 
       const started: string[] = [];
       const inflight: Array<(v: Buffer) => void> = [];

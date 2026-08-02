@@ -279,10 +279,24 @@ export const DEFAULT_COVER_ART_CONCURRENCY = 4;
 export const DEFAULT_COVER_ART_QUEUE = 64;
 export const DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS = 5_000;
 
-// Weight of the newest sample in the observed slot-hold latency EWMA. High enough to react within
-// a few calls once the upstream degrades (which is exactly when admission control has to engage),
-// low enough that one slow outlier does not start rejecting an otherwise healthy queue.
-export const COVER_ART_LATENCY_EWMA_ALPHA = 0.3;
+// The latency estimator is a MEDIAN over a sliding window, not an average.
+//
+// It began as an EWMA (alpha 0.3) and that was wrong in a way worth recording, because the mistake
+// is easy to repeat: an average lets a single pathological sample dominate. With a healthy 50ms
+// baseline, ONE art fetch stalling to the 10s http bound moved the estimate to ~3035ms, which at
+// concurrency 4 against a 5s deadline collapses the admissible queue from 64 entries to 4; a second
+// outlier took it to 0. Sonos would then get 503s while the upstream was answering in 50ms, and
+// recovery needed ~10 consecutive good samples. Cover-art latency is exactly the kind of signal
+// that produces occasional huge outliers (a cold image cache, one stalled mount), so the estimator
+// has to be robust to them by construction rather than tuned to survive them.
+//
+// A median over the window ignores a minority of outliers outright, and only moves once slowness
+// is the common case - which is the condition admission control actually exists for.
+export const COVER_ART_LATENCY_WINDOW = 16;
+
+// Below this many observations the guard stays dormant. Without it, one cold first fetch was
+// adopted as the estimate outright and could gate the queue before anything was really known.
+export const COVER_ART_LATENCY_MIN_SAMPLES = 5;
 
 // A transient capacity/availability signal surfaced by the coordinator: the queue is full, or a
 // queued request waited past its bounded deadline. Subclass of CoverArtUnavailableError so the HTTP
@@ -370,8 +384,8 @@ export class CoverArtCoordinator {
   private active = 0;
   private readonly inFlight = new Map<string, Promise<unknown>>();
   private readonly queue: Queued[] = [];
-  // Observed upstream slot-hold latency (EWMA, ms). Undefined until the first call settles, so a
-  // cold coordinator never rejects on an estimate it has not measured yet.
+  // Sliding window of observed slot-hold latencies (ms), newest last. Empty until the first call
+  // settles, so a cold coordinator never rejects on an estimate it has not measured yet.
   //
   // The estimator is only ever fed by calls that actually run, and admission control deliberately
   // gates QUEUEING only - a free slot is always used. Those two facts are what let a degraded
@@ -379,7 +393,7 @@ export class CoverArtCoordinator {
   // SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS, so a stalled upstream still settles and still yields a
   // sample. A caller that routed an UNBOUNDED task through here could pin every slot, starve the
   // estimator, and leave the guard shut - so that bound is load-bearing, not just hygiene.
-  private latencyEwmaMs: number | undefined;
+  private readonly latencySamplesMs: number[] = [];
 
   constructor(opts: CoverArtCoordinatorOptions = {}) {
     const maxConcurrency = opts.maxConcurrency ?? DEFAULT_COVER_ART_CONCURRENCY;
@@ -484,24 +498,42 @@ export class CoverArtCoordinator {
   // under a degraded upstream it is better to answer "busy" at once than to hold the caller for
   // the full deadline and answer "busy" anyway.
   private estimatedWaitMs = (position: number): number | undefined => {
-    if (this.latencyEwmaMs === undefined) return undefined;
-    return Math.ceil((position + 1) / this.maxConcurrency) * this.latencyEwmaMs;
+    const typical = this.typicalLatencyMs();
+    if (typical === undefined) return undefined;
+    return Math.ceil((position + 1) / this.maxConcurrency) * typical;
+  };
+
+  // Median of the window. Undefined until there are enough samples to be worth acting on, so a
+  // cold or barely-exercised coordinator never rejects on an estimate it has not really measured.
+  private typicalLatencyMs = (): number | undefined => {
+    if (this.latencySamplesMs.length < COVER_ART_LATENCY_MIN_SAMPLES) return undefined;
+    const sorted = [...this.latencySamplesMs].sort((a, b) => a - b);
+    const mid = sorted.length >> 1;
+    return sorted.length % 2 === 1
+      ? sorted[mid]!
+      : (sorted[mid - 1]! + sorted[mid]!) / 2;
   };
 
   private recordLatency = (sampleMs: number): void => {
-    const sample = Math.max(0, sampleMs);
-    this.latencyEwmaMs =
-      this.latencyEwmaMs === undefined
-        ? sample
-        : COVER_ART_LATENCY_EWMA_ALPHA * sample +
-          (1 - COVER_ART_LATENCY_EWMA_ALPHA) * this.latencyEwmaMs;
+    // A non-finite or negative delta can only come from a clock that moved (an NTP step or a VM
+    // resume mid-call), never from real elapsed time. Such a sample says nothing about the upstream,
+    // so it is discarded rather than clamped to 0 - clamping silently biased the estimate downward
+    // and quietly disabled the guard.
+    if (!Number.isFinite(sampleMs) || sampleMs < 0) return;
+    this.latencySamplesMs.push(sampleMs);
+    if (this.latencySamplesMs.length > COVER_ART_LATENCY_WINDOW) {
+      this.latencySamplesMs.shift();
+    }
   };
 
   // Start a task under an already-held slot, timing how long it holds that slot so admission
   // control has a measured latency to work from. A synchronous throw is normalized to a rejection
   // so the caller can always attach settle handlers exactly once.
   private startTask = (task: () => Promise<unknown>): Promise<unknown> => {
-    const startedAt = Date.now();
+    // performance.now() is MONOTONIC; Date.now() is not. An NTP step or a VM resume mid-call would
+    // otherwise fabricate a latency sample out of a clock movement - backwards producing a negative
+    // delta, forwards a huge one - neither of which says anything about the upstream.
+    const startedAt = performance.now();
     let result: Promise<unknown>;
     try {
       result = Promise.resolve(task());
@@ -509,7 +541,7 @@ export class CoverArtCoordinator {
       result = Promise.reject(e);
     }
     // A failure still consumed the slot for as long as it took, so it is a valid latency sample.
-    const record = () => this.recordLatency(Date.now() - startedAt);
+    const record = () => this.recordLatency(performance.now() - startedAt);
     result.then(record, record);
     return result;
   };
