@@ -1108,6 +1108,51 @@ describe("wsdl api", () => {
                 );
                 expect(musicLibrary.searchTracks).toHaveBeenCalledWith(term);
               });
+
+              it("collapses several hits from the SAME album into one tile", async () => {
+                // Track hits render as ALBUM tiles, so N hits from one album produced N identical
+                // tiles. Each carried its own song's art id, so that was also N distinct /art urls
+                // and N distinct coalescing keys - up to 20x the cover-art fetches for one search
+                // page, defeating the coordinator. Collapsing here fixes the redundancy where it
+                // actually lives, and keeps the art id the server returned (OpenSubsonic specifies
+                // getCoverArt takes that opaque value, so synthesizing one from albumId is not
+                // portable even though it works on Navidrome).
+                const sharedAlbum = aTrack().album;
+                const hits = Array.from({ length: 5 }, () =>
+                  aTrack({ album: sharedAlbum })
+                );
+                musicLibrary.searchTracks.mockResolvedValue(hits);
+
+                const result = await ws.searchAsync({ id: "tracks", term: "whoopie" });
+
+                // Asserted on count/total plus the single entry rather than deep-equality, because
+                // the SOAP layer serializes a one-element mediaCollection as an object, not an array.
+                const res = result[0].searchResult;
+                expect(res.count).toEqual(1);
+                expect(res.total).toEqual(1);
+                expect([res.mediaCollection].flat()[0]).toEqual(
+                  album(bonobUrlWithAccessToken, sharedAlbum)
+                );
+              });
+
+              it("keeps distinct albums as distinct tiles", async () => {
+                const a = aTrack();
+                const b = aTrack();
+                musicLibrary.searchTracks.mockResolvedValue([a, b, aTrack({ album: a.album })]);
+
+                const result = await ws.searchAsync({ id: "tracks", term: "whoopie" });
+
+                expect(result[0]).toEqual(
+                  searchResult({
+                    mediaCollection: [
+                      album(bonobUrlWithAccessToken, a.album),
+                      album(bonobUrlWithAccessToken, b.album),
+                    ],
+                    index: 0,
+                    total: 2,
+                  })
+                );
+              });
             });
 
             describe("searching for an unsupported type", () => {

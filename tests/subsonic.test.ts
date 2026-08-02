@@ -1335,6 +1335,47 @@ describe("Subsonic", () => {
         }
       });
 
+      it("accepts a catalog whose size is EXACTLY the safety cap", async () => {
+        // Off-by-one in my own truncation guard, found by review. The loop runs while
+        // `offset < cap`, and `complete` is only set by an empty or short page. A catalog of
+        // exactly `cap` albums (with cap a multiple of the 500 page size) fills every page, so the
+        // loop simply runs out of offsets without ever seeing the end - `complete` stays false and a
+        // COMPLETE index is rejected as truncated. The default cap, 20,000,000, is itself a multiple
+        // of 500, so this is reachable rather than theoretical.
+        const indexCacheStore = { load: jest.fn(() => []), save: jest.fn() };
+        const indexCache = new SwrCache(clock, 60_000, { store: indexCacheStore });
+        const cap = 1000; // exactly two full pages
+        const cappedSubsonic = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          SwrCache.disabled(),
+          indexCache,
+          false,
+          {},
+          cap
+        );
+        const artist = anArtist();
+        mockGET.mockImplementation((_u: string, config: any) => {
+          const offset = Number(config.params.get("offset"));
+          // Exactly `cap` albums exist: full pages at 0 and 500, nothing at 1000.
+          const remaining = Math.max(0, cap - offset);
+          const page = Array.from({ length: Math.min(500, remaining) }, (_, i) =>
+            anAlbumSummary({ id: `album-${offset + i}`, name: `Album ${offset + i}` })
+          );
+          return Promise.resolve(
+            ok(
+              getAlbumListJson(
+                page.map((album) => [artist, album] as [Artist, AlbumSummary])
+              )
+            )
+          );
+        });
+
+        const idx = await cappedSubsonic.getAlbumIndex(credentials);
+        expect(idx.total).toEqual(cap);
+      });
+
       it("refuses a scan that hits the safety cap rather than caching a TRUNCATED index", async () => {
         // The cap was a hardcoded 2,000,000 and hitting it just ended the loop, so the partial
         // result was returned, cached and persisted as though it were the whole catalog: every

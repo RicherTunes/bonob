@@ -738,14 +738,28 @@ function bindSmapiSoapServiceToExpress(
                       })
                     );
                   case "tracks":
-                    return musicLibrary.searchTracks(term).then((it) =>
-                      searchResult({
-                        count: it.length,
-                        mediaCollection: it.map((aTrack) =>
-                          album(urlWithToken(apiKey), aTrack.album)
+                    return musicLibrary.searchTracks(term).then((it) => {
+                      // Track hits are rendered as ALBUM tiles, so several hits from one album used
+                      // to produce several identical tiles - visually redundant, and each carried
+                      // the matching song's own art id, giving one distinct /art url per hit and
+                      // defeating the cover-art coordinator's coalescing (up to 20x the fetches).
+                      // Deduplicating by album fixes both, and keeps the art id the SERVER returned
+                      // rather than one synthesized from the album id: OpenSubsonic specifies that
+                      // getCoverArt takes the opaque coverArt value, so deriving it from albumId
+                      // works on Navidrome but is not portable.
+                      const byAlbum = new Map<string, AlbumSummary>();
+                      for (const aTrack of it) {
+                        if (!byAlbum.has(aTrack.album.id))
+                          byAlbum.set(aTrack.album.id, aTrack.album);
+                      }
+                      const albums = [...byAlbum.values()];
+                      return searchResult({
+                        count: albums.length,
+                        mediaCollection: albums.map((it) =>
+                          album(urlWithToken(apiKey), it)
                         ),
-                      })
-                    );
+                      });
+                    });
                   default:
                     logger.info(`Sonos asked for an unsupported search of: ${id}, term=${term}`);
                     return searchResult({

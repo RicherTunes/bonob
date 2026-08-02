@@ -923,14 +923,13 @@ export const asTrack = (
 //   - artistId/artistName are the TRACK's artist, which on a compilation differs from the album
 //     artist. For a song-driven listing that is the more useful attribution, and it is the only
 //     artist a song record carries.
-//   - coverArt is derived from the ALBUM id, not from song.coverArt. That matters for load, not
-//     just tidiness: Navidrome returns a per-song art id (mf-<songId>_<hash>) while the album's is
-//     shared (al-<albumId>_<hash>), so using the song's would give 20 search hits from one album 20
-//     distinct /art urls, 20 distinct coalescing keys, and no coalescing at all - multiplying
-//     cover-art fetches by up to 20x. getCoverArt takes an album id per the Subsonic API, so the
-//     raw albumId is both server-agnostic and shared by every track of the album. Verified against
-//     the live server: albumId, al-<albumId>, al-<albumId>_<hash> and the song's own art id all
-//     return byte-identical artwork.
+//   - coverArt is the art id the SERVER returned for the song. It is deliberately NOT synthesized
+//     from albumId: that works on Navidrome (verified live - albumId, al-<albumId>,
+//     al-<albumId>_<hash> and the song's own id all return byte-identical artwork) but OpenSubsonic
+//     specifies getCoverArt takes the opaque coverArt value a server handed you, so an id built
+//     from an entity id is not portable. Navidrome's per-song art id would otherwise cost one
+//     distinct /art url per search hit; that is solved where it belongs, by deduplicating the album
+//     tiles in the SMAPI search handler, rather than by fabricating ids here.
 export const albumSummaryFromSong = (song: song): AlbumSummary => ({
   id: song.albumId || "",
   name: song.album || "",
@@ -938,7 +937,7 @@ export const albumSummaryFromSong = (song: song): AlbumSummary => ({
   genre: maybeAsGenre(song.genre),
   artistId: song.artistId,
   artistName: song.artist,
-  coverArt: coverArtURN(song.albumId),
+  coverArt: coverArtURN(song.coverArt),
 });
 
 export const asAlbumSummary = (album: album): AlbumSummary => ({
@@ -1780,7 +1779,17 @@ export class Subsonic {
           break;
         }
       }
-      // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+      // Exactly-at-the-cap is a COMPLETE catalog, not a truncated one. The loop runs while
+    // `offset < cap`, so a catalog of exactly `cap` albums fills every page and the loop runs out of
+    // offsets without ever observing the end - indistinguishable, so far, from a catalog that
+    // overflows. One extra probe settles it: an empty page at `cap` means we really did reach the
+    // end. The default cap is a multiple of the page size, so this is reachable, not theoretical.
+    if (!complete) {
+      const probe = await this.scanAlbums(credentials, this.maxIndexScanAlbums);
+      if (probe.length === 0) complete = true;
+    }
+
+    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
       // partial result was returned, cached and persisted as if it were the whole catalog: every
       // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
       // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
