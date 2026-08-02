@@ -858,6 +858,31 @@ export const asTrack = (
   album: album,
 });
 
+// Build a track's album summary from the SONG record alone.
+//
+// search3 (and getRandomSongs, getStarred2, ...) already return complete song records carrying every
+// album field a listing needs, so resolving the album with a separate round trip per song was
+// fetching data we were already holding. It cost getSong + getAlbum per result, and getAlbum
+// returns the album's ENTIRE track list - so 20 search hits pulled 20 full album payloads to read
+// 20 album names. This is O(1) per song and independent of library size.
+//
+// Two honest caveats:
+//   - artistId/artistName are the TRACK's artist, which on a compilation differs from the album
+//     artist. For a song-driven listing that is the more useful attribution, and it is the only
+//     artist a song record carries.
+//   - coverArt is the song's own art id, which every Subsonic server resolves to the album artwork.
+//     It is used verbatim rather than derived from albumId, because servers namespace these ids
+//     (Navidrome uses al-/mf- prefixes) and a synthesized id would not resolve.
+export const albumSummaryFromSong = (song: song): AlbumSummary => ({
+  id: song.albumId || "",
+  name: song.album || "",
+  year: song.year,
+  genre: maybeAsGenre(song.genre),
+  artistId: song.artistId,
+  artistName: song.artist,
+  coverArt: coverArtURN(song.coverArt),
+});
+
 export const asAlbumSummary = (album: album): AlbumSummary => ({
   id: album.id,
   name: album.name,
@@ -1796,6 +1821,13 @@ export class Subsonic {
   starredSongs = (credentials: Credentials) =>
     this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
       (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
+    );
+
+  // Map complete song records straight to Tracks, resolving each album from the song itself. The
+  // counterpart to toAlbumSummary, and the reason a song listing needs no per-song round trips.
+  toTracks = (songs: song[]): Track[] =>
+    songs.map((song) =>
+      asTrack(albumSummaryFromSong(song), song, this.customPlayers)
     );
 
   toAlbumSummary = (albumList: album[]): AlbumSummary[] =>

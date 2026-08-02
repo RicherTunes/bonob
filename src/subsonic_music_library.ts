@@ -342,15 +342,16 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   searchTracks = async (query: string) =>
     this.subsonic
       .search3(this.credentials, { query, songCount: 20 })
-      .then(({ songs }) =>
-        // One flaky/slow track must not reject the whole search: fetch each independently and keep
-        // only the resolved ones (the SMAPI browse deadline caps overall latency).
-        Promise.allSettled(
-          songs.map((it) => this.subsonic.getTrack(this.credentials, it.id))
-        ).then((settled) =>
-          settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []))
-        )
-      );
+      // search3 returns complete song records, so the album is resolved from each song rather than
+      // re-fetched. This used to run getTrack per hit - itself getSong + getAlbum - so 20 matches
+      // cost 41 round trips against the 4.5s SMAPI deadline, and getAlbum returns the album's whole
+      // track list, so it also pulled 20 full album payloads to read 20 album names.
+      //
+      // The old Promise.allSettled was defending the wrong thing: it stopped one slow track
+      // rejecting the search, but every failure was dropped SILENTLY, so a search that lost all 20
+      // fan-out calls returned an empty result indistinguishable from "nothing matched". That is
+      // the reported "songs never come back". With no fan-out there is nothing to partially fail.
+      .then(({ songs }) => this.subsonic.toTracks(songs));
 
   playlists = async () =>
     this.subsonic.playlists(this.credentials);

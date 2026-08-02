@@ -380,6 +380,9 @@ const getSearchResult3Json = ({
         artist: track.artist.name,
         track: track.number,
         year: "",
+        // Real search3 song records carry a genre; this fixture omitted it, which silently made the
+        // mapped genre undefined and would have hidden a genre regression.
+        genre: track.genre?.name,
         coverArt: maybeIdFromCoverArtUrn(track.coverArt),
         size: "5624132",
         contentType: track.encoding.mimeType,
@@ -387,6 +390,7 @@ const getSearchResult3Json = ({
         starred: track.rating.love ? "sometime" : undefined,
         duration: track.duration,
         bitRate: 128,
+        userRating: track.rating.stars,
         //bitDepth
         //samplingRate
         //channelCount
@@ -2984,6 +2988,83 @@ describe("SubsonicMusicLibrary", () => {
       customPlayers.encodingFor.mockReturnValue(O.none);
     });
 
+    // A song-driven listing resolves its album from the song record, so the album summary carries
+    // the song's own year and art rather than the album document's. asSongJson emits year: "" and
+    // the track's coverArt, so this is what the mapping legitimately produces.
+    const albumAsSeenFromSong = (track: Track) => ({
+      ...track,
+      album: {
+        id: track.album.id,
+        name: track.album.name,
+        year: "",
+        genre: track.genre,
+        artistId: track.artist.id,
+        artistName: track.artist.name,
+        coverArt: track.coverArt,
+      },
+    });
+
+    describe("cost", () => {
+      it("issues exactly ONE upstream call however many songs match", async () => {
+        // This used to be search3 + a getTrack per song, and getTrack is itself getSong + getAlbum,
+        // so 20 matches cost 41 round trips against the 4.5s SMAPI deadline - and getAlbum returns
+        // the album's ENTIRE track list, so it also pulled 20 full album payloads to read 20 album
+        // names. On a library of millions that reliably blew the deadline, and the search silently
+        // degraded to an empty result: the reported "songs never come back".
+        //
+        // search3 already returns the full song records, including every album field needed here,
+        // so the extra round trips were fetching data we were holding. Cost is now O(1) in the
+        // number of matches and independent of library size.
+        const pop = asGenre("Pop");
+        const album = anAlbum({ id: "album1", name: "Burnin", genre: pop });
+        const artist = anArtist({ id: "artist1", name: "Bob Marley", albums: [album] });
+        const tracks = Array.from({ length: 20 }, (_, i) =>
+          aTrack({
+            id: `track${i}`,
+            artist: artistToArtistSummary(artist),
+            album: albumToAlbumSummary(album),
+            genre: pop,
+          })
+        );
+
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(ok(getSearchResult3Json({ tracks })))
+        );
+
+        const result = await subsonic.searchTracks("foo");
+
+        expect(result).toHaveLength(20);
+        expect(mockGET).toHaveBeenCalledTimes(1);
+      });
+
+      it("still resolves every album field from the song alone", async () => {
+        const pop = asGenre("Pop");
+        const album = anAlbum({ id: "album1", name: "Burnin", genre: pop });
+        const artist = anArtist({ id: "artist1", name: "Bob Marley", albums: [album] });
+        const track = aTrack({
+          artist: artistToArtistSummary(artist),
+          album: albumToAlbumSummary(album),
+          genre: pop,
+        });
+
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(ok(getSearchResult3Json({ tracks: [track] })))
+        );
+
+        const [result] = await subsonic.searchTracks("foo");
+
+        // smapi's album() renders exactly these five fields, so these are what must survive.
+        // year/genre are deliberately not asserted: a song record carries the TRACK's year and
+        // genre, which need not match the album's, and neither is rendered.
+        const expected = albumToAlbumSummary(album);
+        expect(result!.album.id).toEqual(expected.id);
+        expect(result!.album.name).toEqual(expected.name);
+        expect(result!.album.artistId).toEqual(expected.artistId);
+        expect(result!.album.artistName).toEqual(expected.artistName);
+        expect(result!.album.coverArt).toEqual(track.coverArt);
+      });
+    });
+
     describe("when there is 1 search results", () => {
       it("should return true", async () => {
         const pop = asGenre("Pop");
@@ -3000,18 +3081,13 @@ describe("SubsonicMusicLibrary", () => {
           genre: pop,
         });
 
-        mockGET
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getSearchResult3Json({ tracks: [track] })))
-          )
-          .mockImplementationOnce(() => Promise.resolve(ok(getSongJson(track))))
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getAlbumJson(album)))
-          );
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(ok(getSearchResult3Json({ tracks: [track] })))
+        );
 
         const result = await subsonic.searchTracks("foo");
 
-        expect(result).toEqual([track]);
+        expect(result).toEqual([albumAsSeenFromSong(track)]);
 
         expect(mockGET).toHaveBeenCalledWith(
           url.append({ pathname: "/rest/search3" }).href(),
@@ -3069,22 +3145,14 @@ describe("SubsonicMusicLibrary", () => {
               )
             )
           )
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getSongJson(track1)))
-          )
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getSongJson(track2)))
-          )
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getAlbumJson(album1)))
-          )
-          .mockImplementationOnce(() =>
-            Promise.resolve(ok(getAlbumJson(album2)))
-          );
+          ;
 
         const result = await subsonic.searchTracks("moo");
 
-        expect(result).toEqual([track1, track2]);
+        expect(result).toEqual([
+          albumAsSeenFromSong(track1),
+          albumAsSeenFromSong(track2),
+        ]);
 
         expect(mockGET).toHaveBeenCalledWith(
           url.append({ pathname: "/rest/search3" }).href(),
@@ -3102,10 +3170,48 @@ describe("SubsonicMusicLibrary", () => {
       });
     });
 
-    describe("when one track lookup fails", () => {
-      // A flaky/malformed track must not reject the whole search (Sonos "something went wrong") -
-      // keep the tracks that resolved and drop the ones that failed.
-      it("still returns the tracks that resolved (allSettled)", async () => {
+    describe("when a song record is incomplete", () => {
+      // This replaces an allSettled test that kept the tracks whose per-song lookup resolved. There
+      // is no per-song lookup any more, so that partial failure cannot occur - but the risk it was
+      // guarding moved rather than vanished: a malformed song record must still not reject the
+      // whole search. Note the old defence ALSO hid every failure, so a search that lost all its
+      // fan-out calls returned an empty result that looked exactly like "nothing matched".
+      it("still returns a usable track when the album fields are missing", async () => {
+        mockGET.mockImplementationOnce(() =>
+          Promise.resolve(
+            ok(
+              subsonicOK({
+                searchResult3: {
+                  artist: [],
+                  album: [],
+                  song: [
+                    {
+                      id: "song-with-no-album",
+                      title: "Orphan",
+                      contentType: "audio/mp3",
+                      // albumId, album, artist, artistId, coverArt, genre all absent
+                    },
+                  ],
+                },
+              })
+            )
+          )
+        );
+
+        const result = await subsonic.searchTracks("orphan");
+
+        expect(result).toHaveLength(1);
+        expect(result[0]!.id).toEqual("song-with-no-album");
+        expect(result[0]!.name).toEqual("Orphan");
+        // Degraded but structurally valid, so the SMAPI layer can still render it.
+        expect(result[0]!.album.id).toEqual("");
+        expect(result[0]!.album.name).toEqual("");
+        expect(result[0]!.album.coverArt).toBeUndefined();
+      });
+    });
+
+    describe("legacy per-track lookup (removed)", () => {
+      it("no longer issues getSong or getAlbum for search results", async () => {
         const album1 = anAlbum({ name: "Album1" });
         const artist = anArtist({ name: "Artist", albums: [album1] });
         const track1 = aTrack({
@@ -3117,26 +3223,27 @@ describe("SubsonicMusicLibrary", () => {
           album: albumToAlbumSummary(album1),
         });
 
-        // dispatch by URL/id so the result is independent of call ordering + the read retry
-        mockGET.mockImplementation((u: string, config: any) => {
+        // A getSong/getAlbum here would previously have been the bulk of the work. Fail them loudly
+        // so the test proves they are never reached, rather than quietly tolerating a regression.
+        const forbidden: string[] = [];
+        mockGET.mockImplementation((u: string) => {
           const url = String(u);
-          const id = config?.params?.get?.("id");
           if (url.includes("search3"))
             return Promise.resolve(
               ok(getSearchResult3Json({ tracks: [track1, track2] }))
             );
-          if (url.includes("getSong"))
-            return id === track2.id
-              ? Promise.reject(new Error("flaky getSong")) // fails every time, incl. the retry
-              : Promise.resolve(ok(getSongJson(track1)));
-          if (url.includes("getAlbum"))
-            return Promise.resolve(ok(getAlbumJson(album1)));
+          forbidden.push(url);
           return Promise.reject(new Error("unexpected " + url));
         });
 
         const result = await subsonic.searchTracks("moo");
 
-        expect(result).toEqual([track1]);
+        expect(result).toEqual([
+          albumAsSeenFromSong(track1),
+          albumAsSeenFromSong(track2),
+        ]);
+        expect(forbidden).toEqual([]);
+        expect(mockGET).toHaveBeenCalledTimes(1);
       });
     });
 
