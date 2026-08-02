@@ -42,6 +42,27 @@ export const ALBUM_SNAPSHOT_VERSION = 3;
 const SNAPSHOT_MAGIC = 0xb0b0_a17e;
 const FILE_PREFIX = "albumSnapshot.v3.";
 
+// Generation token + global-bound configuration.
+//
+// IDENTITY AND ORDERING RIDE ON THE GENERATION TOKEN EMBEDDED IN THE FILENAME, NEVER ON FILESYSTEM
+// mtimeMs. mtimeMs is set by the OS and ties under concurrent finalizes, so the old mtime-based
+// "keep the previous generation" pruning was racy: two builds that landed in the same mtime tick
+// made "which is the previous generation" arbitrary, so the code could evict the live/newest file.
+// The token is a fixed-width zero-padded base36 build timestamp (orders builds chronologically)
+// followed by random hex (breaks the tie when two builds finalize in the same millisecond). Because
+// base36's char-code order matches its digit-value order, the whole token sorts lexicographically
+// as (timestamp, random) — total, tie-free ordering straight off the name, no stat() needed.
+const GEN_TS_WIDTH = 9; // Date.now() (~1.8e12) is 8 base36 digits today; 9 covers until ~year 2089
+const GEN_RND_BYTES = 5; // 10 hex chars of randomness — tie-break within a millisecond
+
+export const DEFAULT_SNAPSHOT_MAX_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB global cap (all keys)
+export const DEFAULT_SNAPSHOT_KEEP_PER_KEY = 2; // retain the newest N generations per key
+export const DEFAULT_SNAPSHOT_PROTECT_PER_KEY = 1; // never evict the newest N per key (the live set)
+
+const generationToken = (): string =>
+  Date.now().toString(36).padStart(GEN_TS_WIDTH, "0") +
+  randomBytes(GEN_RND_BYTES).toString("hex");
+
 type SnapshotTrailer = {
   v: number;
   key: string;
@@ -49,10 +70,28 @@ type SnapshotTrailer = {
   total: number;
   buckets: AlbumIndexBucket[];
   offsets: number[]; // length total+1
+  // Distinct release years, collected during the scan. OPTIONAL: a v3 file written before this field
+  // existed has none (and validates fine), so no version bump is needed. A present-but-malformed
+  // value means corruption → the file is refused.
+  years?: string[];
 };
 
 const keyHash = (key: string): string =>
   createHash("sha1").update(key).digest("hex");
+
+// Split a snapshot filename into its { keyHash, gen } segments, or null for a foreign name.
+// `albumSnapshot.v3.<keyHash>.<gen>.dat` — keyHash is hex (no dots), gen has no dots, so the last
+// dot in the stem separates them. Used by the bound enforcer to group + order files without reading
+// any trailer (eviction never pays a per-file read).
+const parseSnapshotName = (
+  n: string
+): { keyHash: string; gen: string } | null => {
+  if (!n.startsWith(FILE_PREFIX) || !n.endsWith(".dat")) return null;
+  const stem = n.slice(FILE_PREFIX.length, n.length - ".dat".length);
+  const dot = stem.lastIndexOf(".");
+  if (dot <= 0) return null;
+  return { keyHash: stem.slice(0, dot), gen: stem.slice(dot + 1) };
+};
 
 // Validate a parsed trailer against the actual file it came from. Returns the trailer typed, or
 // null if anything is inconsistent — a truncated/garbled/partial file is REFUSED rather than served.
@@ -95,7 +134,15 @@ function validateTrailer(
   // A truncated/extended/edited records region breaks this equality.
   const trailerStart = fileSize - 8 - trailerByteLen;
   if (offsets[o.total] !== trailerStart) return null;
-  return { v: o.v, key: o.key, at: o.at, total: o.total, buckets, offsets };
+  // `years` is optional (a pre-change v3 file has none). If present it must be a string[]; anything
+  // else is corruption, and a corrupt trailer is refused rather than served.
+  let years: string[] | undefined;
+  if (o.years !== undefined) {
+    if (!Array.isArray(o.years) || !(o.years as unknown[]).every((y) => typeof y === "string"))
+      return null;
+    years = o.years as string[];
+  }
+  return { v: o.v, key: o.key, at: o.at, total: o.total, buckets, offsets, years };
 }
 
 // Read + validate the trailer of a snapshot file synchronously (used only at startup load, never on
@@ -148,6 +195,7 @@ function indexFromTrailer(
     items: [],
     snapshotFile: file,
     offsets: Uint32Array.from(trailer.offsets),
+    years: trailer.years,
   };
 }
 
@@ -165,9 +213,18 @@ export class AlbumSnapshotWriter {
   private batchBytes = 0;
   private readonly flushThreshold = 64 * 1024;
 
-  constructor(private readonly dir: string, private readonly key: string) {
-    const gen = randomBytes(6).toString("hex");
-    const base = `${FILE_PREFIX}${keyHash(key)}.${gen}`;
+  constructor(
+    private readonly dir: string,
+    private readonly key: string,
+    // Global-bound options forwarded to enforceSnapshotBounds after each finalize. Defaults keep the
+    // disk footprint bounded across rebuilds AND across users without touching the live indexes.
+    private readonly opts: {
+      maxBytes?: number;
+      keepPerKey?: number;
+      protectPerKey?: number;
+    } = {}
+  ) {
+    const base = `${FILE_PREFIX}${keyHash(key)}.${generationToken()}`;
     this.tmp = path.join(dir, `${base}.tmp`);
     this.dest = path.join(dir, `${base}.dat`);
   }
@@ -206,10 +263,13 @@ export class AlbumSnapshotWriter {
     this.batchBytes = 0;
   }
 
-  // Append trailer + footer, close, atomically rename tmp -> dest, prune older snapshots for this
-  // key. Returns the absolute file path + the resident Uint32Array offset index.
+  // Append trailer + footer, close, atomically rename tmp -> dest, then enforce the global disk
+  // bound. `years` (distinct release years collected during the scan) is persisted into the trailer
+  // so the "Years" browse filter stays O(1) after a restart, not just on the build that scanned.
+  // Returns the absolute file path + the resident Uint32Array offset index.
   async finalize(
-    buckets: AlbumIndexBucket[]
+    buckets: AlbumIndexBucket[],
+    years?: string[]
   ): Promise<{ snapshotFile: string; offsets: Uint32Array }> {
     const fh = this.fh;
     if (!fh) throw new Error("AlbumSnapshotWriter used before open");
@@ -223,6 +283,7 @@ export class AlbumSnapshotWriter {
       total,
       buckets,
       offsets: this.offsets,
+      years,
     };
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
     const footer = Buffer.alloc(8);
@@ -234,11 +295,14 @@ export class AlbumSnapshotWriter {
     this.fh = undefined;
     // Atomic swap. `dest` is a brand-new, uniquely-named file, so this rename never replaces an
     // existing file (no Windows rename-over-existing subtlety). An in-flight browse reading an older
-    // snapshot keeps reading it: its path is immutable, and cleanup keeps the previous snapshot.
+    // snapshot keeps reading it: its path is immutable, and the bound enforcer retains the previous
+    // generation (RETAIN-not-delete — see enforceSnapshotBounds).
     await fs.promises.rename(this.tmp, this.dest);
-    // Prune older snapshots for this key before returning so a rebuild leaves a bounded file count
-    // (cleanup never throws — each step is best-effort — so this does not risk the finalized build).
-    await cleanupSnapshots(this.dir, this.key, this.dest);
+    // Bound the disk footprint GLOBALLY across all keys. This REPLACES the old per-finalize
+    // "delete down to the newest two by mtime" prune: that was racy under an mtime tie (it could
+    // evict the live file) and bounded only a single key. The enforcer never throws — every step is
+    // best-effort — so a bound failure cannot risk the just-finalized build.
+    await enforceSnapshotBounds(this.dir, this.opts);
     return { snapshotFile: this.dest, offsets: Uint32Array.from(this.offsets) };
   }
 
@@ -258,49 +322,123 @@ export class AlbumSnapshotWriter {
   }
 }
 
-// Best-effort cleanup of older snapshot files for a key. Keeps the newest two (the just-written one
-// plus the immediately previous) so an in-flight browse that still holds the previous AlbumIndex
-// keeps a readable file, then deletes the rest. On Windows a delete of an open file fails (caught);
-// on Linux an unlink of an open file leaves the fd readable. Either way no wrong data is served.
-async function cleanupSnapshots(
+// RETAIN-not-delete disk bounding, applied GLOBALLY across every cache key after each finalize.
+//
+// Two layers, both ordered by the GENERATION TOKEN in the filename (never filesystem mtime — see
+// generationToken):
+//
+//   1. PER-KEY GENERATION CAP (`keepPerKey`, default 2). For each key, retain only the newest
+//      `keepPerKey` generations; evict the older ones. This is what makes a rebuild leave a bounded
+//      file count per key, and retaining the previous generation is what keeps an in-flight browse
+//      (which may still hold the just-superseded AlbumIndex) reading a live file.
+//
+//   2. GLOBAL BYTE CAP (`maxBytes`, default 4 GiB) across ALL keys — the cross-key bound the old
+//      per-key prune could not provide, and the one that stops a many-user `/cache` bind mount from
+//      walking into ENOSPC and taking the service down. When the total exceeds it, evict the OLDEST
+//      generations across all keys (oldest token first) until under the cap — but never the newest
+//      `protectPerKey` (default 1) of any key, because that is the active index a live or next browse
+//      reads. If even the protected set exceeds the cap (a cap smaller than the active catalog needs),
+//      nothing more is evicted and a warning is logged: refusing to evict beats breaking every read.
+//
+// Every eviction is best-effort. On Windows, deleting a file a reader has open fails (caught, left
+// in place — the reader keeps reading it, space reclaimed later); on Linux an unlink of an open fd
+// leaves that fd readable. Because reads open/close per call (readByteRange holds no persistent fd),
+// the only divergence is a transiently-unreachable reclaim, never wrong data and never a broken read.
+export async function enforceSnapshotBounds(
   dir: string,
-  key: string,
-  keep: string
+  opts: {
+    maxBytes?: number;
+    keepPerKey?: number;
+    protectPerKey?: number;
+  } = {}
 ): Promise<void> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_SNAPSHOT_MAX_BYTES;
+  const keepPerKey = Math.max(1, opts.keepPerKey ?? DEFAULT_SNAPSHOT_KEEP_PER_KEY);
+  // The protected set is always a subset of the retained set, and at least the single newest.
+  const protectPerKey = Math.max(
+    1,
+    Math.min(opts.protectPerKey ?? DEFAULT_SNAPSHOT_PROTECT_PER_KEY, keepPerKey)
+  );
+
   let names: string[];
   try {
     names = fs.readdirSync(dir);
   } catch {
     return;
   }
-  const prefix = `${FILE_PREFIX}${keyHash(key)}.`;
-  const files = names
-    .filter((n) => n.startsWith(prefix) && n.endsWith(".dat"))
-    .map((n) => {
-      const full = path.join(dir, n);
-      try {
-        return { full, mtime: fs.statSync(full).mtimeMs };
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((x): x is { full: string; mtime: number } => !!x)
-    .sort((a, b) => b.mtime - a.mtime);
-  // Always keep the just-written file plus one previous; remove older snapshots and any stale .tmp.
-  const keepers = new Set([keep, ...files.slice(1, 2).map((f) => f.full)]);
-  for (const { full } of files) {
-    if (keepers.has(full)) continue;
-    try {
-      await fs.promises.rm(full, { force: true });
-    } catch {
-      /* best-effort */
-    }
-  }
-  for (const n of names.filter((n) => n.startsWith(prefix) && n.endsWith(".tmp"))) {
+  // Sweep stale .tmp (a build that crashed before its atomic rename) whenever the directory is touched.
+  for (const n of names.filter((n) => n.startsWith(FILE_PREFIX) && n.endsWith(".tmp"))) {
     try {
       await fs.promises.rm(path.join(dir, n), { force: true });
     } catch {
       /* best-effort */
+    }
+  }
+
+  // Parse + stat every snapshot file. A file we cannot stat is left alone (not blindly evicted).
+  type SF = { full: string; keyHash: string; gen: string; size: number };
+  const files: SF[] = [];
+  for (const n of names) {
+    const parsed = parseSnapshotName(n);
+    if (!parsed) continue;
+    const full = path.join(dir, n);
+    try {
+      files.push({ full, keyHash: parsed.keyHash, gen: parsed.gen, size: fs.statSync(full).size });
+    } catch {
+      /* unreadable → not safely evictable; leave it */
+    }
+  }
+
+  // Rank each file within its key, newest token first (gen sorts as (timestamp, random), tie-free).
+  const byKey = new Map<string, SF[]>();
+  for (const f of files) {
+    const arr = byKey.get(f.keyHash);
+    if (arr) arr.push(f);
+    else byKey.set(f.keyHash, [f]);
+  }
+  const rankByFull = new Map<string, number>();
+  for (const arr of byKey.values()) {
+    arr.sort((a, b) => (a.gen < b.gen ? 1 : a.gen > b.gen ? -1 : 0)); // newest (largest gen) first
+    arr.forEach((f, i) => rankByFull.set(f.full, i));
+  }
+
+  const rm = async (f: SF): Promise<number> => {
+    try {
+      await fs.promises.rm(f.full, { force: true });
+      return f.size;
+    } catch {
+      return 0; // best-effort: a Windows delete of an open file fails; leave it, reclaim later
+    }
+  };
+
+  // Layer 1: always evict every generation beyond the per-key cap, oldest-of-key first.
+  const beyondCap = files
+    .filter((f) => rankByFull.get(f.full)! >= keepPerKey)
+    .sort((a, b) => (a.gen < b.gen ? -1 : a.gen > b.gen ? 1 : 0)); // oldest first
+  for (const f of beyondCap) await rm(f);
+
+  // Layer 2: if the global byte cap is exceeded, evict the oldest remaining generations across all
+  // keys, never dipping into the newest protectPerKey of any key. Operate ONLY on the files that
+  // survived Layer 1 (rank < keepPerKey): rm(force:true) silently no-ops on an already-deleted file,
+  // so including Layer-1 victims here would double-count their size as reclaimed.
+  const remaining = files.filter((f) => rankByFull.get(f.full)! < keepPerKey);
+  let total = remaining.reduce((s, f) => s + f.size, 0);
+  if (total > maxBytes) {
+    const reclaimable = remaining
+      .filter((f) => rankByFull.get(f.full)! >= protectPerKey)
+      .sort((a, b) => (a.gen < b.gen ? -1 : a.gen > b.gen ? 1 : 0)); // oldest first
+    for (const f of reclaimable) {
+      if (total <= maxBytes) break;
+      total -= await rm(f);
+    }
+    if (total > maxBytes) {
+      // The active (newest-per-key) indexes alone exceed the cap. Do NOT evict them — that would
+      // break every current and subsequent read. Surface the misconfiguration instead.
+      logger.warn(
+        `Album snapshot store at ${dir} is ${total} bytes, over its ${maxBytes}-byte bound even ` +
+          `after evicting every reclaimable generation; retaining active indexes. Raise ` +
+          `BNB_ALBUM_SNAPSHOT_MAX_BYTES.`
+      );
     }
   }
 }

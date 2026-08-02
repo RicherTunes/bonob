@@ -3194,12 +3194,12 @@ describe("SubsonicMusicLibrary", () => {
     });
 
     describe("when a song record is incomplete", () => {
-      // This replaces an allSettled test that kept the tracks whose per-song lookup resolved. There
-      // is no per-song lookup any more, so that partial failure cannot occur - but the risk it was
-      // guarding moved rather than vanished: a malformed song record must still not reject the
-      // whole search. Note the old defence ALSO hid every failure, so a search that lost all its
-      // fan-out calls returned an empty result that looked exactly like "nothing matched".
-      it("still returns a usable track when the album fields are missing", async () => {
+      // A search3 hit that arrives with no albumId would render as a DEAD album tile (browsable but
+      // unresolvable). For those hits ONLY, searchTracks makes a bounded getSong attempt to recover
+      // the album. These tests pin the three outcomes: recovered (kept), unrecoverable (dropped, no
+      // dead tile), and mixed. The common case — every hit already carries an albumId — never fires
+      // getSong, which the "cost" and "legacy per-track lookup (removed)" tests above cover.
+      it("drops an orphan whose album cannot be recovered, never rendering a dead tile", async () => {
         mockGET.mockImplementationOnce(() =>
           Promise.resolve(
             ok(
@@ -3220,14 +3220,47 @@ describe("SubsonicMusicLibrary", () => {
             )
           )
         );
+        // getSong is not stubbed here, so the recovery lookup fails: the orphan is dropped
+        // individually rather than poisoning the result. A missing result beats a dead tile.
 
         const result = await subsonic.searchTracks("orphan");
 
-        // Dropped, not rendered. Search results become album tiles, and a tile with an empty album
-        // id is browsable but unresolvable: tapping it asks getMetadata for "album:" and sticks on
-        // the "Loading, please try again" placeholder forever. A missing result beats a dead one,
-        // and the old per-song fan-out dropped these anyway.
         expect(result).toEqual([]);
+      });
+
+      it("recovers an orphan via a bounded getSong fallback when the server returns the album", async () => {
+        const album = anAlbum({ id: "album1", name: "Burnin" });
+        const artist = anArtist({ id: "artist1", name: "Bob Marley", albums: [album] });
+        const orphan = aTrack({
+          id: "orphan",
+          artist: artistToArtistSummary(artist),
+          album: albumToAlbumSummary(album),
+        });
+
+        mockGET
+          // search3 returns the song WITHOUT an albumId...
+          .mockImplementationOnce(() =>
+            Promise.resolve(
+              ok(
+                subsonicOK({
+                  searchResult3: {
+                    artist: [],
+                    album: [],
+                    song: [{ id: "orphan", title: "Orphan", contentType: "audio/mp3" }],
+                  },
+                })
+              )
+            )
+          )
+          // ...getSong returns the COMPLETE record (with albumId), so the orphan is recovered and
+          // rendered as a live album tile instead of being dropped.
+          .mockImplementationOnce(() => Promise.resolve(ok(getSongJson(orphan))));
+
+        const result = await subsonic.searchTracks("orphan");
+
+        expect(result).toHaveLength(1);
+        expect(result[0]!.id).toEqual("orphan");
+        expect(result[0]!.album.id).toEqual("album1"); // recovered, not a dead tile
       });
 
       it("keeps the songs that DO have an album when only some are orphaned", async () => {
@@ -3324,6 +3357,43 @@ describe("SubsonicMusicLibrary", () => {
           }
         );
       });
+    });
+  });
+
+  describe("years", () => {
+    // The Subsonic under test has no index cache, so peekAlbumIndex is always undefined and years()
+    // takes the paged-collection fallback — the path that used to silently truncate at the first
+    // 500-album page.
+    it("pages the catalog and returns DISTINCT years newest-first, not just the first page", async () => {
+      const artist = anArtist({ name: "art", albums: [] });
+      // A catalog across two pages: page 0 is a FULL 500 albums (years 1970/1980); page 1 holds a
+      // year (1990) the first page does NOT contain, then the catalog ends. The old single-_count
+      // query (capped at 500 by the server) would have LOST 1990 and called the rest the whole set.
+      const page0 = Array.from({ length: 500 }, (_, i) =>
+        anAlbumSummary({ name: `a${i}`, year: i % 2 ? "1980" : "1970" })
+      );
+      const page1 = [
+        anAlbumSummary({ name: "b0", year: "1990" }),
+        anAlbumSummary({ name: "b1", year: "1970" }),
+      ];
+      mockGET.mockImplementation((u: string, config: any) => {
+        const url = String(u);
+        if (url.includes("getArtists")) return Promise.resolve(ok(asArtistsJson([artist])));
+        const offset = Number(config.params.get("offset"));
+        const page = offset === 0 ? page0 : offset === 500 ? page1 : [];
+        return Promise.resolve(
+          ok(
+            getAlbumListJson(
+              page.map((a) => [artist, a] as [Artist, AlbumSummary])
+            )
+          )
+        );
+      });
+
+      const result = await subsonic.years();
+
+      // 1990 (only on page 1) is present → paging reached past the first page. Distinct, newest first.
+      expect(result).toEqual([{ year: "1990" }, { year: "1980" }, { year: "1970" }]);
     });
   });
 

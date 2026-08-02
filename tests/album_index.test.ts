@@ -160,4 +160,19 @@ describe("albumIndexRangesFor", () => {
     ]);
     expect(albumIndexRangesFor(idx, "Z")).toEqual([]);
   });
+
+  it("looks up a letter in O(1) via a memoized map (no re-filter, live bucket objects)", () => {
+    // The lookup must not re-filter `buckets` on every call. A per-index memo returns the same
+    // array instance on repeat and the actual bucket objects (so it cannot drift from `buckets`).
+    const idx = buildAlbumIndexFromPages([
+      names("Apple", "Banana", "Apex"), // A(0,1), B(1,1), A(2,1)
+    ]);
+    const first = albumIndexRangesFor(idx, "A");
+    const again = albumIndexRangesFor(idx, "A");
+    expect(again).toBe(first); // memoized: identical array, not a fresh filter result
+    expect(first[0]).toBe(idx.buckets[0]); // the live bucket object, in scan order
+    expect(first[1]).toBe(idx.buckets[2]);
+    // A letter with no runs yields a stable empty array (still O(1)).
+    expect(albumIndexRangesFor(idx, "Z")).toEqual([]);
+  });
 });

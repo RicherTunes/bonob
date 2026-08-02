@@ -31,6 +31,8 @@ import {
   CoverArtUnavailableError,
   CoverArtUpstreamError,
   headerString,
+  ALBUM_SCAN_PAGE_SIZE,
+  song,
 } from "./subsonic";
 import _ from "underscore";
 
@@ -339,25 +341,40 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       .search3(this.credentials, { query, albumCount: 20 })
       .then(({ albums }) => this.subsonic.toAlbumSummary(albums));
 
-  searchTracks = async (query: string) =>
-    this.subsonic
-      .search3(this.credentials, { query, songCount: 20 })
-      // search3 returns complete song records, so the album is resolved from each song rather than
-      // re-fetched. This used to run getTrack per hit - itself getSong + getAlbum - so 20 matches
-      // cost 41 round trips against the 4.5s SMAPI deadline, and getAlbum returns the album's whole
-      // track list, so it also pulled 20 full album payloads to read 20 album names.
-      //
-      // The old Promise.allSettled was defending the wrong thing: it stopped one slow track
-      // rejecting the search, but every failure was dropped SILENTLY, so a search that lost all 20
-      // fan-out calls returned an empty result indistinguishable from "nothing matched". That is
-      // the reported "songs never come back". With no fan-out there is nothing to partially fail.
-      //
-      // A song with no albumId is dropped: the SMAPI search renders each hit as an album tile, and
-      // a tile with an empty album id is browsable but unresolvable - tapping it asks getMetadata
-      // for "album:" and lands on the "Loading, please try again" placeholder forever. The old
-      // per-song fan-out dropped these too (getAlbum(undefined) simply failed), so this preserves
-      // the previous user-visible behaviour rather than introducing a dead tile.
-      .then(({ songs }) => this.subsonic.toTracks(songs.filter((s) => !!s.albumId)));
+  searchTracks = async (query: string) => {
+    const { songs } = await this.subsonic.search3(this.credentials, {
+      query,
+      songCount: 20,
+    });
+    // search3 returns complete song records, so a hit carrying an albumId resolves its album from
+    // the song itself — one upstream call total, independent of how many match. This used to run
+    // getTrack (getSong + getAlbum) per hit: 20 matches cost 41 round trips against the 4.5s SMAPI
+    // deadline, and getAlbum returns the album's WHOLE track list, so it pulled 20 full album
+    // payloads to read 20 names. The old allSettled then dropped every failure SILENTLY, so a search
+    // that lost all 20 fan-out calls returned [] indistinguishable from "nothing matched" — the
+    // reported "songs never come back".
+    //
+    // A song with no albumId would render as a DEAD album tile (browsable but unresolvable: tapping
+    // it asks getMetadata for "album:" and sticks on "Loading, please try again" forever). For those
+    // hits ONLY — never all of them — make a bounded best-effort getSong to recover the album. Each
+    // that still comes back without an albumId, or whose lookup fails, is dropped INDIVIDUALLY
+    // rather than poisoning the result; a missing result beats a dead tile. The common case (every
+    // hit carries an albumId) never fires the recovery, so cost stays O(1) in the match count.
+    const recovered = await Promise.all(
+      songs
+        .filter((s) => !s.albumId)
+        .map((s) =>
+          this.subsonic
+            .getSong(this.credentials, s.id)
+            .then((full) => (full && full.albumId ? full : undefined))
+            .catch(() => undefined)
+        )
+    );
+    const withAlbum = songs.filter((s) => !!s.albumId);
+    const rescued: song[] = [];
+    for (const full of recovered) if (full) rescued.push(full);
+    return this.subsonic.toTracks([...withAlbum, ...rescued]);
+  };
 
   playlists = async () =>
     this.subsonic.playlists(this.credentials);
@@ -401,23 +418,42 @@ export class SubsonicMusicLibrary implements MusicLibrary {
     this.radioStations().then((it) => it.find((station) => station.id === id)!);
 
   years = async () => {
-    const q: AlbumQuery = {
-      _index: 0,
-      _count: 100000, // FIXME: better than this, probably doesnt work anyway as max _count is 500 or something
-      type: "alphabeticalByArtist",
-    };
-    const years = this.subsonic
-      .getAlbumList2(this.credentials, q)
-      .then(({ results }) =>
-        results
-          .map((album) => album.year || "?")
-          .filter((item, i, ar) => ar.indexOf(item) === i)
-          .sort()
-          .map((year) => ({
-            ...asYear(year),
-          }))
-          .reverse()
+    // O(1) when the catalog index is warm: the distinct years were collected during the index scan
+    // (which touches every album anyway), so serve them straight off it. The index is built only for
+    // a catalog large enough to need A-Z bucketing; a small catalog has none and falls through.
+    const indexed = this.subsonic.peekAlbumIndex(this.credentials);
+    if (indexed) {
+      const idx = await indexed;
+      if (idx.years && idx.years.length > 0) {
+        return idx.years.map((y) => ({ ...asYear(y) })).reverse(); // stored ascending → newest first
+      }
+    }
+    // No index (small catalog, or a large one whose index is not warm yet): page the album list and
+    // collect the distinct years. The old code asked getAlbumList2 for _count 100000, but the server
+    // caps a page at 500, so it SILENTLY returned only the first page's years as if they were the
+    // whole set. This pages until the catalog actually ends. The walk is bounded by MAX_ALBUMS_FLAT
+    // (the small-catalog threshold) so a not-yet-warm LARGE catalog degrades bounded rather than
+    // paging millions of rows inline; that rare case is logged, never silent.
+    const years = new Set<string>();
+    let complete = false;
+    for (let index = 0; index < MAX_ALBUMS_FLAT; index += ALBUM_SCAN_PAGE_SIZE) {
+      const { results } = await this.subsonic.getAlbumList2(this.credentials, {
+        _index: index,
+        _count: ALBUM_SCAN_PAGE_SIZE,
+        type: "alphabeticalByArtist",
+      });
+      for (const album of results) if (album.year) years.add(album.year);
+      if (results.length < ALBUM_SCAN_PAGE_SIZE) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete) {
+      logger.warn(
+        `years() had no warm album index and hit the ${MAX_ALBUMS_FLAT}-album paging bound; the ` +
+          `year list may be incomplete until the album index finishes building.`
       );
-    return years;
+    }
+    return [...years].sort().map((y) => ({ ...asYear(y) })).reverse();
   };
 }

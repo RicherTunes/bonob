@@ -1420,6 +1420,64 @@ describe("Subsonic", () => {
         expect(indexCacheStore.save).not.toHaveBeenCalled();
       });
 
+      it("never ingests past a NON-multiple-of-page-size cap (cumulative guard)", async () => {
+        // The cap is driven by a CUMULATIVE ingested count, not the raw scan offset. With an offset-
+        // driven loop a non-multiple cap (1200, not a multiple of the 500 page size) lets the final
+        // full page overshoot — ingesting up to `cap + 499` records before the over-cap reject fires.
+        // The guard slices the last page to the remaining allowance, so exactly `cap` is ingested.
+        const mk = (cap: number) => {
+          const store = { load: jest.fn(() => []), save: jest.fn() };
+          const cache = new SwrCache(clock, 60_000, { store });
+          return {
+            cache,
+            store,
+            sub: new Subsonic(
+              url,
+              customPlayers,
+              axiosImageFetcher,
+              SwrCache.disabled(),
+              cache,
+              false,
+              {},
+              cap
+            ),
+          };
+        };
+        const artist = anArtist();
+
+        // A catalog of EXACTLY the non-multiple cap (1200) is complete: accept, total === cap.
+        // If the guard dropped records with an over-eager slice, total would be < cap.
+        const exact = mk(1200);
+        mockGET.mockImplementation((_u: string, config: any) => {
+          const offset = Number(config.params.get("offset"));
+          const remaining = Math.max(0, 1200 - offset);
+          const page = Array.from({ length: Math.min(500, remaining) }, (_, i) =>
+            anAlbumSummary({ id: `a-${offset + i}`, name: `Album ${offset + i}` })
+          );
+          return Promise.resolve(
+            ok(getAlbumListJson(page.map((album) => [artist, album] as [Artist, AlbumSummary])))
+          );
+        });
+        const exactIdx = await exact.sub.getAlbumIndex(credentials);
+        expect(exactIdx.total).toEqual(1200);
+
+        // A catalog that exceeds the non-multiple cap is refused, and nothing is cached.
+        const over = mk(1200);
+        let n = 0;
+        mockGET.mockImplementation(() => {
+          const page = Array.from({ length: 500 }, () =>
+            anAlbumSummary({ id: `a-${n++}`, name: `Album ${n}` })
+          );
+          return Promise.resolve(
+            ok(getAlbumListJson(page.map((album) => [artist, album] as [Artist, AlbumSummary])))
+          );
+        });
+        await expect(over.sub.getAlbumIndex(credentials)).rejects.toThrow(/safety cap/);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(over.cache.size()).toBe(0);
+        expect(over.store.save).not.toHaveBeenCalled();
+      });
+
       it("rejects an inconsistent album-index scan so a duplicate/missing snapshot is not cached or persisted", async () => {
         const indexCacheStore = {
           load: jest.fn(() => []),
