@@ -1,4 +1,14 @@
 import { randomUUID as uuid } from "crypto";
+
+jest.mock("../src/logger", () => {
+  const make = () => jest.fn();
+  return {
+    __esModule: true,
+    default: { error: make(), warn: make(), debug: make(), info: make() },
+    debugIt: <T,>(x: T) => x,
+  };
+});
+import logger from "../src/logger";
 import dayjs from "dayjs";
 import request from "supertest";
 import sharp from "sharp";
@@ -1574,6 +1584,253 @@ describe("server", () => {
               });
             });
 
+            describe("transient upstream / capacity failures (503 + no-store + Retry-After)", () => {
+              // The library (SubsonicMusicLibrary.coverArt) classifies 429/5xx/timeout/network/
+              // coordinator-bus and throws CoverArtUnavailableError; the route maps that to 503.
+              // The full axios -> classification path is covered in subsonic_music_library.test.ts;
+              // here the library boundary is mocked with the realistic contract it produces.
+              const { CoverArtUnavailableError, CoverArtBusyError } = require("../src/subsonic");
+              const transientCases: Array<[string, Error]> = [
+                ["HTTP 429", new CoverArtUnavailableError()],
+                ["coordinator busy (queue full / wait timeout)", new CoverArtBusyError("queue full")],
+              ];
+              transientCases.forEach(([label, err]) => {
+                it(`returns 503 with no-store and a numeric Retry-After for a transient ${label}, never a cacheable 404`, async () => {
+                  const coverArtURN = { system: "subsonic", resource: "art:transient" };
+                  musicService.login.mockResolvedValue(musicLibrary);
+                  musicLibrary.coverArt.mockRejectedValue(err);
+
+                  const res = await request(server)
+                    .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                    .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                  expect(res.status).toEqual(503);
+                  expect(res.header["cache-control"]).toMatch(/no-store/);
+                  // A small numeric Retry-After so Sonos / caches back off, but do not retry-storm.
+                  expect(res.header["retry-after"]).toBeDefined();
+                  expect(Number(res.header["retry-after"])).toBeGreaterThan(0);
+                  expect(res.header["retry-after"]).toMatch(/^\d+$/);
+                });
+              });
+
+              it("does not leak the coverArtURN / id / username / upstream body in the response body", async () => {
+                const coverArtURN = { system: "subsonic", resource: "art:secret-id" };
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockRejectedValue(new CoverArtUnavailableError());
+
+                const res = await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                expect(res.status).toEqual(503);
+                // The error must carry no identifiers, upstream URLs, credentials, or art ids.
+                expect(res.text).not.toContain("secret-id");
+                expect(res.text).not.toContain("coverArtUnavailable");
+              });
+            });
+
+            describe("serving a 200 response that carries non-image / XML error content", () => {
+              it("returns 502 with no-store when the upstream returned a 200 with an XML content type, never serving it as an image", async () => {
+                const coverArtURN = { system: "subsonic", resource: "art:xml" };
+                musicService.login.mockResolvedValue(musicLibrary);
+                // Navidrome can answer getCoverArt with HTTP 200 + text/xml (an error envelope)
+                // when the art id is missing/throttled mid-scan. It must never be served as art.
+                musicLibrary.coverArt.mockResolvedValue({
+                  contentType: "text/xml",
+                  data: Buffer.from("<subsonic-response><error code=\"70\"/></subsonic-response>"),
+                });
+
+                const res = await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                expect(res.status).toEqual(502);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
+                expect(res.text).not.toContain("subsonic-response");
+              });
+            });
+
+            describe("other unexpected upstream failures (non-404, no-store)", () => {
+              it("returns 500 with no-store for a sanitized CoverArtUpstreamError (e.g. 400/401/403), never a 404", async () => {
+                const { CoverArtUpstreamError } = require("../src/subsonic");
+                const coverArtURN = { system: "subsonic", resource: "art:other" };
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockRejectedValue(new CoverArtUpstreamError("other"));
+
+                const res = await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                expect(res.status).toEqual(500);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
+              });
+            });
+
+            describe("failure-path logging does not leak identifiers (real logger boundary)", () => {
+              // Collect every argument the logger received across the request. Sensitive values are
+              // the art id, username, password, upstream URL/query, response body, and the literal
+              // "[object Object]" that the prior defect produced.
+              const allLoggerArgs = () =>
+                (logger as jest.Mocked<typeof logger>).error.mock.calls
+                  .concat((logger as jest.Mocked<typeof logger>).warn.mock.calls)
+                  .concat((logger as jest.Mocked<typeof logger>).debug.mock.calls)
+                  .flatMap((args) => args.map((a) => (typeof a === "string" ? a : "")));
+
+              beforeEach(() => {
+                (logger as jest.Mocked<typeof logger>).error.mockClear();
+                (logger as jest.Mocked<typeof logger>).warn.mockClear();
+                (logger as jest.Mocked<typeof logger>).debug.mockClear();
+              });
+
+              const assertNoLeaks = () => {
+                // The per-request debug log MUST have fired, so a 'no leak' result is non-vacuous.
+                expect((logger as jest.Mocked<typeof logger>).debug).toHaveBeenCalled();
+                const dump = allLoggerArgs().join("\n");
+                expect(dump).not.toContain("art:leaked-id");
+                expect(dump).not.toContain("secret-user");
+                expect(dump).not.toContain("hunter2");
+                expect(dump).not.toContain("navidrome-internal");
+                expect(dump).not.toContain("upstream-body-secret");
+                expect(dump).not.toContain("[object Object]");
+              };
+
+              it("a 429 transient failure logs no art id / user / password / URL / body / [object Object]", async () => {
+                const { CoverArtUnavailableError } = require("../src/subsonic");
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockRejectedValue(new CoverArtUnavailableError());
+                const coverArtURN = { system: "subsonic", resource: "art:leaked-id" };
+
+                await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                assertNoLeaks();
+              });
+
+              it("a timeout/busy transient failure logs no identifiers", async () => {
+                const { CoverArtBusyError } = require("../src/subsonic");
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockRejectedValue(new CoverArtBusyError("queue full"));
+                const coverArtURN = { system: "subsonic", resource: "art:leaked-id" };
+
+                await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                assertNoLeaks();
+              });
+
+              it("a 200-with-XML-content-type (bad upstream) logs no body / identifiers", async () => {
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockResolvedValue({
+                  contentType: "text/xml",
+                  data: Buffer.from("<subsonic-response>upstream-body-secret</subsonic-response>"),
+                });
+                const coverArtURN = { system: "subsonic", resource: "art:leaked-id" };
+
+                await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                assertNoLeaks();
+              });
+
+              it("an unexpected (other) failure logs no identifiers", async () => {
+                const { CoverArtUpstreamError } = require("../src/subsonic");
+                musicService.login.mockResolvedValue(musicLibrary);
+                musicLibrary.coverArt.mockRejectedValue(new CoverArtUpstreamError("other"));
+                const coverArtURN = { system: "subsonic", resource: "art:leaked-id" };
+
+                await request(server)
+                  .get(`/art/${encodeURIComponent(formatForURL(coverArtURN))}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                assertNoLeaks();
+              });
+            });
+            describe("client-error logging does not leak request-derived values (real logger boundary)", () => {
+              // These two 400 paths previously logged the raw burn (and the parse error that embeds
+              // it) and the full signed external URL. They must now emit only a fixed, stable,
+              // non-identifying category. Assert over EVERY captured logger argument after safe
+              // stringification that no injected secret/identifier/path/query can appear.
+              const allLoggerArgs = () =>
+                (logger as jest.Mocked<typeof logger>).error.mock.calls
+                  .concat((logger as jest.Mocked<typeof logger>).warn.mock.calls)
+                  .concat((logger as jest.Mocked<typeof logger>).debug.mock.calls)
+                  .concat((logger as jest.Mocked<typeof logger>).info.mock.calls)
+                  .flatMap((args) =>
+                    args.map((a) => {
+                      if (typeof a === "string") return a;
+                      try {
+                        return JSON.stringify(a) ?? "";
+                      } catch {
+                        return String(a);
+                      }
+                    })
+                  );
+
+              beforeEach(() => {
+                (logger as jest.Mocked<typeof logger>).error.mockClear();
+                (logger as jest.Mocked<typeof logger>).warn.mockClear();
+                (logger as jest.Mocked<typeof logger>).debug.mockClear();
+                (logger as jest.Mocked<typeof logger>).info.mockClear();
+              });
+
+              it("a malformed burn logs only a fixed category: no raw burn, no path, no exception message/object, no [object Object]", async () => {
+                musicService.login.mockResolvedValue(musicLibrary);
+                // A unique marker embedded in the malformed burn; if any of it reaches a log arg
+                // the test fails. (parse() also embeds the raw burn in its thrown Error message.)
+                const marker = "MALBURN-MARKER-9f3a7c";
+                const burn = `not-a-valid-burn-${marker}`;
+
+                const res = await request(server)
+                  .get(`/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                // HTTP behavior unchanged: deliberate 400 + no-store.
+                expect(res.status).toEqual(400);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
+                // A warn MUST have fired for this client error (non-vacuous).
+                expect((logger as jest.Mocked<typeof logger>).warn).toHaveBeenCalled();
+                const dump = allLoggerArgs().join("\n");
+                expect(dump).not.toContain(marker);
+                expect(dump).not.toContain(burn);
+                expect(dump).not.toContain("not-a-valid-burn");
+                expect(dump).not.toContain("[object Object]");
+                // The fixed category IS emitted (proves we still log the event, just safely).
+                expect(dump).toContain("rejected art request");
+              });
+
+              it("a rejected unsafe external URL logs only a fixed category: no private path, no query credential, no resource, no [object Object]", async () => {
+                musicService.login.mockResolvedValue(musicLibrary);
+                // A signed external burn whose resource is a private path carrying a query
+                // credential. 127.0.0.1 is rejected by isSafeExternalImageUrl (loopback).
+                const pathMarker = "PRIVATE-PATH-MARKER-4b2e91";
+                const queryCred = "token=hunter2-query-secret-77";
+                const unsafeExternalURN = {
+                  system: "external" as const,
+                  resource: `http://127.0.0.1:9999/secret/${pathMarker}?${queryCred}`,
+                };
+                const signedBurn = formatForURL(unsafeExternalURN);
+
+                const res = await request(server)
+                  .get(`/art/${encodeURIComponent(signedBurn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`)
+                  .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+                // HTTP behavior unchanged: deliberate 400 + no-store.
+                expect(res.status).toEqual(400);
+                expect(res.header["cache-control"]).toMatch(/no-store/);
+                expect((logger as jest.Mocked<typeof logger>).warn).toHaveBeenCalled();
+                const dump = allLoggerArgs().join("\n");
+                expect(dump).not.toContain(pathMarker);
+                expect(dump).not.toContain("hunter2-query-secret-77");
+                expect(dump).not.toContain("127.0.0.1");
+                expect(dump).not.toContain("/secret/");
+                expect(dump).not.toContain("token=");
+                expect(dump).not.toContain("[object Object]");
+                expect(dump).toContain("rejected art request");
+              });
+            });
             describe("when the burn is malformed", () => {
               it("should return 400 with no-store (a client error, handled deliberately, not an Express default 500)", async () => {
                 musicService.login.mockResolvedValue(musicLibrary);

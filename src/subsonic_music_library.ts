@@ -27,6 +27,9 @@ import {
   asYear,
   isValidImage,
   SONOS_CLIENT_INFO,
+  classifyCoverArtError,
+  CoverArtUnavailableError,
+  CoverArtUpstreamError,
 } from "./subsonic";
 import _ from "underscore";
 
@@ -262,24 +265,46 @@ export class SubsonicMusicLibrary implements MusicLibrary {
     return this.subsonic.stream(this.credentials, trackId, track.encoding.player, range);
   };
 
-  coverArt = async (coverArtURN: BUrn, size?: number) =>
-    Promise.resolve(coverArtURN)
-      .then((it) => assertSystem(it, "subsonic"))
-      .then((it) =>
-        this.subsonic.getCoverArt(
-          this.credentials,
-          it.resource.split(":")[1]!,
-          size
-        )
-      )
-      .then((res) => ({
+  coverArt = async (coverArtURN: BUrn, size?: number) => {
+    // A non-Subsonic/invalid URN is not transient: there is no art to fetch here, so return
+    // undefined (the HTTP layer answers 404). assertSystem throws on a system mismatch.
+    let artId: string;
+    try {
+      const system = assertSystem(coverArtURN, "subsonic");
+      artId = system.resource.split(":")[1]!;
+    } catch {
+      return undefined;
+    }
+
+    try {
+      const res = await this.subsonic.getCoverArt(
+        this.credentials,
+        artId,
+        size
+      );
+      return {
         contentType: res.headers["content-type"],
         data: Buffer.from(res.data, "binary"),
-      }))
-      .catch((e) => {
-        logger.error(`Failed getting coverArt for urn:'${coverArtURN}': ${e}`);
-        return undefined;
-      });
+      };
+    } catch (e) {
+      // Classify the upstream outcome. NEVER log `${e}`, the raw URN, username, password/token,
+      // upstream URL/query, or response body here (this also removes the prior `[object Object]`
+      // defect): a transient throttle is expected and must not leak identifiers. Sanitize every
+      // thrown value into a typed error carrying no upstream body/URL/credential, so the HTTP layer
+      // can map it without leaking.
+      const category = classifyCoverArtError(e);
+      if (category === "absent") return undefined; // genuine HTTP 404 -> cacheable absence (404)
+      if (category === "transient") {
+        // A coordinator busy/timeout is already a CoverArtUnavailableError (a subclass): re-throw
+        // as-is so the busy signal survives. An axios 429/5xx/timeout is wrapped in a fresh
+        // CoverArtUnavailableError so the upstream body/URL never leak through to the HTTP layer.
+        throw e instanceof CoverArtUnavailableError ? e : new CoverArtUnavailableError();
+      }
+      // "other" (e.g. 400/401/403 / unexpected): never become undefined/404. Wrap in a sanitized
+      // typed error carrying only the category - no upstream body, URL, id, or credential.
+      throw new CoverArtUpstreamError(category);
+    }
+  };
 
   // todo: unit test the difference between scrobble and nowPlaying
   scrobble = async (id: string) =>

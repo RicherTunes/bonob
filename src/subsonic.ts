@@ -221,6 +221,266 @@ export const isRetryableSubsonicError = (e: unknown): boolean => {
   // Unknown non-Axios error -> treat as a transient transport error.
   return true;
 };
+// ----------------------------------------------------------------------------
+// Cover-art request coordination.
+//
+// Navidrome (and any Subsonic server) serves cover art via /rest/getCoverArt. Sonos requests art
+// for every album/artist/track it shows, so a single browse page fans out dozens of identical
+// (per-image) and distinct requests at once. Under restart/resumed-scan contention Navidrome
+// returns 429s and slow/invalid responses; without coordination bonob amplifies that pressure (one
+// independent upstream call per art tile, no coalescing, no bound) and turns every transient
+// failure into a cacheable 404 (so clients never retry the real art).
+//
+// The CoverArtCoordinator fixes three things per Subsonic instance:
+//   1. Coalesces identical IN-FLIGHT requests onto one upstream call (privacy-safe key, below).
+//   2. Bounds the number of DISTINCT requests active at once (maxConcurrency) so bonob never opens
+//      hundreds of simultaneous sockets to a throttled server.
+//   3. Bounds the wait for a slot (maxQueue + queueTimeoutMs): a FIFO queue with a hard cap, and
+//      each queued request has a bounded wait. Over-cap or expired waits reject with a
+//      classifiable CoverArtBusyError so the HTTP layer can return 503 + no-store + Retry-After.
+//
+// It does NOT retry: a blind 429/5xx retry loop would amplify throttle pressure. A failure (any
+// kind) releases the in-flight entry so the next identical request starts a fresh upstream call.
+//
+// The coalescing key is a SHA-256 digest of an UNAMBIGUOUS length-prefixed encoding of the full
+// credential scope (username + password), the art id, and the normalized size. Length-prefixing
+// makes the input to the hash collision-free across differing component boundaries (so "ab"+"c"
+// can never collide with "a"+"bc"), and the digest is the ONLY thing stored in the Map/queue, so
+// raw credentials, tokens, art ids, and usernames are never persisted or logged by the coordinator.
+// Distinct users, passwords, ids, and sizes never share a result.
+// ----------------------------------------------------------------------------
+
+// getCoverArt has its own bounded timeout, shorter than the process-wide SUBSONIC_HTTP_TIMEOUT_MS.
+// Art tiles are small and high-volume; a hung/slow getCoverArt must not stack up behind the global
+// 30s bound and must free its coordinator slot promptly.
+export const SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS = 10_000;
+export const DEFAULT_COVER_ART_HTTP_TIMEOUT_MS = SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS;
+
+// Conservative default: a single browse page fans out many art tiles, but the Subsonic server is
+// the bottleneck under throttle - keep the simultaneous-socket count low. No env var is added (env
+// surface stays exactly as-is); tests inject options via the constructor.
+export const DEFAULT_COVER_ART_CONCURRENCY = 4;
+export const DEFAULT_COVER_ART_QUEUE = 64;
+export const DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS = 5_000;
+
+// A transient capacity/availability signal surfaced by the coordinator: the queue is full, or a
+// queued request waited past its bounded deadline. Subclass of CoverArtUnavailableError so the HTTP
+// layer maps it to a single 503 path (one instanceof check), and so callers can classify it.
+export class CoverArtUnavailableError extends Error {
+  constructor(message = "cover art temporarily unavailable") {
+    super(message);
+    this.name = "CoverArtUnavailableError";
+    Object.setPrototypeOf(this, CoverArtUnavailableError.prototype);
+  }
+}
+
+// A sanitized upstream error for non-transient (e.g. 400/401/403 / unexpected) cover-art failures.
+// Carries no upstream body, URL, id, username, or credential - only a stable category - so it can
+// propagate and be reported (non-404) without leaking identifiers.
+export class CoverArtUpstreamError extends Error {
+  readonly category: CoverArtErrorCategory;
+  constructor(category: CoverArtErrorCategory, message = "cover art upstream error") {
+    super(message);
+    this.name = "CoverArtUpstreamError";
+    this.category = category;
+    Object.setPrototypeOf(this, CoverArtUpstreamError.prototype);
+  }
+}
+
+export class CoverArtBusyError extends CoverArtUnavailableError {
+  constructor(message = "cover art coordinator busy") {
+    super(message);
+    this.name = "CoverArtBusyError";
+    Object.setPrototypeOf(this, CoverArtBusyError.prototype);
+  }
+}
+
+type Queued = {
+  task: () => Promise<unknown>;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
+
+export type CoverArtCoordinatorOptions = {
+  maxConcurrency?: number;
+  maxQueue?: number;
+  queueTimeoutMs?: number;
+};
+
+// Build an unambiguous, canonical key for coalescing. Each component is length-prefixed so that
+// concatenated inputs with different component boundaries cannot collide (e.g. ("ab","c") vs
+// ("a","bc")). The password is part of the scope so a credential rotation never serves a prior
+// user's cached art to a new one. Only the opaque hex digest is ever stored.
+const LENGTH_PREFIX = (s: string) => `${s.length}:`;
+
+export const coverArtKey = (
+  username: string,
+  password: string,
+  artId: string,
+  size?: number
+): string => {
+  const normalizedSize = size && size > 0 ? size : 0;
+  const encoded =
+    LENGTH_PREFIX(username) + username +
+    LENGTH_PREFIX(password) + password +
+    LENGTH_PREFIX(artId) + artId +
+    LENGTH_PREFIX(`${normalizedSize}`) + `${normalizedSize}`;
+  return createHash("sha256").update(encoded).digest("hex");
+};
+
+const isPositiveInteger = (n: number): boolean =>
+  Number.isInteger(n) && n > 0;
+const isNonNegativeInteger = (n: number): boolean =>
+  Number.isInteger(n) && n >= 0;
+
+export class CoverArtCoordinator {
+  private readonly maxConcurrency: number;
+  private readonly maxQueue: number;
+  private readonly queueTimeoutMs: number;
+  private active = 0;
+  private readonly inFlight = new Map<string, Promise<unknown>>();
+  private readonly queue: Queued[] = [];
+
+  constructor(opts: CoverArtCoordinatorOptions = {}) {
+    const maxConcurrency = opts.maxConcurrency ?? DEFAULT_COVER_ART_CONCURRENCY;
+    const maxQueue = opts.maxQueue ?? DEFAULT_COVER_ART_QUEUE;
+    const queueTimeoutMs = opts.queueTimeoutMs ?? DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS;
+
+    // Validate synchronously so a misconfiguration fails fast at construction, not on the first
+    // request. maxQueue = 0 means "no queue": once all slots are busy, extra requests reject at
+    // once rather than waiting.
+    if (!isPositiveInteger(maxConcurrency)) {
+      throw new RangeError(
+        `CoverArtCoordinator maxConcurrency must be a positive integer, got ${maxConcurrency}`
+      );
+    }
+    if (!isNonNegativeInteger(maxQueue)) {
+      throw new RangeError(
+        `CoverArtCoordinator maxQueue must be a non-negative integer, got ${maxQueue}`
+      );
+    }
+    if (!isPositiveInteger(queueTimeoutMs) || !Number.isFinite(queueTimeoutMs)) {
+      throw new RangeError(
+        `CoverArtCoordinator queueTimeoutMs must be a positive finite integer, got ${queueTimeoutMs}`
+      );
+    }
+
+    this.maxConcurrency = maxConcurrency;
+    this.maxQueue = maxQueue;
+    this.queueTimeoutMs = queueTimeoutMs;
+  }
+
+  // Coalesce identical in-flight requests onto one upstream call. After ANY settlement the map
+  // entry is dropped, so the next identical request starts a fresh upstream call (no sticky
+  // failures). The key is opaque (a SHA-256 digest) so the Map never holds credentials/resource
+  // values. Generic so it can wrap either a raw-image task or an axios-response task.
+  run = <T>(key: string, task: () => Promise<T>): Promise<T> => {
+    const existing = this.inFlight.get(key) as Promise<T> | undefined;
+    if (existing) return existing;
+
+    const promise = this.acquire(task) as Promise<T>;
+    // Drop the entry on settle so a later identical request retries upstream after a failure.
+    const tracked = promise.then(
+      (v) => {
+        this.inFlight.delete(key);
+        return v;
+      },
+      (e) => {
+        this.inFlight.delete(key);
+        throw e;
+      }
+    ) as Promise<T>;
+    this.inFlight.set(key, tracked as Promise<unknown>);
+    return tracked;
+  };
+
+  private acquire = (task: () => Promise<unknown>): Promise<unknown> => {
+    if (this.active < this.maxConcurrency) return this.execute(task);
+
+    // maxQueue = 0 means no queueing at all: reject immediately when every slot is busy.
+    if (this.maxQueue === 0 || this.queue.length >= this.maxQueue) {
+      return Promise.reject(new CoverArtBusyError("cover art queue full"));
+    }
+
+    return new Promise<unknown>((resolve, reject) => {
+      const entry: Queued = {
+        task,
+        resolve,
+        reject,
+        timer: undefined,
+      };
+      // Each queued request has a bounded wait; reject (and dequeue) on expiry, never holding it.
+      entry.timer = setTimeout(() => {
+        const i = this.queue.indexOf(entry);
+        if (i >= 0) {
+          this.queue.splice(i, 1);
+          reject(new CoverArtBusyError("cover art queue wait timed out"));
+        }
+      }, this.queueTimeoutMs);
+      this.queue.push(entry);
+    });
+  };
+
+  // Run a task under an active slot. A synchronous throw from the task is normalized to a rejection
+  // so the slot is always released exactly once via the settle handler.
+  private execute = (task: () => Promise<unknown>): Promise<unknown> => {
+    this.active += 1;
+    let result: Promise<unknown>;
+    try {
+      result = Promise.resolve(task());
+    } catch (e) {
+      result = Promise.reject(e);
+    }
+    result.then(
+      () => this.onSettled(),
+      () => this.onSettled()
+    );
+    return result;
+  };
+
+  // Release a slot: if a queued request is waiting, hand it the freed slot (FIFO) and run it;
+  // otherwise decrement the active count. Clears the queued request's wait timer first.
+  private onSettled = (): void => {
+    const next = this.queue.shift();
+    if (next) {
+      if (next.timer) clearTimeout(next.timer);
+      let result: Promise<unknown>;
+      try {
+        result = Promise.resolve(next.task());
+      } catch (e) {
+        result = Promise.reject(e);
+      }
+      result.then(next.resolve, next.reject);
+      result.then(
+        () => this.onSettled(),
+        () => this.onSettled()
+      );
+      return;
+    }
+    this.active = Math.max(0, this.active - 1);
+  };
+}
+
+// Honest classification of an upstream error from getCoverArt. The result is an explicit union;
+// "other" is a first-class outcome (never cast away) so unexpected errors propagate deliberately
+// instead of being hidden as a cacheable 404.
+export type CoverArtErrorCategory = "absent" | "transient" | "other";
+
+export const classifyCoverArtError = (e: unknown): CoverArtErrorCategory => {
+  if (axios.isAxiosError(e)) {
+    const status = e.response?.status;
+    if (status === 404) return "absent";
+    // No response = transport/timeout (ECONNABORTED, ENOTFOUND, ETIMEDOUT, ECONNRESET...). A real
+    // response status of 429/5xx is throttle/capacity. Both are transient -> the caller retries.
+    if (!status || status === 429 || status >= 500) return "transient";
+    // Other 4xx (400/401/403) is unexpected for cover art -> "other", surfaced deliberately.
+    return "other";
+  }
+  // Coordinator busy / queue timeout is already a CoverArtUnavailableError -> transient.
+  if (e instanceof CoverArtUnavailableError) return "transient";
+  return "other";
+};
 
 type SubsonicEnvelope = {
   "subsonic-response": SubsonicResponse;
@@ -1055,6 +1315,9 @@ export class Subsonic {
   private cache: SwrCache;
   private indexCache: SwrCache;
 
+  // Bounds and coalesces getCoverArt across all libraries on this instance (see CoverArtCoordinator).
+  private coverArtCoordinator: CoverArtCoordinator;
+
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
@@ -1064,7 +1327,11 @@ export class Subsonic {
     // changes only on a library scan, so it must have a much longer TTL than the browse cache
     // (otherwise it would re-scan on every stale browse). Defaults to the browse cache.
     indexCache: SwrCache = cache,
-    preferDeezerArtistArt: boolean = false
+    preferDeezerArtistArt: boolean = false,
+    // Cover-art coordination options: an optional test/config object so tests can exercise real
+    // coordinator behaviour (concurrency cap, queue depth, queue wait) without poking private
+    // fields. All existing positional callers are preserved.
+    coverArtCoordinatorOptions: CoverArtCoordinatorOptions = {}
   ) {
     this.url = url;
     this.customPlayers = customPlayers;
@@ -1072,6 +1339,10 @@ export class Subsonic {
     this.preferDeezerArtistArt = preferDeezerArtistArt;
     this.cache = cache;
     this.indexCache = indexCache;
+    // One coordinator per Subsonic instance, shared by every logged-in library using it. The key
+    // includes the credential scope so distinct users never share a result, while identical
+    // concurrent requests for the SAME user/art/size coalesce onto one upstream call.
+    this.coverArtCoordinator = new CoverArtCoordinator(coverArtCoordinatorOptions);
   }
 
   private get = async (
@@ -1409,11 +1680,23 @@ export class Subsonic {
         albums: this.toAlbumSummary(it.album || []),
       }));
 
-  getCoverArt = (credentials: Credentials, id: string, size?: number) =>
-    this.get(credentials, "/rest/getCoverArt", size ? { id, size } : { id }, {
-      headers: { "User-Agent": "bonob" },
-      responseType: "arraybuffer",
-    });
+  getCoverArt = (credentials: Credentials, id: string, size?: number) => {
+    // Route through the per-instance coordinator: identical concurrent requests for the same
+    // user/art/size coalesce onto ONE upstream call, and distinct requests are bounded
+    // (concurrency cap + FIFO queue). The coordinator does NOT retry, so a 429/5xx failure
+    // releases the slot and a later identical request starts a fresh upstream call.
+    const key = coverArtKey(credentials.username, credentials.password, id, size);
+    const fetch = () =>
+      this.get(credentials, "/rest/getCoverArt", size ? { id, size } : { id }, {
+        headers: { "User-Agent": "bonob" },
+        responseType: "arraybuffer",
+        // getCoverArt is small + high-volume: give it its own bound shorter than the global 30s
+        // timeout so a hung/throttled server frees the coordinator slot promptly. Headers,
+        // params, and the arraybuffer behaviour are unchanged.
+        timeout: SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS,
+      });
+    return this.coverArtCoordinator.run(key, fetch);
+  };
 
   getTrack = (credentials: Credentials, id: string) =>
     this.getJSONWithRetry<GetSongResponse>(credentials, "/rest/getSong", {
