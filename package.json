@@ -5,6 +5,9 @@
   "repository": "https://github.com/RicherTunes/bonob",
   "author": "simojenki <simojenki@users.noreply.github.com>",
   "license": "GPL-3.0-only",
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "@svrooij/sonos": "^2.6.0-beta.13",
     "@types/express": "^5.0.6",
@@ -22,7 +25,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.11.0",
     "node-html-parser": "^7.1.0",
-    "sharp": "^0.34.5",
+    "sharp": "^0.35.3",
     "soap": "^1.9.0",
     "typescript": "^5.9.3",
     "underscore": "^1.13.8",
