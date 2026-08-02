@@ -22,6 +22,7 @@ import { SystemClock } from "./clock";
 import { JWTSmapiLoginTokens } from "./smapi_auth";
 import { SwrCache } from "./swr_cache";
 import { fileStore } from "./swr_cache_file_store";
+import { albumIndexStore } from "./album_snapshot";
 import { deezerArtistImageUrl } from "./deezer";
 import ms from "ms";
 
@@ -78,16 +79,29 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
 // The album index is a heavy full-catalog scan (~N/500 requests) that changes only on a library
 // scan, so cache it far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on
 // every stale browse. Persisted in its own subdir so it survives restarts.
+//
+// Slice 1: the index snapshot is disk-backed (records streamed to an immutable per-build file,
+// only buckets + a Uint32Array of byte offsets resident), so it is persisted by albumIndexStore
+// (one self-describing snapshot file per build), NOT by the generic fileStore. The same directory
+// is passed to Subsonic so the scan writes its snapshot where the store will look for it.
+const indexCacheDir = config.subsonic.cacheDir
+  ? path.join(config.subsonic.cacheDir, "index")
+  : undefined;
 const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
-  store: config.subsonic.cacheDir
-    ? // the index holds a full album snapshot (tens of MB on a large library), so raise the
-      // per-file cap well above the browse cache's default but keep only a small number of snapshots.
-      fileStore(path.join(config.subsonic.cacheDir, "index"), {
-        maxFiles: ALBUM_INDEX_CACHE_MAX_ENTRIES,
-        maxFileBytes: 256 * 1024 * 1024,
-      })
-    : undefined,
-  revive: deepFreeze,
+  store: indexCacheDir ? albumIndexStore(indexCacheDir) : undefined,
+  // A restored index has a Uint32Array of byte offsets; deepFreeze must NOT recurse into it
+  // (Object.values on a typed array allocates a million-entry array). Freeze just the index and
+  // its bucket rows — enough to match the "persisted = immutable" contract without that cost.
+  revive: (v) => {
+    if (v && typeof v === "object") {
+      Object.freeze(v);
+      const buckets = (v as { buckets?: unknown }).buckets;
+      if (Array.isArray(buckets)) {
+        for (const b of buckets) if (b && typeof b === "object") Object.freeze(b);
+      }
+    }
+    return v;
+  },
   maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
   // The full-catalog scan legitimately takes several minutes on a large library; the default
   // 60s backstop would abort it before it ever completes. Give it a generous ceiling.
@@ -101,7 +115,10 @@ const subsonic = new SubsonicMusicService(
     artistImageFetcher,
     browseCache,
     indexCache,
-    config.subsonic.deezerArtistArt
+    config.subsonic.deezerArtistArt,
+    {}, // coverArtCoordinatorOptions (default)
+    undefined, // maxIndexScanAlbums (default)
+    indexCacheDir // Slice 1: disk-backed album snapshot directory
   ),
   customPlayers,
   config.subsonic.transcode

@@ -1,0 +1,2519 @@
+diff --git a/src/album_index.ts b/src/album_index.ts
+index b1b56fe..136bcd3 100644
+--- a/src/album_index.ts
++++ b/src/album_index.ts
+@@ -22,8 +22,18 @@ export type AlbumIndex<T = { name: string }> = {
+   // Contiguous runs in scan order. A letter may appear in more than one run when a stray title
+   // sorts away from its neighbours; correctness does not depend on runs being one-per-letter.
+   buckets: AlbumIndexBucket[];
+-  // The scanned album snapshot, in scan order. Runs index into this array.
++  // The scanned album snapshot, in scan order. Runs index into this array. For a disk-backed
++  // (large-catalog) index this is EMPTY â€” the records live in `snapshotFile` and a page is read on
++  // demand via `offsets` (see readAlbumIndexPage/readAlbumIndexAll in album_snapshot.ts), so the
++  // full snapshot is never resident. Absent for in-memory (small/test) indexes.
+   items: T[];
++  // Slice 1 disk-backed snapshot. `snapshotFile` is an absolute path to an IMMUTABLE, per-build
++  // file; `offsets[i]` is the byte offset of record i within it (offsets[total] = end of records).
++  // A page read opens the file and reads exactly [offsets[s], offsets[e]) for the requested slice.
++  // Because the file is never rewritten (each rebuild is a new file) offsets always resolve against
++  // the same bytes they were built from â€” drift is impossible across a rebuild.
++  snapshotFile?: string;
++  offsets?: Uint32Array;
+ };
+ 
+ // A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
+@@ -83,6 +93,26 @@ export function albumBucketKey(
+ const compareBucketKeys = (a: string, b: string): number =>
+   a === b ? 0 : a === "#" ? -1 : b === "#" ? 1 : a < b ? -1 : 1;
+ 
++// Accumulates the contiguous-run bucket table one album at a time, in scan order. A new run starts
++// whenever the bucket key changes, so each run is an exact [offset, offset+count) slice of the
++// snapshot. Shared by the in-memory reduce (buildAlbumIndexFromPages) and the disk-streaming build
++// (Subsonic.buildAlbumIndex) so the two paths cannot diverge in how they bucket.
++export class BucketBuilder<T extends { name: string }> {
++  readonly buckets: AlbumIndexBucket[] = [];
++  private current: AlbumIndexBucket | undefined;
++  total = 0;
++
++  append(album: T, ignoredArticles?: string[]): void {
++    const key = albumBucketKey(album.name, ignoredArticles);
++    if (!this.current || this.current.key !== key) {
++      this.current = { key, label: key, offset: this.total, count: 0 };
++      this.buckets.push(this.current);
++    }
++    this.current.count++;
++    this.total++;
++  }
++}
++
+ // Reduce the scanned album pages (in alphabeticalByName order) into the snapshot + contiguous runs.
+ // Pure so it can be unit-tested without the Subsonic client. A new run starts whenever the bucket
+ // key changes, so each run is an exact [offset, offset+count) slice of the stored `items` snapshot.
+@@ -90,23 +120,13 @@ export function buildAlbumIndexFromPages<T extends { name: string }>(
+   pages: T[][],
+   ignoredArticles?: string[]
+ ): AlbumIndex<T> {
+-  const buckets: AlbumIndexBucket[] = [];
+-  const items: T[] = [];
+-  let offset = 0;
+-  let current: AlbumIndexBucket | undefined;
++  const builder = new BucketBuilder<T>();
+   for (const page of pages) {
+     for (const album of page) {
+-      items.push(album);
+-      const key = albumBucketKey(album.name, ignoredArticles);
+-      if (!current || current.key !== key) {
+-        current = { key, label: key, offset, count: 0 };
+-        buckets.push(current);
+-      }
+-      current.count++;
+-      offset++;
++      builder.append(album, ignoredArticles);
+     }
+   }
+-  return { total: offset, buckets, items };
++  return { total: builder.total, buckets: builder.buckets, items: pages.flat() };
+ }
+ 
+ // Serve one page of a letter directly from the stored snapshot: gather the letter's contiguous
+diff --git a/src/album_snapshot.ts b/src/album_snapshot.ts
+new file mode 100644
+index 0000000..651934c
+--- /dev/null
++++ b/src/album_snapshot.ts
+@@ -0,0 +1,459 @@
++import fs from "fs";
++import path from "path";
++import { createHash, randomBytes } from "crypto";
++import { SwrCacheStore } from "./swr_cache";
++import logger from "./logger";
++import {
++  AlbumIndex,
++  AlbumIndexBucket,
++  albumIndexPage,
++  albumIndexAll,
++  albumIndexRangesFor,
++} from "./album_index";
++
++// Slice 1: disk-backed album snapshot.
++//
++// The album index used to hold the entire scanned snapshot (`AlbumIndex.items`) in memory â€” about
++// 474 B/album, which crosses the container limit around 900k albums. This module moves the records
++// to disk and keeps only the bucket table + a Uint32Array of per-record byte offsets resident, so
++// resident memory is O(buckets + offsets) rather than O(albums). Serving a browse page does one
++// async read of just that page's contiguous byte range.
++//
++// FILE FORMAT (one immutable file per build, text â€” NOT the binary format reserved for Slice 3):
++//
++//   <record0>\n <record1>\n ... <recordN-1>\n   each record is one AlbumSummary as JSON
++//   <trailer>                                   one JSON object (see SnapshotTrailer), UTF-8
++//   <footer>                                    8 bytes: uint32LE trailerByteLen, uint32LE magic
++//
++// The 8-byte footer is structural metadata to locate the text trailer; the records themselves are
++// JSON text. A trailer holds { v, key, at, total, buckets, offsets } where offsets is the (total+1)
++// per-record byte offsets. The footer lets a reader find the trailer in two small positional reads
++// (stat + read-last-8 + read-trailer) without scanning the (potentially multi-GB) records.
++//
++// DRIFT IS IMPOSSIBLE: each build writes a NEW, uniquely-named, never-overwritten file. The
++// `AlbumIndex` an in-flight browse holds references its own immutable file path + the offsets that
++// were built from that exact file, so an offset always resolves against the bytes it describes. A
++// rebuild produces a new file and a new `AlbumIndex`; the old one keeps reading its old file (which
++// is only deleted best-effort once it is no longer the newest, see cleanupNewestSnapshots).
++
++// Version + magic. The version mirrors the SwrCache key bump (albumIndex:v3:) so a persisted v2
++// snapshot (which held items inline as JSON) is never misread as this format.
++export const ALBUM_SNAPSHOT_VERSION = 3;
++const SNAPSHOT_MAGIC = 0xb0b0_a17e;
++const FILE_PREFIX = "albumSnapshot.v3.";
++
++type SnapshotTrailer = {
++  v: number;
++  key: string;
++  at: number;
++  total: number;
++  buckets: AlbumIndexBucket[];
++  offsets: number[]; // length total+1
++};
++
++const keyHash = (key: string): string =>
++  createHash("sha1").update(key).digest("hex");
++
++// Validate a parsed trailer against the actual file it came from. Returns the trailer typed, or
++// null if anything is inconsistent â€” a truncated/garbled/partial file is REFUSED rather than served.
++// This is the guard against "a half-written snapshot read as complete": a file truncated mid-build
++// either loses its footer (magic mismatch), its trailer (JSON parse / structural failure), or the
++// recorded record-region size (offsets[total]) no longer matches where the trailer actually starts.
++function validateTrailer(
++  t: unknown,
++  fileSize: number,
++  trailerByteLen: number
++): SnapshotTrailer | null {
++  if (!t || typeof t !== "object") return null;
++  const o = t as Record<string, unknown>;
++  if (o.v !== ALBUM_SNAPSHOT_VERSION) return null;
++  if (typeof o.key !== "string" || o.key.length === 0) return null;
++  if (typeof o.at !== "number" || !Number.isFinite(o.at) || o.at <= 0) return null;
++  if (typeof o.total !== "number" || !Number.isInteger(o.total) || o.total < 0) return null;
++  if (!Array.isArray(o.buckets) || !Array.isArray(o.offsets)) return null;
++  const buckets = o.buckets as AlbumIndexBucket[];
++  const offsets = o.offsets as number[];
++  if (offsets.length !== o.total + 1) return null;
++  // Buckets must be a contiguous, in-order partition of [0, total): each run starts where the
++  // previous ended, and together they cover exactly the snapshot.
++  let expected = 0;
++  for (const b of buckets) {
++    if (!b || typeof b.key !== "string" || typeof b.label !== "string") return null;
++    if (typeof b.offset !== "number" || typeof b.count !== "number") return null;
++    if (!Number.isInteger(b.offset) || !Number.isInteger(b.count) || b.count < 0) return null;
++    if (b.offset !== expected) return null;
++    expected += b.count;
++  }
++  if (expected !== o.total) return null;
++  // offsets[0] is byte 0; every offset must be a non-negative integer that fits uint32 (the resident
++  // index is a Uint32Array, so a record past 4 GiB cannot be addressed and must be refused at build).
++  if (offsets[0] !== 0) return null;
++  for (const off of offsets) {
++    if (typeof off !== "number" || !Number.isInteger(off) || off < 0 || off > 0xffffffff) return null;
++  }
++  // The recorded end of the record region must land exactly where the trailer begins in THIS file.
++  // A truncated/extended/edited records region breaks this equality.
++  const trailerStart = fileSize - 8 - trailerByteLen;
++  if (offsets[o.total] !== trailerStart) return null;
++  return { v: o.v, key: o.key, at: o.at, total: o.total, buckets, offsets };
++}
++
++// Read + validate the trailer of a snapshot file synchronously (used only at startup load, never on
++// the browse path). Returns null for any missing/truncated/corrupt file.
++function readTrailerSync(file: string): SnapshotTrailer | null {
++  let fd: number | undefined;
++  try {
++    const size = fs.statSync(file).size;
++    if (size < 8) return null;
++    fd = fs.openSync(file, "r");
++    const footer = Buffer.alloc(8);
++    // Footer is the last 8 bytes.
++    if (fs.readSync(fd, footer, 0, 8, size - 8) !== 8) return null;
++    const trailerByteLen = footer.readUInt32LE(0);
++    const magic = footer.readUInt32LE(4);
++    if (magic !== SNAPSHOT_MAGIC) return null;
++    if (trailerByteLen <= 0 || size < 8 + trailerByteLen) return null;
++    const trailerBuf = Buffer.alloc(trailerByteLen);
++    if (fs.readSync(fd, trailerBuf, 0, trailerByteLen, size - 8 - trailerByteLen) !== trailerByteLen)
++      return null;
++    let parsed: unknown;
++    try {
++      parsed = JSON.parse(trailerBuf.toString("utf8"));
++    } catch {
++      return null;
++    }
++    return validateTrailer(parsed, size, trailerByteLen);
++  } catch {
++    return null;
++  } finally {
++    if (fd !== undefined) {
++      try {
++        fs.closeSync(fd);
++      } catch {
++        /* best-effort */
++      }
++    }
++  }
++}
++
++// Rebuild the resident AlbumIndex (buckets + Uint32Array offsets; items empty) from a validated
++// trailer, pointing at the given immutable file path.
++function indexFromTrailer(
++  trailer: SnapshotTrailer,
++  file: string
++): AlbumIndex<any> {
++  return {
++    total: trailer.total,
++    buckets: trailer.buckets,
++    items: [],
++    snapshotFile: file,
++    offsets: Uint32Array.from(trailer.offsets),
++  };
++}
++
++// A streaming, buffered writer that appends one record per album to a temp file, tracks the byte
++// offset of each, then finalizes the trailer + footer and atomically renames into place. Records
++// are flushed in ~64 KiB batches so a multi-million-album build does not issue one syscall per
++// record, and nothing holds the whole snapshot in memory.
++export class AlbumSnapshotWriter {
++  private fh?: fs.promises.FileHandle;
++  private readonly tmp: string;
++  private readonly dest: string;
++  private readonly offsets: number[] = [];
++  private flushedBytes = 0;
++  private batch: Buffer[] = [];
++  private batchBytes = 0;
++  private readonly flushThreshold = 64 * 1024;
++
++  constructor(private readonly dir: string, private readonly key: string) {
++    const gen = randomBytes(6).toString("hex");
++    const base = `${FILE_PREFIX}${keyHash(key)}.${gen}`;
++    this.tmp = path.join(dir, `${base}.tmp`);
++    this.dest = path.join(dir, `${base}.dat`);
++  }
++
++  async open(): Promise<void> {
++    try {
++      fs.mkdirSync(this.dir, { recursive: true });
++    } catch {
++      /* best-effort; the write below will surface a real error */
++    }
++    this.fh = await fs.promises.open(this.tmp, "w");
++  }
++
++  async write(record: unknown): Promise<void> {
++    // Record the start offset of THIS record before it enters the batch.
++    this.offsets.push(this.flushedBytes + this.batchBytes);
++    const buf = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
++    if (buf.length > 0xffffffff - this.flushedBytes - this.batchBytes) {
++      // A record past the 4 GiB uint32 address space can never be located by the resident index.
++      throw new Error(
++        "Album snapshot exceeds the 4 GiB addressable limit; refusing to write an un-locatable record"
++      );
++    }
++    this.batch.push(buf);
++    this.batchBytes += buf.length;
++    if (this.batchBytes >= this.flushThreshold) await this.flush();
++  }
++
++  private async flush(): Promise<void> {
++    if (this.batch.length === 0) return;
++    const fh = this.fh;
++    if (!fh) throw new Error("AlbumSnapshotWriter used before open");
++    for (const b of this.batch) await fh.write(b);
++    this.flushedBytes += this.batchBytes;
++    this.batch = [];
++    this.batchBytes = 0;
++  }
++
++  // Append trailer + footer, close, atomically rename tmp -> dest, prune older snapshots for this
++  // key. Returns the absolute file path + the resident Uint32Array offset index.
++  async finalize(
++    buckets: AlbumIndexBucket[]
++  ): Promise<{ snapshotFile: string; offsets: Uint32Array }> {
++    const fh = this.fh;
++    if (!fh) throw new Error("AlbumSnapshotWriter used before open");
++    await this.flush();
++    this.offsets.push(this.flushedBytes); // offsets[total] = end of records
++    const total = this.offsets.length - 1;
++    const trailer: SnapshotTrailer = {
++      v: ALBUM_SNAPSHOT_VERSION,
++      key: this.key,
++      at: Date.now(),
++      total,
++      buckets,
++      offsets: this.offsets,
++    };
++    const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
++    const footer = Buffer.alloc(8);
++    footer.writeUInt32LE(trailerBuf.length, 0);
++    footer.writeUInt32LE(SNAPSHOT_MAGIC, 4);
++    await fh.write(trailerBuf);
++    await fh.write(footer);
++    await fh.close();
++    this.fh = undefined;
++    // Atomic swap. `dest` is a brand-new, uniquely-named file, so this rename never replaces an
++    // existing file (no Windows rename-over-existing subtlety). An in-flight browse reading an older
++    // snapshot keeps reading it: its path is immutable, and cleanup keeps the previous snapshot.
++    await fs.promises.rename(this.tmp, this.dest);
++    // Prune older snapshots for this key before returning so a rebuild leaves a bounded file count
++    // (cleanup never throws â€” each step is best-effort â€” so this does not risk the finalized build).
++    await cleanupSnapshots(this.dir, this.key, this.dest);
++    return { snapshotFile: this.dest, offsets: Uint32Array.from(this.offsets) };
++  }
++
++  // Drop the temp file on a failed/aborted build so a half-written snapshot is never left behind.
++  async abort(): Promise<void> {
++    try {
++      if (this.fh) await this.fh.close();
++    } catch {
++      /* best-effort */
++    }
++    this.fh = undefined;
++    try {
++      await fs.promises.rm(this.tmp, { force: true });
++    } catch {
++      /* best-effort */
++    }
++  }
++}
++
++// Best-effort cleanup of older snapshot files for a key. Keeps the newest two (the just-written one
++// plus the immediately previous) so an in-flight browse that still holds the previous AlbumIndex
++// keeps a readable file, then deletes the rest. On Windows a delete of an open file fails (caught);
++// on Linux an unlink of an open file leaves the fd readable. Either way no wrong data is served.
++async function cleanupSnapshots(
++  dir: string,
++  key: string,
++  keep: string
++): Promise<void> {
++  let names: string[];
++  try {
++    names = fs.readdirSync(dir);
++  } catch {
++    return;
++  }
++  const prefix = `${FILE_PREFIX}${keyHash(key)}.`;
++  const files = names
++    .filter((n) => n.startsWith(prefix) && n.endsWith(".dat"))
++    .map((n) => {
++      const full = path.join(dir, n);
++      try {
++        return { full, mtime: fs.statSync(full).mtimeMs };
++      } catch {
++        return undefined;
++      }
++    })
++    .filter((x): x is { full: string; mtime: number } => !!x)
++    .sort((a, b) => b.mtime - a.mtime);
++  // Always keep the just-written file plus one previous; remove older snapshots and any stale .tmp.
++  const keepers = new Set([keep, ...files.slice(1, 2).map((f) => f.full)]);
++  for (const { full } of files) {
++    if (keepers.has(full)) continue;
++    try {
++      await fs.promises.rm(full, { force: true });
++    } catch {
++      /* best-effort */
++    }
++  }
++  for (const n of names.filter((n) => n.startsWith(prefix) && n.endsWith(".tmp"))) {
++    try {
++      await fs.promises.rm(path.join(dir, n), { force: true });
++    } catch {
++      /* best-effort */
++    }
++  }
++}
++
++// Async read of an exact byte range [start, end). One open/read/close per call â€” no persistent fd
++// to leak or to race an atomic swap. A short read (file shrank after load) throws rather than serve
++// partial data.
++async function readByteRange(file: string, start: number, end: number): Promise<Buffer> {
++  const len = end - start;
++  if (len <= 0) return Buffer.alloc(0);
++  const fh = await fs.promises.open(file, "r");
++  try {
++    const buf = Buffer.alloc(len);
++    const { bytesRead } = await fh.read(buf, 0, len, start);
++    if (bytesRead !== len) {
++      throw new Error(
++        `Album snapshot short read: wanted ${len} bytes at ${start}, got ${bytesRead} (${file})`
++      );
++    }
++    return buf;
++  } finally {
++    await fh.close();
++  }
++}
++
++// Decode a buffer of newline-delimited JSON records (the contents of one contiguous byte range).
++function decodeJsonlRecords(buf: Buffer): any[] {
++  const text = buf.toString("utf8");
++  if (text.length === 0) return [];
++  const lines = text.split("\n");
++  const out: any[] = [];
++  for (const line of lines) {
++    if (line.length === 0) continue; // trailing newline yields a final empty element
++    out.push(JSON.parse(line));
++  }
++  return out;
++}
++
++// Serve one page of a letter directly from the on-disk snapshot. Mirrors the pure albumIndexPage
++// walk over the letter's contiguous runs, but reads each run-slice's byte range from disk instead of
++// slicing a resident array. Drift-proof â€” the offsets and the file are from the same immutable
++// build. In-memory (small/test) indexes defer to the synchronous albumIndexPage.
++export async function readAlbumIndexPage<T>(
++  index: AlbumIndex<T>,
++  key: string,
++  pageIndex: number,
++  pageCount: number
++): Promise<{ items: T[]; total: number }> {
++  if (!index.snapshotFile || !index.offsets) {
++    return albumIndexPage(index, key, pageIndex, pageCount);
++  }
++  const offsets = index.offsets;
++  const ranges = albumIndexRangesFor(index, key);
++  const total = ranges.reduce((sum, r) => sum + r.count, 0);
++  const items: T[] = [];
++  let skip = pageIndex;
++  let take = pageCount;
++  for (const r of ranges) {
++    if (take <= 0) break;
++    if (skip >= r.count) {
++      skip -= r.count;
++      continue;
++    }
++    const from = r.offset + skip;
++    const n = Math.min(r.count - skip, take);
++    const buf = await readByteRange(index.snapshotFile, offsets[from]!, offsets[from + n]!);
++    const recs = decodeJsonlRecords(buf);
++    if (recs.length !== n) {
++      throw new Error(
++        `Album snapshot page decode mismatch: expected ${n} records, got ${recs.length}`
++      );
++    }
++    for (const rec of recs) items.push(rec as T);
++    take -= n;
++    skip = 0;
++  }
++  return { items, total };
++}
++
++// Slice the on-disk snapshot in scan order, for the flat (small/shrunk-library) browse. Drift-proof;
++// in-memory indexes defer to the synchronous albumIndexAll.
++export async function readAlbumIndexAll<T>(
++  index: AlbumIndex<T>,
++  pageIndex: number,
++  pageCount: number
++): Promise<T[]> {
++  if (!index.snapshotFile || !index.offsets) {
++    return albumIndexAll(index, pageIndex, pageCount);
++  }
++  const offsets = index.offsets;
++  const total = index.total;
++  const start = Math.min(Math.max(0, pageIndex), total);
++  const end = Math.min(total, pageIndex + pageCount);
++  if (end <= start) return [];
++  const buf = await readByteRange(index.snapshotFile, offsets[start]!, offsets[end]!);
++  const recs = decodeJsonlRecords(buf);
++  if (recs.length !== end - start) {
++    throw new Error(
++      `Album snapshot flat decode mismatch: expected ${end - start} records, got ${recs.length}`
++    );
++  }
++  return recs as T[];
++}
++
++// A SwrCacheStore that persists each built index as one self-describing snapshot file. The BUILD
++// writes the snapshot (it is the only place that streams the records), so save() is a no-op;
++// persistence is the file itself. load() scans the directory at startup, validates each file's
++// trailer, and reconstructs the newest valid index per cache key.
++export function albumIndexStore(dir: string): SwrCacheStore {
++  try {
++    fs.mkdirSync(dir, { recursive: true });
++  } catch (e) {
++    logger.warn(`Album snapshot store: could not create ${dir}: ${e}`);
++  }
++
++  return {
++    // The build has already written the snapshot file atomically; nothing more to persist.
++    save() {
++      /* no-op */
++    },
++
++    load() {
++      let names: string[];
++      try {
++        names = fs.readdirSync(dir);
++      } catch {
++        return [];
++      }
++      // Drop stale .tmp files left by a build that crashed before its atomic rename. Safe at startup
++      // (no build is running yet); a .dat only ever appears via rename from a .tmp.
++      for (const n of names.filter((n) => n.startsWith(FILE_PREFIX) && n.endsWith(".tmp"))) {
++        try {
++          fs.rmSync(path.join(dir, n), { force: true });
++        } catch {
++          /* best-effort */
++        }
++      }
++      // Newest valid trailer per cache key wins; corrupt/truncated files are skipped (â†’ cold rebuild).
++      const newestByKey = new Map<string, { at: number; value: unknown }>();
++      for (const n of names) {
++        if (!n.startsWith(FILE_PREFIX) || !n.endsWith(".dat")) continue;
++        const full = path.join(dir, n);
++        const trailer = readTrailerSync(full);
++        if (!trailer) continue;
++        const existing = newestByKey.get(trailer.key);
++        if (!existing || trailer.at > existing.at) {
++          newestByKey.set(trailer.key, {
++            at: trailer.at,
++            value: indexFromTrailer(trailer, full),
++          });
++        }
++      }
++      return [...newestByKey.entries()].map(([key, { at, value }]) => ({ key, at, value }));
++    },
++  };
++}
+diff --git a/src/app.ts b/src/app.ts
+index 49f816d..e3c8acc 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -22,6 +22,7 @@ import { SystemClock } from "./clock";
+ import { JWTSmapiLoginTokens } from "./smapi_auth";
+ import { SwrCache } from "./swr_cache";
+ import { fileStore } from "./swr_cache_file_store";
++import { albumIndexStore } from "./album_snapshot";
+ import { deezerArtistImageUrl } from "./deezer";
+ import ms from "ms";
+ 
+@@ -78,16 +79,29 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
+ // The album index is a heavy full-catalog scan (~N/500 requests) that changes only on a library
+ // scan, so cache it far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on
+ // every stale browse. Persisted in its own subdir so it survives restarts.
++//
++// Slice 1: the index snapshot is disk-backed (records streamed to an immutable per-build file,
++// only buckets + a Uint32Array of byte offsets resident), so it is persisted by albumIndexStore
++// (one self-describing snapshot file per build), NOT by the generic fileStore. The same directory
++// is passed to Subsonic so the scan writes its snapshot where the store will look for it.
++const indexCacheDir = config.subsonic.cacheDir
++  ? path.join(config.subsonic.cacheDir, "index")
++  : undefined;
+ const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
+-  store: config.subsonic.cacheDir
+-    ? // the index holds a full album snapshot (tens of MB on a large library), so raise the
+-      // per-file cap well above the browse cache's default but keep only a small number of snapshots.
+-      fileStore(path.join(config.subsonic.cacheDir, "index"), {
+-        maxFiles: ALBUM_INDEX_CACHE_MAX_ENTRIES,
+-        maxFileBytes: 256 * 1024 * 1024,
+-      })
+-    : undefined,
+-  revive: deepFreeze,
++  store: indexCacheDir ? albumIndexStore(indexCacheDir) : undefined,
++  // A restored index has a Uint32Array of byte offsets; deepFreeze must NOT recurse into it
++  // (Object.values on a typed array allocates a million-entry array). Freeze just the index and
++  // its bucket rows â€” enough to match the "persisted = immutable" contract without that cost.
++  revive: (v) => {
++    if (v && typeof v === "object") {
++      Object.freeze(v);
++      const buckets = (v as { buckets?: unknown }).buckets;
++      if (Array.isArray(buckets)) {
++        for (const b of buckets) if (b && typeof b === "object") Object.freeze(b);
++      }
++    }
++    return v;
++  },
+   maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
+   // The full-catalog scan legitimately takes several minutes on a large library; the default
+   // 60s backstop would abort it before it ever completes. Give it a generous ceiling.
+@@ -101,7 +115,10 @@ const subsonic = new SubsonicMusicService(
+     artistImageFetcher,
+     browseCache,
+     indexCache,
+-    config.subsonic.deezerArtistArt
++    config.subsonic.deezerArtistArt,
++    {}, // coverArtCoordinatorOptions (default)
++    undefined, // maxIndexScanAlbums (default)
++    indexCacheDir // Slice 1: disk-backed album snapshot directory
+   ),
+   customPlayers,
+   config.subsonic.transcode
+diff --git a/src/smapi.ts b/src/smapi.ts
+index 1f51fbc..77b4ea1 100644
+--- a/src/smapi.ts
++++ b/src/smapi.ts
+@@ -33,11 +33,10 @@ import _ from "underscore";
+ import { BUrn, formatForURL } from "./burn";
+ import {
+   albumIndexLetters,
+-  albumIndexPage,
+   albumIndexLetterTotal,
+-  albumIndexAll,
+   MAX_ALBUMS_FLAT,
+ } from "./album_index";
++import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
+ import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
+ import {
+   isExpiredTokenError,
+@@ -1082,15 +1081,17 @@ function bindSmapiSoapServiceToExpress(
+                     // catalogs) -> serve the bucketed A-Z menu. No count fetch, never blocks.
+                     const peekedAlbums = musicLibrary.peekAlbumIndex();
+                     if (peekedAlbums) {
+-                      return peekedAlbums.then((idx) => {
++                      return peekedAlbums.then(async (idx) => {
+                         // A catalog that shrank back under the cap can still serve flat from the
+                         // snapshot; otherwise the A-Z letter menu.
+                         if (idx.total <= MAX_ALBUMS_FLAT) {
+                           return getMetadataResult({
+-                            mediaCollection: albumIndexAll(
+-                              idx,
+-                              paging._index,
+-                              paging._count
++                            mediaCollection: (
++                              await readAlbumIndexAll(
++                                idx,
++                                paging._index,
++                                paging._count
++                              )
+                             ).map((it) => album(urlWithToken(apiKey), it)),
+                             index: paging._index,
+                             total: idx.total,
+@@ -1162,7 +1163,7 @@ function bindSmapiSoapServiceToExpress(
+                         total: 1,
+                       });
+                     }
+-                    return peekedLetter.then((idx) => {
++                    return peekedLetter.then(async (idx) => {
+                       const letterTotal = albumIndexLetterTotal(idx, typeId);
+                       if (letterTotal > MAX_ALBUMS_FLAT) {
+                         // A single letter is itself too big for one S2 container; split it into
+@@ -1187,7 +1188,7 @@ function bindSmapiSoapServiceToExpress(
+                       }
+                       // Serve the letter's page straight from the index snapshot (drift-proof: no
+                       // live re-fetch by offset). Advertise only this letter's total.
+-                      const page = albumIndexPage(
++                      const page = await readAlbumIndexPage(
+                         idx,
+                         typeId,
+                         paging._index,
+@@ -1234,7 +1235,7 @@ function bindSmapiSoapServiceToExpress(
+                         total: 1,
+                       });
+                     }
+-                    return peekedChunk.then((idx) => {
++                    return peekedChunk.then(async (idx) => {
+                       const base = chunk * MAX_ALBUMS_FLAT;
+                       const letterTotal = albumIndexLetterTotal(idx, chunkKey);
+                       const chunkTotal = Math.max(
+@@ -1245,7 +1246,7 @@ function bindSmapiSoapServiceToExpress(
+                         paging._count,
+                         Math.max(0, chunkTotal - paging._index)
+                       );
+-                      const page = albumIndexPage(
++                      const page = await readAlbumIndexPage(
+                         idx,
+                         chunkKey,
+                         base + paging._index,
+diff --git a/src/subsonic.ts b/src/subsonic.ts
+index 7107392..b80aa3c 100644
+--- a/src/subsonic.ts
++++ b/src/subsonic.ts
+@@ -34,7 +34,8 @@ import axios, { AxiosRequestConfig } from "axios";
+ import { b64Encode, b64Decode } from "./b64";
+ import { BUrn } from "./burn";
+ import { SwrCache } from "./swr_cache";
+-import { AlbumIndex, buildAlbumIndexFromPages } from "./album_index";
++import { AlbumIndex, BucketBuilder } from "./album_index";
++import { AlbumSnapshotWriter } from "./album_snapshot";
+ import { album, artist } from "./smapi";
+ import { URLBuilder } from "./url_builder";
+ 
+@@ -1479,6 +1480,12 @@ export class Subsonic {
+ 
+   private readonly maxIndexScanAlbums: number;
+ 
++  // Directory for the disk-backed album snapshot (Slice 1). When set, buildAlbumIndex streams each
++  // scanned record to an immutable snapshot file and keeps only buckets + a Uint32Array of byte
++  // offsets resident (O(buckets + offsets), not O(albums)). Undefined â†’ in-memory build (no cache
++  // volume configured: nothing is persisted and the resident snapshot is acceptable).
++  private readonly albumSnapshotDir: string | undefined;
++
+   constructor(
+     url: URLBuilder,
+     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
+@@ -1496,9 +1503,14 @@ export class Subsonic {
+     // Upper bound on the one-time album index scan. Injectable so the truncation guard can be
+     // tested without mocking millions of albums, and env-overridable so a very large catalog can
+     // be raised without a rebuild.
+-    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS
++    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS,
++    // Directory on the cache volume for the disk-backed album snapshot (Slice 1). Injected from
++    // app.ts so it shares the index cache volume with the persisted store. Defaults to undefined
++    // (in-memory build) so existing test/non-cache callers are unchanged.
++    albumSnapshotDir: string | undefined = undefined
+   ) {
+     this.maxIndexScanAlbums = maxIndexScanAlbums;
++    this.albumSnapshotDir = albumSnapshotDir;
+     this.url = url;
+     this.customPlayers = customPlayers;
+     this.externalImageFetcher = externalImageFetcher;
+@@ -1719,44 +1731,82 @@ export class Subsonic {
+   // Build the alphabetical album index by scanning the whole catalog once (500/page). Heavy
+   // (~N/500 requests), so it is only ever run behind the cache (getAlbumIndex) as a background
+   // job - never inline on a live browse. A safety cap stops a runaway scan.
++  //
++  // Slice 1: when a snapshot directory is configured the scan STREAMS each record to an immutable
++  // on-disk snapshot file (one append per album, buffered) and keeps only the bucket table + a
++  // Uint32Array of per-record byte offsets resident â€” so a multi-million-album catalog no longer
++  // holds its whole ~474 B/album snapshot in memory. Without a directory it falls back to the old
++  // resident build (nowhere to persist, and that path is only used by tests/cache-disabled setups).
++  // The truncation + duplicate-id guards apply to both paths.
+   private buildAlbumIndex = async (
+     credentials: Credentials
+   ): Promise<AlbumIndex<AlbumSummary>> => {
+-    const pages: AlbumSummary[][] = [];
++    const cacheKey = `albumIndex:v3:${credentials.username}`;
+     const seen = new Set<string>();
++    const builder = new BucketBuilder<AlbumSummary>();
++    const writer = this.albumSnapshotDir
++      ? new AlbumSnapshotWriter(this.albumSnapshotDir, cacheKey)
++      : undefined;
++    // `items` is only collected for the resident (no-directory) build; the disk build leaves it
++    // empty and serves pages from the snapshot file via readAlbumIndexPage/readAlbumIndexAll.
++    const items: AlbumSummary[] | undefined = writer ? undefined : [];
++    if (writer) await writer.open();
++    // One async write per album is fine: the writer buffers ~64 KiB internally, and the scan is
++    // dominated by its (~N/500) HTTP round trips, not local I/O.
++    const ingest = async (album: AlbumSummary): Promise<void> => {
++      builder.append(album);
++      if (writer) await writer.write(album);
++      else items!.push(album);
++    };
+     let complete = false;
+-    for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
+-      const page = await this.scanAlbums(credentials, offset);
+-      if (page.length === 0) {
+-        complete = true;
+-        break;
+-      }
+-      for (const album of page) {
+-        if (seen.has(album.id)) {
+-          throw new Error(
+-            `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
+-          );
++    try {
++      for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
++        const page = await this.scanAlbums(credentials, offset);
++        if (page.length === 0) {
++          complete = true;
++          break;
++        }
++        for (const album of page) {
++          if (seen.has(album.id)) {
++            throw new Error(
++              `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
++            );
++          }
++          seen.add(album.id);
++          await ingest(album);
++        }
++        if (page.length < ALBUM_SCAN_PAGE_SIZE) {
++          complete = true;
++          break;
+         }
+-        seen.add(album.id);
+       }
+-      pages.push(page);
+-      if (page.length < ALBUM_SCAN_PAGE_SIZE) {
+-        complete = true;
+-        break;
++      // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
++      // partial result was returned, cached and persisted as if it were the whole catalog: every
++      // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
++      // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
++      // leaves the previous good index in place and says why, which is what the duplicate-id guard
++      // above already does for the other way a scan can be untrustworthy. The writer is aborted
++      // (below) so a half-written snapshot file is never left behind to be read as complete.
++      if (!complete) {
++        throw new Error(
++          `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
++        );
+       }
++      if (writer) {
++        const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
++        return {
++          total: builder.total,
++          buckets: builder.buckets,
++          items: [],
++          snapshotFile,
++          offsets,
++        };
++      }
++      return { total: builder.total, buckets: builder.buckets, items: items! };
++    } catch (e) {
++      if (writer) await writer.abort();
++      throw e;
+     }
+-    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+-    // partial result was returned, cached and persisted as if it were the whole catalog: every
+-    // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
+-    // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
+-    // leaves the previous good index in place and says why, which is what the duplicate-id guard
+-    // below already does for the other way a scan can be untrustworthy.
+-    if (!complete) {
+-      throw new Error(
+-        `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
+-      );
+-    }
+-    return buildAlbumIndexFromPages(pages);
+   };
+ 
+   // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
+@@ -1764,7 +1814,7 @@ export class Subsonic {
+   getAlbumIndex = (
+     credentials: Credentials
+   ): Promise<AlbumIndex<AlbumSummary>> =>
+-    this.indexCache.get(`albumIndex:v2:${credentials.username}`, () =>
++    this.indexCache.get(`albumIndex:v3:${credentials.username}`, () =>
+       this.buildAlbumIndex(credentials)
+     );
+ 
+@@ -1775,12 +1825,12 @@ export class Subsonic {
+     credentials: Credentials
+   ): Promise<AlbumIndex<AlbumSummary>> | undefined =>
+     this.indexCache.peek<AlbumIndex<AlbumSummary>>(
+-      `albumIndex:v2:${credentials.username}`
++      `albumIndex:v3:${credentials.username}`
+     );
+ 
+   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
+   warmAlbumIndex = (credentials: Credentials): void =>
+-    this.indexCache.warm(`albumIndex:v2:${credentials.username}`, () =>
++    this.indexCache.warm(`albumIndex:v3:${credentials.username}`, () =>
+       this.buildAlbumIndex(credentials)
+     );
+ 
+diff --git a/tests/album_snapshot.test.ts b/tests/album_snapshot.test.ts
+new file mode 100644
+index 0000000..ba16ce9
+--- /dev/null
++++ b/tests/album_snapshot.test.ts
+@@ -0,0 +1,324 @@
++import fs from "fs";
++import os from "os";
++import path from "path";
++
++import { AlbumSummary } from "../src/music_library";
++import {
++  BucketBuilder,
++  buildAlbumIndexFromPages,
++  albumIndexPage,
++  albumIndexAll,
++} from "../src/album_index";
++import {
++  AlbumSnapshotWriter,
++  albumIndexStore,
++  readAlbumIndexPage,
++  readAlbumIndexAll,
++} from "../src/album_snapshot";
++
++// Build a disk-backed index the same way Subsonic.buildAlbumIndex does: stream records to the
++// snapshot file while bucketing, then finalize. Returns the disk-backed AlbumIndex (items empty,
++// offsets + snapshotFile set).
++async function buildDiskIndex(
++  dir: string,
++  key: string,
++  records: AlbumSummary[]
++) {
++  const builder = new BucketBuilder<AlbumSummary>();
++  const writer = new AlbumSnapshotWriter(dir, key);
++  await writer.open();
++  for (const album of records) {
++    builder.append(album);
++    await writer.write(album);
++  }
++  const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
++  return {
++    total: builder.total,
++    buckets: builder.buckets,
++    items: [] as AlbumSummary[],
++    snapshotFile,
++    offsets,
++  };
++}
++
++// Full AlbumSummary records (year + genre included) so a round-trip assertion actually exercises
++// field preservation â€” a fixture with only {id,name} cannot detect a field being dropped.
++const names = (...ns: string[]) =>
++  ns.map(
++    (name, i) =>
++      ({
++        id: `${name}-${i}`,
++        name,
++        year: `${1970 + (i % 50)}`,
++        genre: { name: "Rock", id: "rock" },
++        coverArt: { system: "subsonic", resource: `art:${name}-${i}` } as any,
++        artistId: "artist-0",
++        artistName: "Artist 0",
++      } as AlbumSummary)
++  );
++
++// A deterministic catalog of AlbumSummary records (full record, incl. year/genre â€” never dropped).
++const catalog = (size: number, tag: string): AlbumSummary[] =>
++  Array.from({ length: size }, (_, i) => ({
++    id: `${tag}-${i}`,
++    name: `Album ${tag} ${i}`,
++    year: `${1970 + (i % 50)}`,
++    genre: { name: "Rock", id: "rock" },
++    coverArt: { system: "subsonic", resource: `art:${tag}-${i}` } as any,
++    artistId: `artist-${tag}`,
++    artistName: `Artist ${tag}`,
++  }));
++
++describe("album_snapshot: disk page matches the in-memory index", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
++  });
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++  });
++
++  it("serves the same items/total as the resident index for every letter and page", async () => {
++    // Scattered runs (a stray "A" after "B") so pages span multiple ranges too.
++    const records = names(
++      "Apple",
++      "Avocado",
++      "Banana",
++      "Apex",
++      "Cherry",
++      "Cantaloupe",
++      "Date"
++    );
++    const mem = buildAlbumIndexFromPages([records]);
++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++
++    // Sanity: the shared BucketBuilder keeps bucketing identical.
++    expect(disk.buckets).toEqual(mem.buckets);
++    expect(disk.total).toBe(mem.total);
++    // Disk-backed: items empty, offsets resident as a Uint32Array.
++    expect(disk.items).toEqual([]);
++    expect(disk.offsets).toBeInstanceOf(Uint32Array);
++    expect(disk.offsets!.length).toBe(records.length + 1);
++    expect(disk.offsets![0]).toBe(0);
++
++    for (const key of ["A", "B", "C", "D", "Z"]) {
++      for (let page = 0; page < 5; page++) {
++        const fromMem = albumIndexPage(mem, key, page, 2);
++        const fromDisk = await readAlbumIndexPage(disk, key, page, 2);
++        expect(fromDisk.total).toBe(fromMem.total);
++        expect(fromDisk.items.map((a) => a.id)).toEqual(
++          fromMem.items.map((a) => (a as { id: string }).id)
++        );
++        // The full AlbumSummary round-trips (year + genre survive â€” never dropped).
++        for (const a of fromDisk.items) {
++          expect(typeof a.year).toBe("string");
++          expect(a.genre).toEqual({ name: "Rock", id: "rock" });
++        }
++      }
++    }
++  });
++
++  it("readAlbumIndexAll slices the same scan-order range as the resident index", async () => {
++    const records = catalog(25, "x");
++    const mem = buildAlbumIndexFromPages([records]);
++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    expect(await readAlbumIndexAll(disk, 5, 10)).toEqual(albumIndexAll(mem, 5, 10));
++    expect((await readAlbumIndexAll(disk, 0, 100)).length).toBe(25);
++    expect(await readAlbumIndexAll(disk, 30, 10)).toEqual([]); // past the end
++  });
++
++  it("readAlbumIndexPage falls back to the synchronous slice for an in-memory index", async () => {
++    const mem = buildAlbumIndexFromPages([names("Apple", "Avocado", "Banana")]);
++    const page = await readAlbumIndexPage(mem, "A", 0, 10);
++    expect(page.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
++    expect(page.total).toBe(2);
++  });
++});
++
++describe("album_snapshot: letter bucketing is unchanged on the disk path", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
++  });
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++  });
++
++  it("produces the same contiguous runs the pure reducer does", async () => {
++    const records = names(
++      "Apple",
++      "Avocado",
++      "Banana",
++      "Apex",
++      "9 to 5",
++      "Cherry"
++    );
++    const mem = buildAlbumIndexFromPages([records]);
++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    expect(disk.buckets).toEqual([
++      { key: "A", label: "A", offset: 0, count: 2 },
++      { key: "B", label: "B", offset: 2, count: 1 },
++      { key: "A", label: "A", offset: 3, count: 1 },
++      { key: "#", label: "#", offset: 4, count: 1 },
++      { key: "C", label: "C", offset: 5, count: 1 },
++    ]);
++    expect(disk.buckets).toEqual(mem.buckets);
++  });
++});
++
++describe("album_snapshot: a truncated or corrupt snapshot is refused, never served", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
++  });
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++  });
++
++  it("loads a valid snapshot on restart", async () => {
++    const records = catalog(10, "ok");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    const loaded = albumIndexStore(dir).load();
++    expect(loaded.length).toBe(1);
++    expect(loaded[0]!.key).toBe("albumIndex:v3:user");
++    expect(loaded[0]!.value).toMatchObject({ total: 10 });
++    // The restored index serves the same page the freshly-built one does.
++    const disk = loaded[0]!.value as any;
++    const page = await readAlbumIndexPage(disk, "A", 0, 10);
++    expect(page.items.map((a: any) => a.id)).toEqual(
++      (await readAlbumIndexPage(built, "A", 0, 10)).items.map((a) => a.id)
++    );
++    // built file is retained (it is the newest).
++    expect(fs.existsSync(built.snapshotFile)).toBe(true);
++  });
++
++  it("refuses a file truncated mid-records (footer/trailer lost)", async () => {
++    const records = catalog(50, "trunc");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    // Chop off the last 200 bytes (footer + part of trailer / records).
++    const size = fs.statSync(built.snapshotFile).size;
++    fs.truncateSync(built.snapshotFile, size - 200);
++    expect(albumIndexStore(dir).load()).toEqual([]);
++  });
++
++  it("refuses a file whose footer magic is wrong", async () => {
++    const records = catalog(10, "magic");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    const size = fs.statSync(built.snapshotFile).size;
++    const fd = fs.openSync(built.snapshotFile, "r+");
++    // Overwrite the 4 magic bytes at the very end (footer = [len:4][magic:4]).
++    fs.writeSync(fd, Buffer.from([0xff, 0xff, 0xff, 0xff]), 0, 4, size - 4);
++    fs.closeSync(fd);
++    expect(albumIndexStore(dir).load()).toEqual([]);
++  });
++
++  it("refuses a file extended with trailing garbage (footer no longer at the end)", async () => {
++    const records = catalog(10, "extend");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    // Append garbage after the footer: the last 8 bytes are no longer the magic footer, and the
++    // recorded record-region end (offsets[total]) no longer matches where a trailer would start.
++    fs.appendFileSync(built.snapshotFile, Buffer.from("garbage that extends the file"));
++    expect(albumIndexStore(dir).load()).toEqual([]);
++  });
++
++  it("ignores an unrelated / garbage file in the directory", async () => {
++    fs.writeFileSync(path.join(dir, "albumSnapshot.v3.deadbeef.dat"), "not a snapshot");
++    fs.writeFileSync(path.join(dir, "random.json"), "{}");
++    const records = catalog(5, "good");
++    await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    const loaded = albumIndexStore(dir).load();
++    expect(loaded.length).toBe(1);
++    expect(loaded[0]!.value).toMatchObject({ total: 5 });
++  });
++
++  it("a short read after load (file shrank) throws rather than serving partial data", async () => {
++    const records = catalog(20, "shrink");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    const disk = albumIndexStore(dir).load()[0]!.value as any;
++    // Truncate INTO the records region. Records live at the START of the file ([0, offsets[total]));
++    // the trailer + 8-byte footer are at the END. A tail truncation only eats the trailer/footer and
++    // leaves every record readable, so it would never produce a short read. Cutting below the
++    // records-region end makes the full-page read [0, offsets[total]) come up short.
++    const recordsEnd = disk.offsets[disk.total] as number;
++    fs.truncateSync(built.snapshotFile, recordsEnd - 10);
++    await expect(readAlbumIndexPage(disk, "A", 0, 20)).rejects.toThrow(/short read/);
++  });
++
++  it("a read with the right byte count but misaligned record boundaries is refused", async () => {
++    const records = catalog(20, "misalign");
++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
++    const disk = albumIndexStore(dir).load()[0]!.value as any;
++    // Overwrite the records region IN PLACE (same file size, so the byte-range read returns the
++    // right byte COUNT) with bytes whose newlines no longer line up with the loaded offsets â€” the
++    // decoded records either fail to parse or do not number `n`, and the read is refused rather than
++    // returned as garbage. (Load-time validation only checks structure; this is the read-time guard.)
++    const recordsEnd = disk.offsets[disk.total] as number;
++    const buf = fs.readFileSync(built.snapshotFile);
++    buf.fill(0x41 /* 'A' */, 0, recordsEnd); // no newlines â†’ record boundaries no longer line up
++    fs.writeFileSync(built.snapshotFile, buf);
++    await expect(readAlbumIndexPage(disk, "A", 0, 20)).rejects.toThrow();
++  });
++});
++
++describe("album_snapshot: drift is impossible across a rebuild", () => {
++  let dir: string;
++  beforeEach(() => {
++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
++  });
++  afterEach(() => {
++    fs.rmSync(dir, { recursive: true, force: true });
++  });
++
++  it("an in-flight index keeps reading its own immutable file after a rebuild", async () => {
++    const key = "albumIndex:v3:user";
++    // Build A: a catalog where "A" holds Apple/Avocado.
++    const indexA = await buildDiskIndex(
++      dir,
++      key,
++      names("Apple", "Avocado", "Banana")
++    );
++    const pageA_before = await readAlbumIndexPage(indexA, "A", 0, 10);
++    expect(pageA_before.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
++
++    // Rebuild for the SAME key with a DIFFERENT catalog (a Navidrome rescan reordered everything;
++    // now "A" holds entirely different records).
++    const indexB = await buildDiskIndex(
++      dir,
++      key,
++      names("Apricot", "Aubergine", "Blueberry")
++    );
++
++    // Different immutable files.
++    expect(indexA.snapshotFile).not.toBe(indexB.snapshotFile);
++
++    // The OLD index A still reads its OWN file â€” its offsets never point into B's file, so it
++    // returns A's records, NOT B's. This is exactly the drift (wrong-letter) class the snapshot
++    // exists to prevent.
++    const pageA_after = await readAlbumIndexPage(indexA, "A", 0, 10);
++    expect(pageA_after.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
++    expect(pageA_after.items.map((a) => a.name)).not.toContain("Apricot");
++
++    // The new index reads its own file.
++    const pageB = await readAlbumIndexPage(indexB, "A", 0, 10);
++    expect(pageB.items.map((a) => a.name)).toEqual(["Apricot", "Aubergine"]);
++
++    // A's file is still on disk (cleanup keeps the previous snapshot).
++    expect(fs.existsSync(indexA.snapshotFile!)).toBe(true);
++  });
++
++  it("rebuilds for one key collapse to a single loaded entry and a bounded file count", async () => {
++    const key = "albumIndex:v3:multi";
++    // Four rebuilds for the same key. load() dedups by key (one entry), and cleanup keeps at most
++    // two .dat files per key so disk does not grow unbounded across rebuilds.
++    for (let i = 0; i < 4; i++) {
++      await buildDiskIndex(dir, key, catalog(3 + i, `g${i}`));
++    }
++    const loaded = albumIndexStore(dir).load();
++    expect(loaded.length).toBe(1);
++    expect(loaded[0]!.key).toBe(key);
++    const datFiles = fs
++      .readdirSync(dir)
++      .filter((n) => n.startsWith("albumSnapshot.v3.") && n.endsWith(".dat"));
++    expect(datFiles.length).toBeLessThanOrEqual(2);
++  });
++});
+diff --git a/tests/subsonic.test.ts b/tests/subsonic.test.ts
+index 4697ffb..4d93876 100644
+--- a/tests/subsonic.test.ts
++++ b/tests/subsonic.test.ts
+@@ -1,7 +1,7 @@
+ import { option as O, either as E } from "fp-ts";
+ import { randomUUID as uuid } from "crypto";
+ import { createHash } from "crypto";
+-import { existsSync, readFileSync, writeFileSync, mkdtempSync } from "fs";
++import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
+ import os from "os";
+ import path from "path";
+ 
+@@ -58,6 +58,7 @@ import { SwrCache } from "../src/swr_cache";
+ 
+ import { Album, Artist, Track, AlbumSummary, AlbumQuery, AuthFailure } from "../src/music_library";
+ import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
++import { readAlbumIndexPage } from "../src/album_snapshot";
+ import { BUrn } from "../src/burn";
+ 
+ 
+@@ -1276,6 +1277,64 @@ describe("Subsonic", () => {
+         ]);
+       });
+ 
++      it("streams a disk-backed snapshot when a snapshot dir is configured (Slice 1)", async () => {
++        const snap = mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
++        try {
++          const onDisk = new Subsonic(
++            url,
++            customPlayers,
++            axiosImageFetcher,
++            SwrCache.disabled(),
++            new SwrCache(clock, 60_000),
++            false,
++            {},
++            undefined,
++            snap
++          );
++          const artist = anArtist();
++          const page: [Artist, AlbumSummary][] = [
++            [artist, anAlbumSummary({ name: "369" })],
++            [artist, anAlbumSummary({ name: "Amsterdam" })],
++            [artist, anAlbumSummary({ name: "Anthracite" })],
++            [artist, anAlbumSummary({ name: "The Beatles" })],
++          ];
++          mockGET.mockImplementation((u: string) =>
++            Promise.resolve(
++              ok(
++                u.includes("getAlbumList2")
++                  ? getAlbumListJson(page)
++                  : asArtistsJson(cached)
++              )
++            )
++          );
++          const idx = await onDisk.getAlbumIndex(credentials);
++          // Disk-backed: the snapshot is NOT resident. items is empty; a snapshot file + a Uint32Array
++          // of byte offsets are what is held instead.
++          expect(idx.items).toEqual([]);
++          expect(idx.offsets).toBeInstanceOf(Uint32Array);
++          expect(idx.offsets!.length).toBe(4 + 1);
++          expect(idx.snapshotFile).toBeDefined();
++          expect(existsSync(idx.snapshotFile!)).toBe(true);
++          expect(idx.buckets.map((b) => `${b.key}:${b.offset}:${b.count}`)).toEqual([
++            "#:0:1",
++            "A:1:2",
++            "B:3:1",
++          ]);
++          // The letter page is read from disk and matches the scanned catalog, full record intact
++          // (year + genre survive the round trip â€” Slice 1 does not drop fields).
++          const aPage = await readAlbumIndexPage(idx, "A", 0, 10);
++          expect(aPage.total).toBe(2);
++          expect(aPage.items.map((a) => a.name)).toEqual([
++            "Amsterdam",
++            "Anthracite",
++          ]);
++          expect(typeof aPage.items[0]!.year).toBe("string");
++          expect(aPage.items[0]!.genre).toBeDefined();
++        } finally {
++          rmSync(snap, { recursive: true, force: true });
++        }
++      });
++
+       it("refuses a scan that hits the safety cap rather than caching a TRUNCATED index", async () => {
+         // The cap was a hardcoded 2,000,000 and hitting it just ended the loop, so the partial
+         // result was returned, cached and persisted as though it were the whole catalog: every
+
+--- /dev/null
++++ b/.glm-delegate-diff/bonob-index-slice1.agent-0.diff.patch
++diff --git a/src/album_index.ts b/src/album_index.ts
++index b1b56fe..136bcd3 100644
++--- a/src/album_index.ts
+++++ b/src/album_index.ts
++@@ -22,8 +22,18 @@ export type AlbumIndex<T = { name: string }> = {
++   // Contiguous runs in scan order. A letter may appear in more than one run when a stray title
++   // sorts away from its neighbours; correctness does not depend on runs being one-per-letter.
++   buckets: AlbumIndexBucket[];
++-  // The scanned album snapshot, in scan order. Runs index into this array.
+++  // The scanned album snapshot, in scan order. Runs index into this array. For a disk-backed
+++  // (large-catalog) index this is EMPTY Ã¢â‚¬â€� the records live in `snapshotFile` and a page is read on
+++  // demand via `offsets` (see readAlbumIndexPage/readAlbumIndexAll in album_snapshot.ts), so the
+++  // full snapshot is never resident. Absent for in-memory (small/test) indexes.
++   items: T[];
+++  // Slice 1 disk-backed snapshot. `snapshotFile` is an absolute path to an IMMUTABLE, per-build
+++  // file; `offsets[i]` is the byte offset of record i within it (offsets[total] = end of records).
+++  // A page read opens the file and reads exactly [offsets[s], offsets[e]) for the requested slice.
+++  // Because the file is never rewritten (each rebuild is a new file) offsets always resolve against
+++  // the same bytes they were built from Ã¢â‚¬â€� drift is impossible across a rebuild.
+++  snapshotFile?: string;
+++  offsets?: Uint32Array;
++ };
++ 
++ // A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
++@@ -83,6 +93,26 @@ export function albumBucketKey(
++ const compareBucketKeys = (a: string, b: string): number =>
++   a === b ? 0 : a === "#" ? -1 : b === "#" ? 1 : a < b ? -1 : 1;
++ 
+++// Accumulates the contiguous-run bucket table one album at a time, in scan order. A new run starts
+++// whenever the bucket key changes, so each run is an exact [offset, offset+count) slice of the
+++// snapshot. Shared by the in-memory reduce (buildAlbumIndexFromPages) and the disk-streaming build
+++// (Subsonic.buildAlbumIndex) so the two paths cannot diverge in how they bucket.
+++export class BucketBuilder<T extends { name: string }> {
+++  readonly buckets: AlbumIndexBucket[] = [];
+++  private current: AlbumIndexBucket | undefined;
+++  total = 0;
+++
+++  append(album: T, ignoredArticles?: string[]): void {
+++    const key = albumBucketKey(album.name, ignoredArticles);
+++    if (!this.current || this.current.key !== key) {
+++      this.current = { key, label: key, offset: this.total, count: 0 };
+++      this.buckets.push(this.current);
+++    }
+++    this.current.count++;
+++    this.total++;
+++  }
+++}
+++
++ // Reduce the scanned album pages (in alphabeticalByName order) into the snapshot + contiguous runs.
++ // Pure so it can be unit-tested without the Subsonic client. A new run starts whenever the bucket
++ // key changes, so each run is an exact [offset, offset+count) slice of the stored `items` snapshot.
++@@ -90,23 +120,13 @@ export function buildAlbumIndexFromPages<T extends { name: string }>(
++   pages: T[][],
++   ignoredArticles?: string[]
++ ): AlbumIndex<T> {
++-  const buckets: AlbumIndexBucket[] = [];
++-  const items: T[] = [];
++-  let offset = 0;
++-  let current: AlbumIndexBucket | undefined;
+++  const builder = new BucketBuilder<T>();
++   for (const page of pages) {
++     for (const album of page) {
++-      items.push(album);
++-      const key = albumBucketKey(album.name, ignoredArticles);
++-      if (!current || current.key !== key) {
++-        current = { key, label: key, offset, count: 0 };
++-        buckets.push(current);
++-      }
++-      current.count++;
++-      offset++;
+++      builder.append(album, ignoredArticles);
++     }
++   }
++-  return { total: offset, buckets, items };
+++  return { total: builder.total, buckets: builder.buckets, items: pages.flat() };
++ }
++ 
++ // Serve one page of a letter directly from the stored snapshot: gather the letter's contiguous
++diff --git a/src/app.ts b/src/app.ts
++index 49f816d..e3c8acc 100644
++--- a/src/app.ts
+++++ b/src/app.ts
++@@ -22,6 +22,7 @@ import { SystemClock } from "./clock";
++ import { JWTSmapiLoginTokens } from "./smapi_auth";
++ import { SwrCache } from "./swr_cache";
++ import { fileStore } from "./swr_cache_file_store";
+++import { albumIndexStore } from "./album_snapshot";
++ import { deezerArtistImageUrl } from "./deezer";
++ import ms from "ms";
++ 
++@@ -78,16 +79,29 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
++ // The album index is a heavy full-catalog scan (~N/500 requests) that changes only on a library
++ // scan, so cache it far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on
++ // every stale browse. Persisted in its own subdir so it survives restarts.
+++//
+++// Slice 1: the index snapshot is disk-backed (records streamed to an immutable per-build file,
+++// only buckets + a Uint32Array of byte offsets resident), so it is persisted by albumIndexStore
+++// (one self-describing snapshot file per build), NOT by the generic fileStore. The same directory
+++// is passed to Subsonic so the scan writes its snapshot where the store will look for it.
+++const indexCacheDir = config.subsonic.cacheDir
+++  ? path.join(config.subsonic.cacheDir, "index")
+++  : undefined;
++ const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
++-  store: config.subsonic.cacheDir
++-    ? // the index holds a full album snapshot (tens of MB on a large library), so raise the
++-      // per-file cap well above the browse cache's default but keep only a small number of snapshots.
++-      fileStore(path.join(config.subsonic.cacheDir, "index"), {
++-        maxFiles: ALBUM_INDEX_CACHE_MAX_ENTRIES,
++-        maxFileBytes: 256 * 1024 * 1024,
++-      })
++-    : undefined,
++-  revive: deepFreeze,
+++  store: indexCacheDir ? albumIndexStore(indexCacheDir) : undefined,
+++  // A restored index has a Uint32Array of byte offsets; deepFreeze must NOT recurse into it
+++  // (Object.values on a typed array allocates a million-entry array). Freeze just the index and
+++  // its bucket rows Ã¢â‚¬â€� enough to match the "persisted = immutable" contract without that cost.
+++  revive: (v) => {
+++    if (v && typeof v === "object") {
+++      Object.freeze(v);
+++      const buckets = (v as { buckets?: unknown }).buckets;
+++      if (Array.isArray(buckets)) {
+++        for (const b of buckets) if (b && typeof b === "object") Object.freeze(b);
+++      }
+++    }
+++    return v;
+++  },
++   maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
++   // The full-catalog scan legitimately takes several minutes on a large library; the default
++   // 60s backstop would abort it before it ever completes. Give it a generous ceiling.
++@@ -101,7 +115,10 @@ const subsonic = new SubsonicMusicService(
++     artistImageFetcher,
++     browseCache,
++     indexCache,
++-    config.subsonic.deezerArtistArt
+++    config.subsonic.deezerArtistArt,
+++    {}, // coverArtCoordinatorOptions (default)
+++    undefined, // maxIndexScanAlbums (default)
+++    indexCacheDir // Slice 1: disk-backed album snapshot directory
++   ),
++   customPlayers,
++   config.subsonic.transcode
++diff --git a/src/smapi.ts b/src/smapi.ts
++index 1f51fbc..77b4ea1 100644
++--- a/src/smapi.ts
+++++ b/src/smapi.ts
++@@ -33,11 +33,10 @@ import _ from "underscore";
++ import { BUrn, formatForURL } from "./burn";
++ import {
++   albumIndexLetters,
++-  albumIndexPage,
++   albumIndexLetterTotal,
++-  albumIndexAll,
++   MAX_ALBUMS_FLAT,
++ } from "./album_index";
+++import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
++ import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
++ import {
++   isExpiredTokenError,
++@@ -1082,15 +1081,17 @@ function bindSmapiSoapServiceToExpress(
++                     // catalogs) -> serve the bucketed A-Z menu. No count fetch, never blocks.
++                     const peekedAlbums = musicLibrary.peekAlbumIndex();
++                     if (peekedAlbums) {
++-                      return peekedAlbums.then((idx) => {
+++                      return peekedAlbums.then(async (idx) => {
++                         // A catalog that shrank back under the cap can still serve flat from the
++                         // snapshot; otherwise the A-Z letter menu.
++                         if (idx.total <= MAX_ALBUMS_FLAT) {
++                           return getMetadataResult({
++-                            mediaCollection: albumIndexAll(
++-                              idx,
++-                              paging._index,
++-                              paging._count
+++                            mediaCollection: (
+++                              await readAlbumIndexAll(
+++                                idx,
+++                                paging._index,
+++                                paging._count
+++                              )
++                             ).map((it) => album(urlWithToken(apiKey), it)),
++                             index: paging._index,
++                             total: idx.total,
++@@ -1162,7 +1163,7 @@ function bindSmapiSoapServiceToExpress(
++                         total: 1,
++                       });
++                     }
++-                    return peekedLetter.then((idx) => {
+++                    return peekedLetter.then(async (idx) => {
++                       const letterTotal = albumIndexLetterTotal(idx, typeId);
++                       if (letterTotal > MAX_ALBUMS_FLAT) {
++                         // A single letter is itself too big for one S2 container; split it into
++@@ -1187,7 +1188,7 @@ function bindSmapiSoapServiceToExpress(
++                       }
++                       // Serve the letter's page straight from the index snapshot (drift-proof: no
++                       // live re-fetch by offset). Advertise only this letter's total.
++-                      const page = albumIndexPage(
+++                      const page = await readAlbumIndexPage(
++                         idx,
++                         typeId,
++                         paging._index,
++@@ -1234,7 +1235,7 @@ function bindSmapiSoapServiceToExpress(
++                         total: 1,
++                       });
++                     }
++-                    return peekedChunk.then((idx) => {
+++                    return peekedChunk.then(async (idx) => {
++                       const base = chunk * MAX_ALBUMS_FLAT;
++                       const letterTotal = albumIndexLetterTotal(idx, chunkKey);
++                       const chunkTotal = Math.max(
++@@ -1245,7 +1246,7 @@ function bindSmapiSoapServiceToExpress(
++                         paging._count,
++                         Math.max(0, chunkTotal - paging._index)
++                       );
++-                      const page = albumIndexPage(
+++                      const page = await readAlbumIndexPage(
++                         idx,
++                         chunkKey,
++                         base + paging._index,
++diff --git a/src/subsonic.ts b/src/subsonic.ts
++index 7107392..b80aa3c 100644
++--- a/src/subsonic.ts
+++++ b/src/subsonic.ts
++@@ -34,7 +34,8 @@ import axios, { AxiosRequestConfig } from "axios";
++ import { b64Encode, b64Decode } from "./b64";
++ import { BUrn } from "./burn";
++ import { SwrCache } from "./swr_cache";
++-import { AlbumIndex, buildAlbumIndexFromPages } from "./album_index";
+++import { AlbumIndex, BucketBuilder } from "./album_index";
+++import { AlbumSnapshotWriter } from "./album_snapshot";
++ import { album, artist } from "./smapi";
++ import { URLBuilder } from "./url_builder";
++ 
++@@ -1479,6 +1480,12 @@ export class Subsonic {
++ 
++   private readonly maxIndexScanAlbums: number;
++ 
+++  // Directory for the disk-backed album snapshot (Slice 1). When set, buildAlbumIndex streams each
+++  // scanned record to an immutable snapshot file and keeps only buckets + a Uint32Array of byte
+++  // offsets resident (O(buckets + offsets), not O(albums)). Undefined Ã¢â€ â€™ in-memory build (no cache
+++  // volume configured: nothing is persisted and the resident snapshot is acceptable).
+++  private readonly albumSnapshotDir: string | undefined;
+++
++   constructor(
++     url: URLBuilder,
++     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
++@@ -1496,9 +1503,14 @@ export class Subsonic {
++     // Upper bound on the one-time album index scan. Injectable so the truncation guard can be
++     // tested without mocking millions of albums, and env-overridable so a very large catalog can
++     // be raised without a rebuild.
++-    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS
+++    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS,
+++    // Directory on the cache volume for the disk-backed album snapshot (Slice 1). Injected from
+++    // app.ts so it shares the index cache volume with the persisted store. Defaults to undefined
+++    // (in-memory build) so existing test/non-cache callers are unchanged.
+++    albumSnapshotDir: string | undefined = undefined
++   ) {
++     this.maxIndexScanAlbums = maxIndexScanAlbums;
+++    this.albumSnapshotDir = albumSnapshotDir;
++     this.url = url;
++     this.customPlayers = customPlayers;
++     this.externalImageFetcher = externalImageFetcher;
++@@ -1719,44 +1731,82 @@ export class Subsonic {
++   // Build the alphabetical album index by scanning the whole catalog once (500/page). Heavy
++   // (~N/500 requests), so it is only ever run behind the cache (getAlbumIndex) as a background
++   // job - never inline on a live browse. A safety cap stops a runaway scan.
+++  //
+++  // Slice 1: when a snapshot directory is configured the scan STREAMS each record to an immutable
+++  // on-disk snapshot file (one append per album, buffered) and keeps only the bucket table + a
+++  // Uint32Array of per-record byte offsets resident Ã¢â‚¬â€� so a multi-million-album catalog no longer
+++  // holds its whole ~474 B/album snapshot in memory. Without a directory it falls back to the old
+++  // resident build (nowhere to persist, and that path is only used by tests/cache-disabled setups).
+++  // The truncation + duplicate-id guards apply to both paths.
++   private buildAlbumIndex = async (
++     credentials: Credentials
++   ): Promise<AlbumIndex<AlbumSummary>> => {
++-    const pages: AlbumSummary[][] = [];
+++    const cacheKey = `albumIndex:v3:${credentials.username}`;
++     const seen = new Set<string>();
+++    const builder = new BucketBuilder<AlbumSummary>();
+++    const writer = this.albumSnapshotDir
+++      ? new AlbumSnapshotWriter(this.albumSnapshotDir, cacheKey)
+++      : undefined;
+++    // `items` is only collected for the resident (no-directory) build; the disk build leaves it
+++    // empty and serves pages from the snapshot file via readAlbumIndexPage/readAlbumIndexAll.
+++    const items: AlbumSummary[] | undefined = writer ? undefined : [];
+++    if (writer) await writer.open();
+++    // One async write per album is fine: the writer buffers ~64 KiB internally, and the scan is
+++    // dominated by its (~N/500) HTTP round trips, not local I/O.
+++    const ingest = async (album: AlbumSummary): Promise<void> => {
+++      builder.append(album);
+++      if (writer) await writer.write(album);
+++      else items!.push(album);
+++    };
++     let complete = false;
++-    for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
++-      const page = await this.scanAlbums(credentials, offset);
++-      if (page.length === 0) {
++-        complete = true;
++-        break;
++-      }
++-      for (const album of page) {
++-        if (seen.has(album.id)) {
++-          throw new Error(
++-            `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
++-          );
+++    try {
+++      for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
+++        const page = await this.scanAlbums(credentials, offset);
+++        if (page.length === 0) {
+++          complete = true;
+++          break;
+++        }
+++        for (const album of page) {
+++          if (seen.has(album.id)) {
+++            throw new Error(
+++              `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
+++            );
+++          }
+++          seen.add(album.id);
+++          await ingest(album);
+++        }
+++        if (page.length < ALBUM_SCAN_PAGE_SIZE) {
+++          complete = true;
+++          break;
++         }
++-        seen.add(album.id);
++       }
++-      pages.push(page);
++-      if (page.length < ALBUM_SCAN_PAGE_SIZE) {
++-        complete = true;
++-        break;
+++      // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+++      // partial result was returned, cached and persisted as if it were the whole catalog: every
+++      // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
+++      // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
+++      // leaves the previous good index in place and says why, which is what the duplicate-id guard
+++      // above already does for the other way a scan can be untrustworthy. The writer is aborted
+++      // (below) so a half-written snapshot file is never left behind to be read as complete.
+++      if (!complete) {
+++        throw new Error(
+++          `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
+++        );
++       }
+++      if (writer) {
+++        const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
+++        return {
+++          total: builder.total,
+++          buckets: builder.buckets,
+++          items: [],
+++          snapshotFile,
+++          offsets,
+++        };
+++      }
+++      return { total: builder.total, buckets: builder.buckets, items: items! };
+++    } catch (e) {
+++      if (writer) await writer.abort();
+++      throw e;
++     }
++-    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
++-    // partial result was returned, cached and persisted as if it were the whole catalog: every
++-    // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
++-    // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
++-    // leaves the previous good index in place and says why, which is what the duplicate-id guard
++-    // below already does for the other way a scan can be untrustworthy.
++-    if (!complete) {
++-      throw new Error(
++-        `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
++-      );
++-    }
++-    return buildAlbumIndexFromPages(pages);
++   };
++ 
++   // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
++@@ -1764,7 +1814,7 @@ export class Subsonic {
++   getAlbumIndex = (
++     credentials: Credentials
++   ): Promise<AlbumIndex<AlbumSummary>> =>
++-    this.indexCache.get(`albumIndex:v2:${credentials.username}`, () =>
+++    this.indexCache.get(`albumIndex:v3:${credentials.username}`, () =>
++       this.buildAlbumIndex(credentials)
++     );
++ 
++@@ -1775,12 +1825,12 @@ export class Subsonic {
++     credentials: Credentials
++   ): Promise<AlbumIndex<AlbumSummary>> | undefined =>
++     this.indexCache.peek<AlbumIndex<AlbumSummary>>(
++-      `albumIndex:v2:${credentials.username}`
+++      `albumIndex:v3:${credentials.username}`
++     );
++ 
++   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
++   warmAlbumIndex = (credentials: Credentials): void =>
++-    this.indexCache.warm(`albumIndex:v2:${credentials.username}`, () =>
+++    this.indexCache.warm(`albumIndex:v3:${credentials.username}`, () =>
++       this.buildAlbumIndex(credentials)
++     );
++ 
++diff --git a/tests/subsonic.test.ts b/tests/subsonic.test.ts
++index 4697ffb..4d93876 100644
++--- a/tests/subsonic.test.ts
+++++ b/tests/subsonic.test.ts
++@@ -1,7 +1,7 @@
++ import { option as O, either as E } from "fp-ts";
++ import { randomUUID as uuid } from "crypto";
++ import { createHash } from "crypto";
++-import { existsSync, readFileSync, writeFileSync, mkdtempSync } from "fs";
+++import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
++ import os from "os";
++ import path from "path";
++ 
++@@ -58,6 +58,7 @@ import { SwrCache } from "../src/swr_cache";
++ 
++ import { Album, Artist, Track, AlbumSummary, AlbumQuery, AuthFailure } from "../src/music_library";
++ import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
+++import { readAlbumIndexPage } from "../src/album_snapshot";
++ import { BUrn } from "../src/burn";
++ 
++ 
++@@ -1276,6 +1277,64 @@ describe("Subsonic", () => {
++         ]);
++       });
++ 
+++      it("streams a disk-backed snapshot when a snapshot dir is configured (Slice 1)", async () => {
+++        const snap = mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+++        try {
+++          const onDisk = new Subsonic(
+++            url,
+++            customPlayers,
+++            axiosImageFetcher,
+++            SwrCache.disabled(),
+++            new SwrCache(clock, 60_000),
+++            false,
+++            {},
+++            undefined,
+++            snap
+++          );
+++          const artist = anArtist();
+++          const page: [Artist, AlbumSummary][] = [
+++            [artist, anAlbumSummary({ name: "369" })],
+++            [artist, anAlbumSummary({ name: "Amsterdam" })],
+++            [artist, anAlbumSummary({ name: "Anthracite" })],
+++            [artist, anAlbumSummary({ name: "The Beatles" })],
+++          ];
+++          mockGET.mockImplementation((u: string) =>
+++            Promise.resolve(
+++              ok(
+++                u.includes("getAlbumList2")
+++                  ? getAlbumListJson(page)
+++                  : asArtistsJson(cached)
+++              )
+++            )
+++          );
+++          const idx = await onDisk.getAlbumIndex(credentials);
+++          // Disk-backed: the snapshot is NOT resident. items is empty; a snapshot file + a Uint32Array
+++          // of byte offsets are what is held instead.
+++          expect(idx.items).toEqual([]);
+++          expect(idx.offsets).toBeInstanceOf(Uint32Array);
+++          expect(idx.offsets!.length).toBe(4 + 1);
+++          expect(idx.snapshotFile).toBeDefined();
+++          expect(existsSync(idx.snapshotFile!)).toBe(true);
+++          expect(idx.buckets.map((b) => `${b.key}:${b.offset}:${b.count}`)).toEqual([
+++            "#:0:1",
+++            "A:1:2",
+++            "B:3:1",
+++          ]);
+++          // The letter page is read from disk and matches the scanned catalog, full record intact
+++          // (year + genre survive the round trip Ã¢â‚¬â€� Slice 1 does not drop fields).
+++          const aPage = await readAlbumIndexPage(idx, "A", 0, 10);
+++          expect(aPage.total).toBe(2);
+++          expect(aPage.items.map((a) => a.name)).toEqual([
+++            "Amsterdam",
+++            "Anthracite",
+++          ]);
+++          expect(typeof aPage.items[0]!.year).toBe("string");
+++          expect(aPage.items[0]!.genre).toBeDefined();
+++        } finally {
+++          rmSync(snap, { recursive: true, force: true });
+++        }
+++      });
+++
++       it("refuses a scan that hits the safety cap rather than caching a TRUNCATED index", async () => {
++         // The cap was a hardcoded 2,000,000 and hitting it just ended the loop, so the partial
++         // result was returned, cached and persisted as though it were the whole catalog: every
++
++--- /dev/null
+++++ b/src/album_snapshot.ts
+++import fs from "fs";
+++import path from "path";
+++import { createHash, randomBytes } from "crypto";
+++import { SwrCacheStore } from "./swr_cache";
+++import logger from "./logger";
+++import {
+++  AlbumIndex,
+++  AlbumIndexBucket,
+++  albumIndexPage,
+++  albumIndexAll,
+++  albumIndexRangesFor,
+++} from "./album_index";
+++
+++// Slice 1: disk-backed album snapshot.
+++//
+++// The album index used to hold the entire scanned snapshot (`AlbumIndex.items`) in memory Ã¢â‚¬â€� about
+++// 474 B/album, which crosses the container limit around 900k albums. This module moves the records
+++// to disk and keeps only the bucket table + a Uint32Array of per-record byte offsets resident, so
+++// resident memory is O(buckets + offsets) rather than O(albums). Serving a browse page does one
+++// async read of just that page's contiguous byte range.
+++//
+++// FILE FORMAT (one immutable file per build, text Ã¢â‚¬â€� NOT the binary format reserved for Slice 3):
+++//
+++//   <record0>\n <record1>\n ... <recordN-1>\n   each record is one AlbumSummary as JSON
+++//   <trailer>                                   one JSON object (see SnapshotTrailer), UTF-8
+++//   <footer>                                    8 bytes: uint32LE trailerByteLen, uint32LE magic
+++//
+++// The 8-byte footer is structural metadata to locate the text trailer; the records themselves are
+++// JSON text. A trailer holds { v, key, at, total, buckets, offsets } where offsets is the (total+1)
+++// per-record byte offsets. The footer lets a reader find the trailer in two small positional reads
+++// (stat + read-last-8 + read-trailer) without scanning the (potentially multi-GB) records.
+++//
+++// DRIFT IS IMPOSSIBLE: each build writes a NEW, uniquely-named, never-overwritten file. The
+++// `AlbumIndex` an in-flight browse holds references its own immutable file path + the offsets that
+++// were built from that exact file, so an offset always resolves against the bytes it describes. A
+++// rebuild produces a new file and a new `AlbumIndex`; the old one keeps reading its old file (which
+++// is only deleted best-effort once it is no longer the newest, see cleanupNewestSnapshots).
+++
+++// Version + magic. The version mirrors the SwrCache key bump (albumIndex:v3:) so a persisted v2
+++// snapshot (which held items inline as JSON) is never misread as this format.
+++export const ALBUM_SNAPSHOT_VERSION = 3;
+++const SNAPSHOT_MAGIC = 0xb0b0_a17e;
+++const FILE_PREFIX = "albumSnapshot.v3.";
+++
+++type SnapshotTrailer = {
+++  v: number;
+++  key: string;
+++  at: number;
+++  total: number;
+++  buckets: AlbumIndexBucket[];
+++  offsets: number[]; // length total+1
+++};
+++
+++const keyHash = (key: string): string =>
+++  createHash("sha1").update(key).digest("hex");
+++
+++// Validate a parsed trailer against the actual file it came from. Returns the trailer typed, or
+++// null if anything is inconsistent Ã¢â‚¬â€� a truncated/garbled/partial file is REFUSED rather than served.
+++// This is the guard against "a half-written snapshot read as complete": a file truncated mid-build
+++// either loses its footer (magic mismatch), its trailer (JSON parse / structural failure), or the
+++// recorded record-region size (offsets[total]) no longer matches where the trailer actually starts.
+++function validateTrailer(
+++  t: unknown,
+++  fileSize: number,
+++  trailerByteLen: number
+++): SnapshotTrailer | null {
+++  if (!t || typeof t !== "object") return null;
+++  const o = t as Record<string, unknown>;
+++  if (o.v !== ALBUM_SNAPSHOT_VERSION) return null;
+++  if (typeof o.key !== "string" || o.key.length === 0) return null;
+++  if (typeof o.at !== "number" || !Number.isFinite(o.at) || o.at <= 0) return null;
+++  if (typeof o.total !== "number" || !Number.isInteger(o.total) || o.total < 0) return null;
+++  if (!Array.isArray(o.buckets) || !Array.isArray(o.offsets)) return null;
+++  const buckets = o.buckets as AlbumIndexBucket[];
+++  const offsets = o.offsets as number[];
+++  if (offsets.length !== o.total + 1) return null;
+++  // Buckets must be a contiguous, in-order partition of [0, total): each run starts where the
+++  // previous ended, and together they cover exactly the snapshot.
+++  let expected = 0;
+++  for (const b of buckets) {
+++    if (!b || typeof b.key !== "string" || typeof b.label !== "string") return null;
+++    if (typeof b.offset !== "number" || typeof b.count !== "number") return null;
+++    if (!Number.isInteger(b.offset) || !Number.isInteger(b.count) || b.count < 0) return null;
+++    if (b.offset !== expected) return null;
+++    expected += b.count;
+++  }
+++  if (expected !== o.total) return null;
+++  // offsets[0] is byte 0; every offset must be a non-negative integer that fits uint32 (the resident
+++  // index is a Uint32Array, so a record past 4 GiB cannot be addressed and must be refused at build).
+++  if (offsets[0] !== 0) return null;
+++  for (const off of offsets) {
+++    if (typeof off !== "number" || !Number.isInteger(off) || off < 0 || off > 0xffffffff) return null;
+++  }
+++  // The recorded end of the record region must land exactly where the trailer begins in THIS file.
+++  // A truncated/extended/edited records region breaks this equality.
+++  const trailerStart = fileSize - 8 - trailerByteLen;
+++  if (offsets[o.total] !== trailerStart) return null;
+++  return { v: o.v, key: o.key, at: o.at, total: o.total, buckets, offsets };
+++}
+++
+++// Read + validate the trailer of a snapshot file synchronously (used only at startup load, never on
+++// the browse path). Returns null for any missing/truncated/corrupt file.
+++function readTrailerSync(file: string): SnapshotTrailer | null {
+++  let fd: number | undefined;
+++  try {
+++    const size = fs.statSync(file).size;
+++    if (size < 8) return null;
+++    fd = fs.openSync(file, "r");
+++    const footer = Buffer.alloc(8);
+++    // Footer is the last 8 bytes.
+++    if (fs.readSync(fd, footer, 0, 8, size - 8) !== 8) return null;
+++    const trailerByteLen = footer.readUInt32LE(0);
+++    const magic = footer.readUInt32LE(4);
+++    if (magic !== SNAPSHOT_MAGIC) return null;
+++    if (trailerByteLen <= 0 || size < 8 + trailerByteLen) return null;
+++    const trailerBuf = Buffer.alloc(trailerByteLen);
+++    if (fs.readSync(fd, trailerBuf, 0, trailerByteLen, size - 8 - trailerByteLen) !== trailerByteLen)
+++      return null;
+++    let parsed: unknown;
+++    try {
+++      parsed = JSON.parse(trailerBuf.toString("utf8"));
+++    } catch {
+++      return null;
+++    }
+++    return validateTrailer(parsed, size, trailerByteLen);
+++  } catch {
+++    return null;
+++  } finally {
+++    if (fd !== undefined) {
+++      try {
+++        fs.closeSync(fd);
+++      } catch {
+++        /* best-effort */
+++      }
+++    }
+++  }
+++}
+++
+++// Rebuild the resident AlbumIndex (buckets + Uint32Array offsets; items empty) from a validated
+++// trailer, pointing at the given immutable file path.
+++function indexFromTrailer(
+++  trailer: SnapshotTrailer,
+++  file: string
+++): AlbumIndex<any> {
+++  return {
+++    total: trailer.total,
+++    buckets: trailer.buckets,
+++    items: [],
+++    snapshotFile: file,
+++    offsets: Uint32Array.from(trailer.offsets),
+++  };
+++}
+++
+++// A streaming, buffered writer that appends one record per album to a temp file, tracks the byte
+++// offset of each, then finalizes the trailer + footer and atomically renames into place. Records
+++// are flushed in ~64 KiB batches so a multi-million-album build does not issue one syscall per
+++// record, and nothing holds the whole snapshot in memory.
+++export class AlbumSnapshotWriter {
+++  private fh?: fs.promises.FileHandle;
+++  private readonly tmp: string;
+++  private readonly dest: string;
+++  private readonly offsets: number[] = [];
+++  private flushedBytes = 0;
+++  private batch: Buffer[] = [];
+++  private batchBytes = 0;
+++  private readonly flushThreshold = 64 * 1024;
+++
+++  constructor(private readonly dir: string, private readonly key: string) {
+++    const gen = randomBytes(6).toString("hex");
+++    const base = `${FILE_PREFIX}${keyHash(key)}.${gen}`;
+++    this.tmp = path.join(dir, `${base}.tmp`);
+++    this.dest = path.join(dir, `${base}.dat`);
+++  }
+++
+++  async open(): Promise<void> {
+++    try {
+++      fs.mkdirSync(this.dir, { recursive: true });
+++    } catch {
+++      /* best-effort; the write below will surface a real error */
+++    }
+++    this.fh = await fs.promises.open(this.tmp, "w");
+++  }
+++
+++  async write(record: unknown): Promise<void> {
+++    // Record the start offset of THIS record before it enters the batch.
+++    this.offsets.push(this.flushedBytes + this.batchBytes);
+++    const buf = Buffer.from(`${JSON.stringify(record)}\n`, "utf8");
+++    if (buf.length > 0xffffffff - this.flushedBytes - this.batchBytes) {
+++      // A record past the 4 GiB uint32 address space can never be located by the resident index.
+++      throw new Error(
+++        "Album snapshot exceeds the 4 GiB addressable limit; refusing to write an un-locatable record"
+++      );
+++    }
+++    this.batch.push(buf);
+++    this.batchBytes += buf.length;
+++    if (this.batchBytes >= this.flushThreshold) await this.flush();
+++  }
+++
+++  private async flush(): Promise<void> {
+++    if (this.batch.length === 0) return;
+++    const fh = this.fh;
+++    if (!fh) throw new Error("AlbumSnapshotWriter used before open");
+++    for (const b of this.batch) await fh.write(b);
+++    this.flushedBytes += this.batchBytes;
+++    this.batch = [];
+++    this.batchBytes = 0;
+++  }
+++
+++  // Append trailer + footer, close, atomically rename tmp -> dest, prune older snapshots for this
+++  // key. Returns the absolute file path + the resident Uint32Array offset index.
+++  async finalize(
+++    buckets: AlbumIndexBucket[]
+++  ): Promise<{ snapshotFile: string; offsets: Uint32Array }> {
+++    const fh = this.fh;
+++    if (!fh) throw new Error("AlbumSnapshotWriter used before open");
+++    await this.flush();
+++    this.offsets.push(this.flushedBytes); // offsets[total] = end of records
+++    const total = this.offsets.length - 1;
+++    const trailer: SnapshotTrailer = {
+++      v: ALBUM_SNAPSHOT_VERSION,
+++      key: this.key,
+++      at: Date.now(),
+++      total,
+++      buckets,
+++      offsets: this.offsets,
+++    };
+++    const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
+++    const footer = Buffer.alloc(8);
+++    footer.writeUInt32LE(trailerBuf.length, 0);
+++    footer.writeUInt32LE(SNAPSHOT_MAGIC, 4);
+++    await fh.write(trailerBuf);
+++    await fh.write(footer);
+++    await fh.close();
+++    this.fh = undefined;
+++    // Atomic swap. `dest` is a brand-new, uniquely-named file, so this rename never replaces an
+++    // existing file (no Windows rename-over-existing subtlety). An in-flight browse reading an older
+++    // snapshot keeps reading it: its path is immutable, and cleanup keeps the previous snapshot.
+++    await fs.promises.rename(this.tmp, this.dest);
+++    // Prune older snapshots for this key before returning so a rebuild leaves a bounded file count
+++    // (cleanup never throws Ã¢â‚¬â€� each step is best-effort Ã¢â‚¬â€� so this does not risk the finalized build).
+++    await cleanupSnapshots(this.dir, this.key, this.dest);
+++    return { snapshotFile: this.dest, offsets: Uint32Array.from(this.offsets) };
+++  }
+++
+++  // Drop the temp file on a failed/aborted build so a half-written snapshot is never left behind.
+++  async abort(): Promise<void> {
+++    try {
+++      if (this.fh) await this.fh.close();
+++    } catch {
+++      /* best-effort */
+++    }
+++    this.fh = undefined;
+++    try {
+++      await fs.promises.rm(this.tmp, { force: true });
+++    } catch {
+++      /* best-effort */
+++    }
+++  }
+++}
+++
+++// Best-effort cleanup of older snapshot files for a key. Keeps the newest two (the just-written one
+++// plus the immediately previous) so an in-flight browse that still holds the previous AlbumIndex
+++// keeps a readable file, then deletes the rest. On Windows a delete of an open file fails (caught);
+++// on Linux an unlink of an open file leaves the fd readable. Either way no wrong data is served.
+++async function cleanupSnapshots(
+++  dir: string,
+++  key: string,
+++  keep: string
+++): Promise<void> {
+++  let names: string[];
+++  try {
+++    names = fs.readdirSync(dir);
+++  } catch {
+++    return;
+++  }
+++  const prefix = `${FILE_PREFIX}${keyHash(key)}.`;
+++  const files = names
+++    .filter((n) => n.startsWith(prefix) && n.endsWith(".dat"))
+++    .map((n) => {
+++      const full = path.join(dir, n);
+++      try {
+++        return { full, mtime: fs.statSync(full).mtimeMs };
+++      } catch {
+++        return undefined;
+++      }
+++    })
+++    .filter((x): x is { full: string; mtime: number } => !!x)
+++    .sort((a, b) => b.mtime - a.mtime);
+++  // Always keep the just-written file plus one previous; remove older snapshots and any stale .tmp.
+++  const keepers = new Set([keep, ...files.slice(1, 2).map((f) => f.full)]);
+++  for (const { full } of files) {
+++    if (keepers.has(full)) continue;
+++    try {
+++      await fs.promises.rm(full, { force: true });
+++    } catch {
+++      /* best-effort */
+++    }
+++  }
+++  for (const n of names.filter((n) => n.startsWith(prefix) && n.endsWith(".tmp"))) {
+++    try {
+++      await fs.promises.rm(path.join(dir, n), { force: true });
+++    } catch {
+++      /* best-effort */
+++    }
+++  }
+++}
+++
+++// Async read of an exact byte range [start, end). One open/read/close per call Ã¢â‚¬â€� no persistent fd
+++// to leak or to race an atomic swap. A short read (file shrank after load) throws rather than serve
+++// partial data.
+++async function readByteRange(file: string, start: number, end: number): Promise<Buffer> {
+++  const len = end - start;
+++  if (len <= 0) return Buffer.alloc(0);
+++  const fh = await fs.promises.open(file, "r");
+++  try {
+++    const buf = Buffer.alloc(len);
+++    const { bytesRead } = await fh.read(buf, 0, len, start);
+++    if (bytesRead !== len) {
+++      throw new Error(
+++        `Album snapshot short read: wanted ${len} bytes at ${start}, got ${bytesRead} (${file})`
+++      );
+++    }
+++    return buf;
+++  } finally {
+++    await fh.close();
+++  }
+++}
+++
+++// Decode a buffer of newline-delimited JSON records (the contents of one contiguous byte range).
+++function decodeJsonlRecords(buf: Buffer): any[] {
+++  const text = buf.toString("utf8");
+++  if (text.length === 0) return [];
+++  const lines = text.split("\n");
+++  const out: any[] = [];
+++  for (const line of lines) {
+++    if (line.length === 0) continue; // trailing newline yields a final empty element
+++    out.push(JSON.parse(line));
+++  }
+++  return out;
+++}
+++
+++// Serve one page of a letter directly from the on-disk snapshot. Mirrors the pure albumIndexPage
+++// walk over the letter's contiguous runs, but reads each run-slice's byte range from disk instead of
+++// slicing a resident array. Drift-proof Ã¢â‚¬â€� the offsets and the file are from the same immutable
+++// build. In-memory (small/test) indexes defer to the synchronous albumIndexPage.
+++export async function readAlbumIndexPage<T>(
+++  index: AlbumIndex<T>,
+++  key: string,
+++  pageIndex: number,
+++  pageCount: number
+++): Promise<{ items: T[]; total: number }> {
+++  if (!index.snapshotFile || !index.offsets) {
+++    return albumIndexPage(index, key, pageIndex, pageCount);
+++  }
+++  const offsets = index.offsets;
+++  const ranges = albumIndexRangesFor(index, key);
+++  const total = ranges.reduce((sum, r) => sum + r.count, 0);
+++  const items: T[] = [];
+++  let skip = pageIndex;
+++  let take = pageCount;
+++  for (const r of ranges) {
+++    if (take <= 0) break;
+++    if (skip >= r.count) {
+++      skip -= r.count;
+++      continue;
+++    }
+++    const from = r.offset + skip;
+++    const n = Math.min(r.count - skip, take);
+++    const buf = await readByteRange(index.snapshotFile, offsets[from]!, offsets[from + n]!);
+++    const recs = decodeJsonlRecords(buf);
+++    if (recs.length !== n) {
+++      throw new Error(
+++        `Album snapshot page decode mismatch: expected ${n} records, got ${recs.length}`
+++      );
+++    }
+++    for (const rec of recs) items.push(rec as T);
+++    take -= n;
+++    skip = 0;
+++  }
+++  return { items, total };
+++}
+++
+++// Slice the on-disk snapshot in scan order, for the flat (small/shrunk-library) browse. Drift-proof;
+++// in-memory indexes defer to the synchronous albumIndexAll.
+++export async function readAlbumIndexAll<T>(
+++  index: AlbumIndex<T>,
+++  pageIndex: number,
+++  pageCount: number
+++): Promise<T[]> {
+++  if (!index.snapshotFile || !index.offsets) {
+++    return albumIndexAll(index, pageIndex, pageCount);
+++  }
+++  const offsets = index.offsets;
+++  const total = index.total;
+++  const start = Math.min(Math.max(0, pageIndex), total);
+++  const end = Math.min(total, pageIndex + pageCount);
+++  if (end <= start) return [];
+++  const buf = await readByteRange(index.snapshotFile, offsets[start]!, offsets[end]!);
+++  const recs = decodeJsonlRecords(buf);
+++  if (recs.length !== end - start) {
+++    throw new Error(
+++      `Album snapshot flat decode mismatch: expected ${end - start} records, got ${recs.length}`
+++    );
+++  }
+++  return recs as T[];
+++}
+++
+++// A SwrCacheStore that persists each built index as one self-describing snapshot file. The BUILD
+++// writes the snapshot (it is the only place that streams the records), so save() is a no-op;
+++// persistence is the file itself. load() scans the directory at startup, validates each file's
+++// trailer, and reconstructs the newest valid index per cache key.
+++export function albumIndexStore(dir: string): SwrCacheStore {
+++  try {
+++    fs.mkdirSync(dir, { recursive: true });
+++  } catch (e) {
+++    logger.warn(`Album snapshot store: could not create ${dir}: ${e}`);
+++  }
+++
+++  return {
+++    // The build has already written the snapshot file atomically; nothing more to persist.
+++    save() {
+++      /* no-op */
+++    },
+++
+++    load() {
+++      let names: string[];
+++      try {
+++        names = fs.readdirSync(dir);
+++      } catch {
+++        return [];
+++      }
+++      // Drop stale .tmp files left by a build that crashed before its atomic rename. Safe at startup
+++      // (no build is running yet); a .dat only ever appears via rename from a .tmp.
+++      for (const n of names.filter((n) => n.startsWith(FILE_PREFIX) && n.endsWith(".tmp"))) {
+++        try {
+++          fs.rmSync(path.join(dir, n), { force: true });
+++        } catch {
+++          /* best-effort */
+++        }
+++      }
+++      // Newest valid trailer per cache key wins; corrupt/truncated files are skipped (Ã¢â€ â€™ cold rebuild).
+++      const newestByKey = new Map<string, { at: number; value: unknown }>();
+++      for (const n of names) {
+++        if (!n.startsWith(FILE_PREFIX) || !n.endsWith(".dat")) continue;
+++        const full = path.join(dir, n);
+++        const trailer = readTrailerSync(full);
+++        if (!trailer) continue;
+++        const existing = newestByKey.get(trailer.key);
+++        if (!existing || trailer.at > existing.at) {
+++          newestByKey.set(trailer.key, {
+++            at: trailer.at,
+++            value: indexFromTrailer(trailer, full),
+++          });
+++        }
+++      }
+++      return [...newestByKey.entries()].map(([key, { at, value }]) => ({ key, at, value }));
+++    },
+++  };
+++}
++
++--- /dev/null
+++++ b/tests/album_snapshot.test.ts
+++import fs from "fs";
+++import os from "os";
+++import path from "path";
+++
+++import { AlbumSummary } from "../src/music_library";
+++import {
+++  BucketBuilder,
+++  buildAlbumIndexFromPages,
+++  albumIndexPage,
+++  albumIndexAll,
+++} from "../src/album_index";
+++import {
+++  AlbumSnapshotWriter,
+++  albumIndexStore,
+++  readAlbumIndexPage,
+++  readAlbumIndexAll,
+++} from "../src/album_snapshot";
+++
+++// Build a disk-backed index the same way Subsonic.buildAlbumIndex does: stream records to the
+++// snapshot file while bucketing, then finalize. Returns the disk-backed AlbumIndex (items empty,
+++// offsets + snapshotFile set).
+++async function buildDiskIndex(
+++  dir: string,
+++  key: string,
+++  records: AlbumSummary[]
+++) {
+++  const builder = new BucketBuilder<AlbumSummary>();
+++  const writer = new AlbumSnapshotWriter(dir, key);
+++  await writer.open();
+++  for (const album of records) {
+++    builder.append(album);
+++    await writer.write(album);
+++  }
+++  const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
+++  return {
+++    total: builder.total,
+++    buckets: builder.buckets,
+++    items: [] as AlbumSummary[],
+++    snapshotFile,
+++    offsets,
+++  };
+++}
+++
+++const names = (...ns: string[]) =>
+++  ns.map((name, i) => ({ id: `${name}-${i}`, name } as AlbumSummary));
+++
+++// A deterministic catalog of AlbumSummary records (full record, incl. year/genre Ã¢â‚¬â€� never dropped).
+++const catalog = (size: number, tag: string): AlbumSummary[] =>
+++  Array.from({ length: size }, (_, i) => ({
+++    id: `${tag}-${i}`,
+++    name: `Album ${tag} ${i}`,
+++    year: `${1970 + (i % 50)}`,
+++    genre: { name: "Rock", id: "rock" },
+++    coverArt: { system: "subsonic", resource: `art:${tag}-${i}` } as any,
+++    artistId: `artist-${tag}`,
+++    artistName: `Artist ${tag}`,
+++  }));
+++
+++describe("album_snapshot: disk page matches the in-memory index", () => {
+++  let dir: string;
+++  beforeEach(() => {
+++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+++  });
+++  afterEach(() => {
+++    fs.rmSync(dir, { recursive: true, force: true });
+++  });
+++
+++  it("serves the same items/total as the resident index for every letter and page", async () => {
+++    // Scattered runs (a stray "A" after "B") so pages span multiple ranges too.
+++    const records = names(
+++      "Apple",
+++      "Avocado",
+++      "Banana",
+++      "Apex",
+++      "Cherry",
+++      "Cantaloupe",
+++      "Date"
+++    );
+++    const mem = buildAlbumIndexFromPages([records]);
+++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++
+++    // Sanity: the shared BucketBuilder keeps bucketing identical.
+++    expect(disk.buckets).toEqual(mem.buckets);
+++    expect(disk.total).toBe(mem.total);
+++    // Disk-backed: items empty, offsets resident as a Uint32Array.
+++    expect(disk.items).toEqual([]);
+++    expect(disk.offsets).toBeInstanceOf(Uint32Array);
+++    expect(disk.offsets!.length).toBe(records.length + 1);
+++    expect(disk.offsets![0]).toBe(0);
+++
+++    for (const key of ["A", "B", "C", "D", "Z"]) {
+++      for (let page = 0; page < 5; page++) {
+++        const fromMem = albumIndexPage(mem, key, page, 2);
+++        const fromDisk = await readAlbumIndexPage(disk, key, page, 2);
+++        expect(fromDisk.total).toBe(fromMem.total);
+++        expect(fromDisk.items.map((a) => a.id)).toEqual(
+++          fromMem.items.map((a) => (a as { id: string }).id)
+++        );
+++        // The full AlbumSummary round-trips (year + genre survive Ã¢â‚¬â€� never dropped).
+++        for (const a of fromDisk.items) {
+++          expect(typeof a.year).toBe("string");
+++          expect(a.genre).toEqual({ name: "Rock", id: "rock" });
+++        }
+++      }
+++    }
+++  });
+++
+++  it("readAlbumIndexAll slices the same scan-order range as the resident index", async () => {
+++    const records = catalog(25, "x");
+++    const mem = buildAlbumIndexFromPages([records]);
+++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    expect(await readAlbumIndexAll(disk, 5, 10)).toEqual(albumIndexAll(mem, 5, 10));
+++    expect((await readAlbumIndexAll(disk, 0, 100)).length).toBe(25);
+++    expect(await readAlbumIndexAll(disk, 30, 10)).toEqual([]); // past the end
+++  });
+++
+++  it("readAlbumIndexPage falls back to the synchronous slice for an in-memory index", async () => {
+++    const mem = buildAlbumIndexFromPages([names("Apple", "Avocado", "Banana")]);
+++    const page = await readAlbumIndexPage(mem, "A", 0, 10);
+++    expect(page.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
+++    expect(page.total).toBe(2);
+++  });
+++});
+++
+++describe("album_snapshot: letter bucketing is unchanged on the disk path", () => {
+++  let dir: string;
+++  beforeEach(() => {
+++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+++  });
+++  afterEach(() => {
+++    fs.rmSync(dir, { recursive: true, force: true });
+++  });
+++
+++  it("produces the same contiguous runs the pure reducer does", async () => {
+++    const records = names(
+++      "Apple",
+++      "Avocado",
+++      "Banana",
+++      "Apex",
+++      "9 to 5",
+++      "Cherry"
+++    );
+++    const mem = buildAlbumIndexFromPages([records]);
+++    const disk = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    expect(disk.buckets).toEqual([
+++      { key: "A", label: "A", offset: 0, count: 2 },
+++      { key: "B", label: "B", offset: 2, count: 1 },
+++      { key: "A", label: "A", offset: 3, count: 1 },
+++      { key: "#", label: "#", offset: 4, count: 1 },
+++      { key: "C", label: "C", offset: 5, count: 1 },
+++    ]);
+++    expect(disk.buckets).toEqual(mem.buckets);
+++  });
+++});
+++
+++describe("album_snapshot: a truncated or corrupt snapshot is refused, never served", () => {
+++  let dir: string;
+++  beforeEach(() => {
+++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+++  });
+++  afterEach(() => {
+++    fs.rmSync(dir, { recursive: true, force: true });
+++  });
+++
+++  it("loads a valid snapshot on restart", async () => {
+++    const records = catalog(10, "ok");
+++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    const loaded = albumIndexStore(dir).load();
+++    expect(loaded.length).toBe(1);
+++    expect(loaded[0]!.key).toBe("albumIndex:v3:user");
+++    expect(loaded[0]!.value).toMatchObject({ total: 10 });
+++    // The restored index serves the same page the freshly-built one does.
+++    const disk = loaded[0]!.value as any;
+++    const page = await readAlbumIndexPage(disk, "A", 0, 10);
+++    expect(page.items.map((a: any) => a.id)).toEqual(
+++      (await readAlbumIndexPage(built, "A", 0, 10)).items.map((a) => a.id)
+++    );
+++    // built file is retained (it is the newest).
+++    expect(fs.existsSync(built.snapshotFile)).toBe(true);
+++  });
+++
+++  it("refuses a file truncated mid-records (footer/trailer lost)", async () => {
+++    const records = catalog(50, "trunc");
+++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    // Chop off the last 200 bytes (footer + part of trailer / records).
+++    const size = fs.statSync(built.snapshotFile).size;
+++    fs.truncateSync(built.snapshotFile, size - 200);
+++    expect(albumIndexStore(dir).load()).toEqual([]);
+++  });
+++
+++  it("refuses a file whose footer magic is wrong", async () => {
+++    const records = catalog(10, "magic");
+++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    const size = fs.statSync(built.snapshotFile).size;
+++    const fd = fs.openSync(built.snapshotFile, "r+");
+++    // Overwrite the 4 magic bytes at the very end (footer = [len:4][magic:4]).
+++    fs.writeSync(fd, Buffer.from([0xff, 0xff, 0xff, 0xff]), 0, 4, size - 4);
+++    fs.closeSync(fd);
+++    expect(albumIndexStore(dir).load()).toEqual([]);
+++  });
+++
+++  it("refuses a file extended with trailing garbage (footer no longer at the end)", async () => {
+++    const records = catalog(10, "extend");
+++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    // Append garbage after the footer: the last 8 bytes are no longer the magic footer, and the
+++    // recorded record-region end (offsets[total]) no longer matches where a trailer would start.
+++    fs.appendFileSync(built.snapshotFile, Buffer.from("garbage that extends the file"));
+++    expect(albumIndexStore(dir).load()).toEqual([]);
+++  });
+++
+++  it("ignores an unrelated / garbage file in the directory", async () => {
+++    fs.writeFileSync(path.join(dir, "albumSnapshot.v3.deadbeef.dat"), "not a snapshot");
+++    fs.writeFileSync(path.join(dir, "random.json"), "{}");
+++    const records = catalog(5, "good");
+++    await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    const loaded = albumIndexStore(dir).load();
+++    expect(loaded.length).toBe(1);
+++    expect(loaded[0]!.value).toMatchObject({ total: 5 });
+++  });
+++
+++  it("a short read after load (file shrank) throws rather than serving partial data", async () => {
+++    const records = catalog(20, "shrink");
+++    const built = await buildDiskIndex(dir, "albumIndex:v3:user", records);
+++    // Truncate the records region AFTER load so the byte-range read comes up short.
+++    const disk = albumIndexStore(dir).load()[0]!.value as any;
+++    fs.truncateSync(built.snapshotFile, fs.statSync(built.snapshotFile).size - 50);
+++    await expect(readAlbumIndexPage(disk, "A", 0, 20)).rejects.toThrow(/short read/);
+++  });
+++});
+++
+++describe("album_snapshot: drift is impossible across a rebuild", () => {
+++  let dir: string;
+++  beforeEach(() => {
+++    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-"));
+++  });
+++  afterEach(() => {
+++    fs.rmSync(dir, { recursive: true, force: true });
+++  });
+++
+++  it("an in-flight index keeps reading its own immutable file after a rebuild", async () => {
+++    const key = "albumIndex:v3:user";
+++    // Build A: a catalog where "A" holds Apple/Avocado.
+++    const indexA = await buildDiskIndex(
+++      dir,
+++      key,
+++      names("Apple", "Avocado", "Banana")
+++    );
+++    const pageA_before = await readAlbumIndexPage(indexA, "A", 0, 10);
+++    expect(pageA_before.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
+++
+++    // Rebuild for the SAME key with a DIFFERENT catalog (a Navidrome rescan reordered everything;
+++    // now "A" holds entirely different records).
+++    const indexB = await buildDiskIndex(
+++      dir,
+++      key,
+++      names("Apricot", "Aubergine", "Blueberry")
+++    );
+++
+++    // Different immutable files.
+++    expect(indexA.snapshotFile).not.toBe(indexB.snapshotFile);
+++
+++    // The OLD index A still reads its OWN file Ã¢â‚¬â€� its offsets never point into B's file, so it
+++    // returns A's records, NOT B's. This is exactly the drift (wrong-letter) class the snapshot
+++    // exists to prevent.
+++    const pageA_after = await readAlbumIndexPage(indexA, "A", 0, 10);
+++    expect(pageA_after.items.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
+++    expect(pageA_after.items.map((a) => a.name)).not.toContain("Apricot");
+++
+++    // The new index reads its own file.
+++    const pageB = await readAlbumIndexPage(indexB, "A", 0, 10);
+++    expect(pageB.items.map((a) => a.name)).toEqual(["Apricot", "Aubergine"]);
+++
+++    // A's file is still on disk (cleanup keeps the previous snapshot).
+++    expect(fs.existsSync(indexA.snapshotFile!)).toBe(true);
+++  });
+++
+++  it("rebuilds for one key collapse to a single loaded entry and a bounded file count", async () => {
+++    const key = "albumIndex:v3:multi";
+++    // Four rebuilds for the same key. load() dedups by key (one entry), and cleanup keeps at most
+++    // two .dat files per key so disk does not grow unbounded across rebuilds.
+++    for (let i = 0; i < 4; i++) {
+++      await buildDiskIndex(dir, key, catalog(3 + i, `g${i}`));
+++    }
+++    const loaded = albumIndexStore(dir).load();
+++    expect(loaded.length).toBe(1);
+++    expect(loaded[0]!.key).toBe(key);
+++    const datFiles = fs
+++      .readdirSync(dir)
+++      .filter((n) => n.startsWith("albumSnapshot.v3.") && n.endsWith(".dat"));
+++    expect(datFiles.length).toBeLessThanOrEqual(2);
+++  });
+++});

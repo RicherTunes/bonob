@@ -34,7 +34,8 @@ import axios, { AxiosRequestConfig } from "axios";
 import { b64Encode, b64Decode } from "./b64";
 import { BUrn } from "./burn";
 import { SwrCache } from "./swr_cache";
-import { AlbumIndex, buildAlbumIndexFromPages } from "./album_index";
+import { AlbumIndex, BucketBuilder } from "./album_index";
+import { AlbumSnapshotWriter } from "./album_snapshot";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
 
@@ -1479,6 +1480,12 @@ export class Subsonic {
 
   private readonly maxIndexScanAlbums: number;
 
+  // Directory for the disk-backed album snapshot (Slice 1). When set, buildAlbumIndex streams each
+  // scanned record to an immutable snapshot file and keeps only buckets + a Uint32Array of byte
+  // offsets resident (O(buckets + offsets), not O(albums)). Undefined → in-memory build (no cache
+  // volume configured: nothing is persisted and the resident snapshot is acceptable).
+  private readonly albumSnapshotDir: string | undefined;
+
   constructor(
     url: URLBuilder,
     customPlayers: CustomPlayers = NO_CUSTOM_PLAYERS,
@@ -1496,9 +1503,14 @@ export class Subsonic {
     // Upper bound on the one-time album index scan. Injectable so the truncation guard can be
     // tested without mocking millions of albums, and env-overridable so a very large catalog can
     // be raised without a rebuild.
-    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS
+    maxIndexScanAlbums: number = DEFAULT_MAX_INDEX_SCAN_ALBUMS,
+    // Directory on the cache volume for the disk-backed album snapshot (Slice 1). Injected from
+    // app.ts so it shares the index cache volume with the persisted store. Defaults to undefined
+    // (in-memory build) so existing test/non-cache callers are unchanged.
+    albumSnapshotDir: string | undefined = undefined
   ) {
     this.maxIndexScanAlbums = maxIndexScanAlbums;
+    this.albumSnapshotDir = albumSnapshotDir;
     this.url = url;
     this.customPlayers = customPlayers;
     this.externalImageFetcher = externalImageFetcher;
@@ -1719,44 +1731,82 @@ export class Subsonic {
   // Build the alphabetical album index by scanning the whole catalog once (500/page). Heavy
   // (~N/500 requests), so it is only ever run behind the cache (getAlbumIndex) as a background
   // job - never inline on a live browse. A safety cap stops a runaway scan.
+  //
+  // Slice 1: when a snapshot directory is configured the scan STREAMS each record to an immutable
+  // on-disk snapshot file (one append per album, buffered) and keeps only the bucket table + a
+  // Uint32Array of per-record byte offsets resident — so a multi-million-album catalog no longer
+  // holds its whole ~474 B/album snapshot in memory. Without a directory it falls back to the old
+  // resident build (nowhere to persist, and that path is only used by tests/cache-disabled setups).
+  // The truncation + duplicate-id guards apply to both paths.
   private buildAlbumIndex = async (
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> => {
-    const pages: AlbumSummary[][] = [];
+    const cacheKey = `albumIndex:v3:${credentials.username}`;
     const seen = new Set<string>();
+    const builder = new BucketBuilder<AlbumSummary>();
+    const writer = this.albumSnapshotDir
+      ? new AlbumSnapshotWriter(this.albumSnapshotDir, cacheKey)
+      : undefined;
+    // `items` is only collected for the resident (no-directory) build; the disk build leaves it
+    // empty and serves pages from the snapshot file via readAlbumIndexPage/readAlbumIndexAll.
+    const items: AlbumSummary[] | undefined = writer ? undefined : [];
+    if (writer) await writer.open();
+    // One async write per album is fine: the writer buffers ~64 KiB internally, and the scan is
+    // dominated by its (~N/500) HTTP round trips, not local I/O.
+    const ingest = async (album: AlbumSummary): Promise<void> => {
+      builder.append(album);
+      if (writer) await writer.write(album);
+      else items!.push(album);
+    };
     let complete = false;
-    for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
-      const page = await this.scanAlbums(credentials, offset);
-      if (page.length === 0) {
-        complete = true;
-        break;
-      }
-      for (const album of page) {
-        if (seen.has(album.id)) {
-          throw new Error(
-            `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
-          );
+    try {
+      for (let offset = 0; offset < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
+        const page = await this.scanAlbums(credentials, offset);
+        if (page.length === 0) {
+          complete = true;
+          break;
         }
-        seen.add(album.id);
+        for (const album of page) {
+          if (seen.has(album.id)) {
+            throw new Error(
+              `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
+            );
+          }
+          seen.add(album.id);
+          await ingest(album);
+        }
+        if (page.length < ALBUM_SCAN_PAGE_SIZE) {
+          complete = true;
+          break;
+        }
       }
-      pages.push(page);
-      if (page.length < ALBUM_SCAN_PAGE_SIZE) {
-        complete = true;
-        break;
+      // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+      // partial result was returned, cached and persisted as if it were the whole catalog: every
+      // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
+      // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
+      // leaves the previous good index in place and says why, which is what the duplicate-id guard
+      // above already does for the other way a scan can be untrustworthy. The writer is aborted
+      // (below) so a half-written snapshot file is never left behind to be read as complete.
+      if (!complete) {
+        throw new Error(
+          `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
+        );
       }
+      if (writer) {
+        const { snapshotFile, offsets } = await writer.finalize(builder.buckets);
+        return {
+          total: builder.total,
+          buckets: builder.buckets,
+          items: [],
+          snapshotFile,
+          offsets,
+        };
+      }
+      return { total: builder.total, buckets: builder.buckets, items: items! };
+    } catch (e) {
+      if (writer) await writer.abort();
+      throw e;
     }
-    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
-    // partial result was returned, cached and persisted as if it were the whole catalog: every
-    // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
-    // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
-    // leaves the previous good index in place and says why, which is what the duplicate-id guard
-    // below already does for the other way a scan can be untrustworthy.
-    if (!complete) {
-      throw new Error(
-        `Album index scan hit its ${this.maxIndexScanAlbums}-album safety cap before reaching the end of the catalog; refusing to cache a truncated index. Raise BNB_MAX_INDEX_SCAN_ALBUMS.`
-      );
-    }
-    return buildAlbumIndexFromPages(pages);
   };
 
   // Cached + persisted alphabetical album index (SwrCache, keyed per user). Serves the bucketed
@@ -1764,7 +1814,7 @@ export class Subsonic {
   getAlbumIndex = (
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> =>
-    this.indexCache.get(`albumIndex:v2:${credentials.username}`, () =>
+    this.indexCache.get(`albumIndex:v3:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 
@@ -1775,12 +1825,12 @@ export class Subsonic {
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> | undefined =>
     this.indexCache.peek<AlbumIndex<AlbumSummary>>(
-      `albumIndex:v2:${credentials.username}`
+      `albumIndex:v3:${credentials.username}`
     );
 
   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
   warmAlbumIndex = (credentials: Credentials): void =>
-    this.indexCache.warm(`albumIndex:v2:${credentials.username}`, () =>
+    this.indexCache.warm(`albumIndex:v3:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
     );
 

@@ -33,11 +33,10 @@ import _ from "underscore";
 import { BUrn, formatForURL } from "./burn";
 import {
   albumIndexLetters,
-  albumIndexPage,
   albumIndexLetterTotal,
-  albumIndexAll,
   MAX_ALBUMS_FLAT,
 } from "./album_index";
+import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
 import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
 import {
   isExpiredTokenError,
@@ -1082,15 +1081,17 @@ function bindSmapiSoapServiceToExpress(
                     // catalogs) -> serve the bucketed A-Z menu. No count fetch, never blocks.
                     const peekedAlbums = musicLibrary.peekAlbumIndex();
                     if (peekedAlbums) {
-                      return peekedAlbums.then((idx) => {
+                      return peekedAlbums.then(async (idx) => {
                         // A catalog that shrank back under the cap can still serve flat from the
                         // snapshot; otherwise the A-Z letter menu.
                         if (idx.total <= MAX_ALBUMS_FLAT) {
                           return getMetadataResult({
-                            mediaCollection: albumIndexAll(
-                              idx,
-                              paging._index,
-                              paging._count
+                            mediaCollection: (
+                              await readAlbumIndexAll(
+                                idx,
+                                paging._index,
+                                paging._count
+                              )
                             ).map((it) => album(urlWithToken(apiKey), it)),
                             index: paging._index,
                             total: idx.total,
@@ -1162,7 +1163,7 @@ function bindSmapiSoapServiceToExpress(
                         total: 1,
                       });
                     }
-                    return peekedLetter.then((idx) => {
+                    return peekedLetter.then(async (idx) => {
                       const letterTotal = albumIndexLetterTotal(idx, typeId);
                       if (letterTotal > MAX_ALBUMS_FLAT) {
                         // A single letter is itself too big for one S2 container; split it into
@@ -1187,7 +1188,7 @@ function bindSmapiSoapServiceToExpress(
                       }
                       // Serve the letter's page straight from the index snapshot (drift-proof: no
                       // live re-fetch by offset). Advertise only this letter's total.
-                      const page = albumIndexPage(
+                      const page = await readAlbumIndexPage(
                         idx,
                         typeId,
                         paging._index,
@@ -1234,7 +1235,7 @@ function bindSmapiSoapServiceToExpress(
                         total: 1,
                       });
                     }
-                    return peekedChunk.then((idx) => {
+                    return peekedChunk.then(async (idx) => {
                       const base = chunk * MAX_ALBUMS_FLAT;
                       const letterTotal = albumIndexLetterTotal(idx, chunkKey);
                       const chunkTotal = Math.max(
@@ -1245,7 +1246,7 @@ function bindSmapiSoapServiceToExpress(
                         paging._count,
                         Math.max(0, chunkTotal - paging._index)
                       );
-                      const page = albumIndexPage(
+                      const page = await readAlbumIndexPage(
                         idx,
                         chunkKey,
                         base + paging._index,
