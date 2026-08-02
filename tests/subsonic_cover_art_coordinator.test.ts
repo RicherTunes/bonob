@@ -457,6 +457,205 @@ describe("CoverArtCoordinator admission control (never promise a wait it cannot 
   });
 });
 
+describe("CoverArtCoordinator admission control - adversarial edges", () => {
+  // Seeds the latency EWMA with exactly one observation. The first sample sets the average
+  // outright, so the estimate afterwards is exact and the boundaries below are not approximate.
+  const seedLatency = async (coord: CoverArtCoordinator, ms: number, key = "seed") => {
+    const p = coord.run(coverArtKey("u", "p", key, 1), () =>
+      new Promise<Buffer>((res) => setTimeout(() => res(Buffer.from(key)), ms))
+    );
+    jest.advanceTimersByTime(ms);
+    await expect(p).resolves.toEqual(Buffer.from(key));
+  };
+
+  // Occupies a slot until released. Every real slot hold is bounded by the cover-art http timeout,
+  // so a slot is never held indefinitely in production - see the recovery test below, which depends
+  // on that invariant.
+  const hold = (coord: CoverArtCoordinator, key: string) => {
+    let release!: (v: Buffer) => void;
+    const p = coord.run(coverArtKey("u", "p", key, 1), () =>
+      new Promise<Buffer>((res) => {
+        release = res;
+      })
+    );
+    p.catch(() => {});
+    return { promise: p, release: () => release(Buffer.from(key)) };
+  };
+
+  const settledState = async (p: Promise<unknown>) => {
+    const state = { rejected: false, error: undefined as unknown };
+    p.catch((e) => {
+      state.rejected = true;
+      state.error = e;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    return state;
+  };
+
+  it("admits when the estimated wait exactly equals the deadline (strict >, not >=)", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 1000);
+      hold(coord, "held");
+
+      // ceil(1/1) * 1000 = 1000, which is not greater than the 1000ms deadline. A request that
+      // might just make it is given its chance rather than pre-emptively failed.
+      const queued = coord.run(coverArtKey("u", "p", "edge", 1), () => Promise.resolve(Buffer.from("x")));
+      const state = await settledState(queued);
+      expect(state.rejected).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("rejects when the estimated wait is one millisecond over the deadline", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 1001);
+      hold(coord, "held");
+
+      const queued = coord.run(coverArtKey("u", "p", "over", 1), () => Promise.resolve(Buffer.from("x")));
+      const state = await settledState(queued);
+      expect(state.rejected).toBe(true);
+      expect(state.error).toBeInstanceOf(CoverArtBusyError);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("counts queue position in turnovers of maxConcurrency, not one turnover per waiter", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 2, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 600);
+      hold(coord, "held-1");
+      hold(coord, "held-2");
+
+      // With 2 slots and a 600ms turnover: positions 0 and 1 are both served in the first
+      // turnover (600ms, admitted); position 2 needs a second turnover (1200ms > 1000, rejected).
+      const q1 = coord.run(coverArtKey("u", "p", "q1", 1), () => Promise.resolve(Buffer.from("1")));
+      const q2 = coord.run(coverArtKey("u", "p", "q2", 1), () => Promise.resolve(Buffer.from("2")));
+      const q3 = coord.run(coverArtKey("u", "p", "q3", 1), () => Promise.resolve(Buffer.from("3")));
+
+      expect((await settledState(q1)).rejected).toBe(false);
+      expect((await settledState(q2)).rejected).toBe(false);
+      const third = await settledState(q3);
+      expect(third.rejected).toBe(true);
+      expect(third.error).toBeInstanceOf(CoverArtBusyError);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("never rejects a request that can start immediately, however bad the observed latency", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 2, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 60_000);
+
+      // Admission control gates QUEUEING only. A free slot must always be used - otherwise a single
+      // bad sample would stop the coordinator doing any work at all, and no new samples would ever
+      // be observed to correct it.
+      const immediate = coord.run(coverArtKey("u", "p", "free-slot", 1), () =>
+        Promise.resolve(Buffer.from("ok"))
+      );
+      await expect(immediate).resolves.toEqual(Buffer.from("ok"));
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("recovers on its own after degradation, because active calls keep supplying samples", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+      await seedLatency(coord, 5000, "slow");
+
+      // Degraded: queueing is refused.
+      const blocked = hold(coord, "held");
+      const refused = coord.run(coverArtKey("u", "p", "refused", 1), () => Promise.resolve(Buffer.from("x")));
+      expect((await settledState(refused)).rejected).toBe(true);
+
+      // The in-flight call finishes - which it always does within SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS,
+      // the invariant this recovery depends on. Once a slot is free the guard cannot block it, so
+      // fast calls run and pull the average down (alpha 0.3) and the queue reopens unaided. Without
+      // that bound on slot-hold time a permanently hung upstream would starve the estimator and the
+      // guard would stay shut, so the http timeout is load-bearing here, not just hygiene.
+      blocked.release();
+      await blocked.promise;
+      for (let i = 0; i < 12; i++) {
+        await seedLatency(coord, 50, `fast-${i}`);
+      }
+
+      hold(coord, "held-again");
+      const admitted = coord.run(coverArtKey("u", "p", "admitted", 1), () => Promise.resolve(Buffer.from("y")));
+      expect((await settledState(admitted)).rejected).toBe(false);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("treats a slow FAILURE as a latency sample too (it consumed the slot just the same)", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 1000 });
+
+      const failing = coord.run(coverArtKey("u", "p", "slow-fail", 1), () =>
+        new Promise<Buffer>((_, rej) => setTimeout(() => rej(new Error("upstream")), 4000))
+      );
+      failing.catch(() => {});
+      jest.advanceTimersByTime(4000);
+      await expect(failing).rejects.toBeDefined();
+
+      // A 4s failure is evidence the upstream is slow, not evidence it is fast.
+      hold(coord, "held");
+      const queued = coord.run(coverArtKey("u", "p", "after-fail", 1), () => Promise.resolve(Buffer.from("x")));
+      expect((await settledState(queued)).rejected).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it("keeps admitted requests in FIFO order - the guard sheds the tail, never reorders the head", async () => {
+    jest.useFakeTimers();
+    try {
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs: 5000 });
+      await seedLatency(coord, 100);
+
+      const started: string[] = [];
+      const inflight: Array<(v: Buffer) => void> = [];
+      const taskFor = (label: string) => () => {
+        started.push(label);
+        return new Promise<Buffer>((res) => inflight.push(res));
+      };
+
+      const a = coord.run(coverArtKey("u", "p", "a", 1), taskFor("a"));
+      const b = coord.run(coverArtKey("u", "p", "b", 1), taskFor("b"));
+      const c = coord.run(coverArtKey("u", "p", "c", 1), taskFor("c"));
+      [a, b, c].forEach((p) => p.catch(() => {}));
+
+      await Promise.resolve();
+      expect(started).toEqual(["a"]);
+
+      inflight.shift()!(Buffer.from("a"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(started).toEqual(["a", "b"]);
+
+      inflight.shift()!(Buffer.from("b"));
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(started).toEqual(["a", "b", "c"]);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+});
+
 describe("headerString (axios >= 1.19 header values are not plain strings)", () => {
   it("passes a plain string through", () => {
     expect(headerString("image/png")).toEqual("image/png");

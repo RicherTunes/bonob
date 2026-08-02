@@ -364,6 +364,13 @@ export class CoverArtCoordinator {
   private readonly queue: Queued[] = [];
   // Observed upstream slot-hold latency (EWMA, ms). Undefined until the first call settles, so a
   // cold coordinator never rejects on an estimate it has not measured yet.
+  //
+  // The estimator is only ever fed by calls that actually run, and admission control deliberately
+  // gates QUEUEING only - a free slot is always used. Those two facts are what let a degraded
+  // coordinator recover unaided. They rely on slot holds being bounded: getCoverArt passes
+  // SUBSONIC_COVER_ART_HTTP_TIMEOUT_MS, so a stalled upstream still settles and still yields a
+  // sample. A caller that routed an UNBOUNDED task through here could pin every slot, starve the
+  // estimator, and leave the guard shut - so that bound is load-bearing, not just hygiene.
   private latencyEwmaMs: number | undefined;
 
   constructor(opts: CoverArtCoordinatorOptions = {}) {
