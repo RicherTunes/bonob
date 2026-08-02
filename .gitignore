@@ -11,3 +11,5 @@ node_modules
 !.yarn/sdks
 !.yarn/versions
 .pnp.*
+# glm-delegate hands back a copy of each lane diff; it is a delegation artifact, not source.
+.glm-delegate-diff/
