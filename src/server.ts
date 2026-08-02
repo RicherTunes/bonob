@@ -52,7 +52,7 @@ import {
   JWTSmapiLoginTokens,
   SmapiAuthTokens,
 } from "./smapi_auth";
-import { isValidMimeType } from "./utils";
+import { isValidMimeType, sanitizeLogValue } from "./utils";
 
 export const BONOB_ACCESS_TOKEN_HEADER = "bat";
 
@@ -160,25 +160,10 @@ export const redactAccessTokenFromReferrer = (value: string | undefined): string
   }
 };
 
-// Every request-supplied field in an access log is attacker-controlled. A CR/LF inside one lets a
-// client forge whole additional log lines, and a bare quote lets it escape a quoted field - the
-// same defect class morgan 1.11.0 fixed for :remote-user, and which it does NOT fix for :referrer
-// or :user-agent. Escape control characters, the quote, and the escape character itself, so a
-// logged value can never be mistaken for log structure.
-export const sanitizeLogValue = (value: string | undefined): string => {
-  if (!value) return "";
-  let out = "";
-  for (const ch of value) {
-    const code = ch.charCodeAt(0);
-    if (ch === '"') out += '\\"';
-    else if (ch === "\\") out += "\\\\";
-    // C0 and C1 control characters, including the CR/LF that would forge a new log line.
-    else if (code < 0x20 || (code >= 0x7f && code <= 0x9f))
-      out += "\\x" + code.toString(16).padStart(2, "0");
-    else out += ch;
-  }
-  return out;
-};
+// Re-exported so the access-log call sites (and their tests) keep a single obvious import, while
+// the implementation lives in utils.ts - shared with the SMAPI degradation log, which must not
+// import this module.
+export { sanitizeLogValue };
 
 const MORGAN_REDACTED_COMBINED =
   ':remote-addr - :remote-user [:date[clf]] ":method :redacted-url HTTP/:http-version" :status :res[content-length] ":redacted-referrer" ":safe-user-agent"';

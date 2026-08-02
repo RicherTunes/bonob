@@ -756,8 +756,17 @@ function bindSmapiSoapServiceToExpress(
                 }
               }),
               SMAPI_BROWSE_TIMEOUT_MS,
-              searchResult({ count: 0, mediaCollection: [] })
-            ).catch(faultOrFallback(searchResult({ count: 0, mediaCollection: [] }))),
+              searchResult({ count: 0, mediaCollection: [] }),
+              // Named per category, because the whole point is to tell WHICH search degrades. A
+              // category whose backend work outruns the deadline returns an empty result, which in
+              // the Sonos app looks exactly like "nothing matched".
+              `search:${id}`
+            ).catch(
+              faultOrFallback(
+                searchResult({ count: 0, mediaCollection: [] }),
+                `search:${id}`
+              )
+            ),
           getExtendedMetadata: async (
             { id }: { id: string },
             _,
@@ -826,8 +835,11 @@ function bindSmapiSoapServiceToExpress(
               })
               .then(sanitizeXml),
               SMAPI_BROWSE_TIMEOUT_MS,
-              { getExtendedMetadataResult: {} }
-            ).catch(faultOrFallback({ getExtendedMetadataResult: {} })),
+              { getExtendedMetadataResult: {} },
+              `getExtendedMetadata:${id}`
+            ).catch(
+              faultOrFallback({ getExtendedMetadataResult: {} }, `getExtendedMetadata:${id}`)
+            ),
           getExtendedMetadataText: async (
             { id, type: textType }: { id: string; type: string },
             _,
@@ -852,8 +864,14 @@ function bindSmapiSoapServiceToExpress(
                 })
                 .then(sanitizeXml),
               SMAPI_BROWSE_TIMEOUT_MS,
-              { getExtendedMetadataTextResult: "" }
-            ).catch(faultOrFallback({ getExtendedMetadataTextResult: "" })),
+              { getExtendedMetadataTextResult: "" },
+              `getExtendedMetadataText:${textType}`
+            ).catch(
+              faultOrFallback(
+                { getExtendedMetadataTextResult: "" },
+                `getExtendedMetadataText:${textType}`
+              )
+            ),
           getMetadata: async (
             {
               id,
@@ -1442,8 +1460,11 @@ function bindSmapiSoapServiceToExpress(
                 }
               }),
               SMAPI_BROWSE_TIMEOUT_MS,
-              browseTimeoutFallback
-            ).catch(faultOrFallback(browseTimeoutFallback))
+              browseTimeoutFallback,
+              // This is the degradation the user sees as a tile stuck on "Loading, please try
+              // again" - naming the browsed id is what makes it actionable.
+              `getMetadata:${id}`
+            ).catch(faultOrFallback(browseTimeoutFallback, `getMetadata:${id}`))
           }
           ,
           createContainer: async (
