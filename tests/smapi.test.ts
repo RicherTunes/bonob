@@ -2282,7 +2282,7 @@ describe("wsdl api", () => {
                       mediaCollection: artistSummaries.map((it) => ({
                         itemType: "artist",
                         id: `artist:${it.id}`,
-                        artistId: it.id,
+                        artistId: `artist:${it.id}`,
                         title: it.name,
                         albumArtURI: coverArtURI(
                           bonobUrlWithAccessToken,
@@ -2327,7 +2327,7 @@ describe("wsdl api", () => {
                       mediaCollection: someArtists.map((it) => ({
                         itemType: "artist",
                         id: `artist:${it.id}`,
-                        artistId: it.id,
+                        artistId: `artist:${it.id}`,
                         title: it.name,
                         albumArtURI: coverArtURI(
                           bonobUrlWithAccessToken,
@@ -2388,7 +2388,7 @@ describe("wsdl api", () => {
                         ].map((it) => ({
                           itemType: "artist",
                           id: `artist:${it.id}`,
-                          artistId: it.id,
+                          artistId: `artist:${it.id}`,
                           title: it.name,
                           albumArtURI: coverArtURI(
                             bonobUrlWithAccessToken,
@@ -2417,7 +2417,7 @@ describe("wsdl api", () => {
                           (it) => ({
                             itemType: "artist",
                             id: `artist:${it.id}`,
-                            artistId: it.id,
+                            artistId: `artist:${it.id}`,
                             title: it.name,
                             albumArtURI: coverArtURI(
                               bonobUrlWithAccessToken,
@@ -3653,7 +3653,7 @@ describe("wsdl api", () => {
                       mediaCollection: {
                         itemType: "artist",
                         id: `artist:${artist.id}`,
-                        artistId: artist.id,
+                        artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
                       },
@@ -3685,7 +3685,7 @@ describe("wsdl api", () => {
                       mediaCollection: {
                         itemType: "artist",
                         id: `artist:${artist.id}`,
-                        artistId: artist.id,
+                        artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
                       }
@@ -3777,7 +3777,7 @@ describe("wsdl api", () => {
                       mediaCollection: {
                         itemType: "artist",
                         id: `artist:${artist.id}`,
-                        artistId: artist.id,
+                        artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
                       }

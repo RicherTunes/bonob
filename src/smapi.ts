@@ -456,7 +456,14 @@ export { MAX_ALBUMS_FLAT };
 export const artist = (bonobUrl: URLBuilder, artist: ArtistSummary) => ({
   itemType: "artist",
   id: `artist:${artist.id}`,
-  artistId: artist.id,
+  // The WSDL types artistId as tns:id - a browsable container id, not a backend key. album()
+  // already emits the prefixed form (`artist:<id>`) and that is the shape Sonos demonstrably
+  // accepts; this emitted the RAW Navidrome id, so an artist tile advertised an artistId that
+  // resolves to nothing. Whether that is what makes the Sonos app drop artist search results is
+  // unproven - the tiles are returned correctly at the SOAP layer either way - but an id-typed
+  // field carrying a non-id is wrong regardless, and the two tile builders disagreeing is the kind
+  // of asymmetry that hides a client-side bug.
+  artistId: `artist:${artist.id}`,
   title: artist.name,
   albumArtURI: albumArtURI(coverArtURI(bonobUrl, { coverArt: artist.image }).href()),
 });
