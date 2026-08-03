@@ -1,4 +1,5 @@
 import { Clock, SystemClock } from "./clock";
+import logger from "./logger";
 
 type Entry = {
   at: number; // completion time of the most recent successful fetch (start time until settled)
@@ -122,7 +123,15 @@ export class SwrCache {
   // any in-flight one and refreshes if stale) and swallow errors. Used to pre-warm a slow
   // list (e.g. getArtists) on connect so the first browse of a session isn't cold.
   warm<T>(key: string, fetch: () => Promise<T>): void {
-    void this.get(key, fetch).catch(() => {});
+    // Swallowing the REJECTION is required - an unhandled rejection here would crash the process.
+    // Swallowing the INFORMATION is not. The album-index build runs through warm(), so a build that
+    // threw left no trace at all: no error, no warning, and its .tmp cleaned up behind it. Observed
+    // live - a rebuild started, died, and the only evidence was a missing snapshot eleven minutes
+    // later. A background job that fails invisibly cannot be operated.
+    void this.get(key, fetch).catch((e) => {
+      const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      logger.warn(`Background warm of '${key}' failed: ${reason}`);
+    });
   }
 
   // Non-blocking read: return the entry's (already resolved) promise ONLY if a value has

@@ -1,6 +1,7 @@
 import dayjs from "dayjs";
 import { FixedClock } from "../src/clock";
 import { SwrCache } from "../src/swr_cache";
+import logger from "../src/logger";
 
 // A fetch whose resolution/rejection the test controls, and that counts calls.
 function deferredFetcher<T>() {
@@ -249,6 +250,30 @@ describe("SwrCache", () => {
     const got = cache.get("k", f.fetch); // evicted -> refetch
     f.resolve(1, "ok");
     expect(await got).toBe("ok");
+  });
+
+  it("warm() LOGS a failed background fetch instead of swallowing it", async () => {
+    // warm() was `void this.get(key, fetch).catch(() => {})`. The album index build runs through it,
+    // so a build that threw left NO trace anywhere: no error, no warning, no partial file. Observed
+    // live - a rebuild started, died, removed its .tmp, and the only evidence was the ABSENCE of a
+    // snapshot 11 minutes later. A background job that can fail invisibly is a job you cannot
+    // operate. Swallowing the rejection is right (it must not become an unhandled rejection);
+    // swallowing the INFORMATION is not.
+    const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      const cache = new SwrCache(new FixedClock(at), 60_000);
+      cache.warm("albumIndex:v3:someone", () =>
+        Promise.reject(new Error("Inconsistent album index scan: duplicate album id"))
+      );
+      await flush();
+
+      expect(warn).toHaveBeenCalled();
+      const msg = warn.mock.calls.map((c) => String(c[0])).join("\n");
+      expect(msg).toContain("albumIndex:v3:someone");
+      expect(msg).toContain("Inconsistent album index scan");
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps the NEWEST persisted entries when the store has more than maxEntries", async () => {
