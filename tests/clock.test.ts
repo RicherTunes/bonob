@@ -3,7 +3,7 @@ import dayjs, { Dayjs } from "dayjs";
 import timezone from "dayjs/plugin/timezone";
 dayjs.extend(timezone);
 
-import { Clock, isChristmas, isCNY, isCNY_2022, isCNY_2023, isCNY_2024, isCNY_2025, isHalloween, isHoli, isMay4 } from "../src/clock";
+import { Clock, isChristmas, isCNY, isCNY_2022, isCNY_2023, isCNY_2024, isCNY_2025, isHalloween, isHoli, isMay4, SystemClock } from "../src/clock";
 
 
 
@@ -83,3 +83,43 @@ describeFixedDateEvent("cny 2022", ["2022-02-01"], isCNY_2022);
 describeFixedDateEvent("cny 2023", ["2023/01/22"], isCNY_2023);
 describeFixedDateEvent("cny 2024", ["2024/02/10"], isCNY_2024);
 describeFixedDateEvent("cny 2025", ["2025/02/29"], isCNY_2025);
+
+// The holiday predicates default `clock` to SystemClock. Driving them with no argument is the only
+// way to exercise that default; patching SystemClock.now makes the result deterministic and pins
+// the default to SystemClock specifically (a mutation that drops the default or points it elsewhere
+// turns these red).
+describe("default clock (SystemClock)", () => {
+  let realNow: () => Dayjs;
+  beforeEach(() => {
+    realNow = SystemClock.now;
+  });
+  afterEach(() => {
+    SystemClock.now = realNow;
+  });
+
+  // covers src/clock.ts line 6 default-arg (fixedDateMonthEvent -> isChristmas)
+  it("isChristmas() with no clock reads SystemClock.now()", () => {
+    SystemClock.now = () => dayjs("2021-12-25T03:00:00");
+    expect(isChristmas()).toEqual(true);
+    SystemClock.now = () => dayjs("2021-07-04T03:00:00");
+    expect(isChristmas()).toEqual(false);
+  });
+
+  // covers src/clock.ts line 13 default-arg (fixedDateEvent -> isCNY_2022)
+  it("isCNY_2022() with no clock reads SystemClock.now()", () => {
+    SystemClock.now = () => dayjs("2022-02-01T12:00:00");
+    expect(isCNY_2022()).toEqual(true);
+    SystemClock.now = () => dayjs("2022-02-02T12:00:00");
+    expect(isCNY_2022()).toEqual(false);
+  });
+
+  // covers src/clock.ts line 19 default-arg (anyOf -> isCNY / isHoli)
+  it("isCNY() and isHoli() with no clock read SystemClock.now()", () => {
+    SystemClock.now = () => dayjs("2022-02-01T00:00:00");
+    expect(isCNY()).toEqual(true);
+    expect(isHoli()).toEqual(false);
+    SystemClock.now = () => dayjs("2022-03-18T00:00:00");
+    expect(isCNY()).toEqual(false);
+    expect(isHoli()).toEqual(true);
+  });
+});
