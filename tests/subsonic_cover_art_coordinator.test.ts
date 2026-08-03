@@ -780,6 +780,60 @@ describe("CoverArtCoordinator admission control - adversarial edges", () => {
       jest.useRealTimers();
     }
   });
+
+  it("discards a non-finite / negative latency sample so an NTP step or VM resume cannot corrupt the estimate", async () => {
+    // recordLatency guards against a clock that moved mid-call (NTP step / VM resume): a negative
+    // or non-finite delta says nothing about the upstream and must be dropped rather than clamped
+    // (clamping silently biased the median downward and quietly disabled the guard). We prove the
+    // guard by counting samples: seed FOUR valid 2000ms samples (one short of MIN_SAMPLES=5 so the
+    // estimator is still dormant), then a task whose record() observes a NEGATIVE delta. With the
+    // guard the negative sample is discarded and the estimator stays dormant -> a queued request
+    // is ADMITTED. A mutant that drops the `sampleMs < 0` (or `!Number.isFinite`) clause keeps the
+    // negative sample as the 5th, engages the estimator at median 2000ms, and the queued request is
+    // REJECTED with CoverArtBusyError - the assertion below flips and the test fails.
+    jest.useFakeTimers();
+    try {
+      const queueTimeoutMs = 1000;
+      const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 64, queueTimeoutMs });
+
+      // Four valid 2000ms samples (just under COVER_ART_LATENCY_MIN_SAMPLES = 5).
+      await seedSteadyLatency(coord, 2000, 4);
+
+      // Override performance.now for exactly the two calls startTask makes for this one task:
+      // startedAt = 2000 (phase 1), record = 1000 (phase 2) -> delta -1000.
+      const realPerfNow = jest.requireActual("perf_hooks").performance.now.bind(
+        jest.requireActual("perf_hooks").performance
+      );
+      let phase = 0;
+      const spy = jest.spyOn(performance, "now").mockImplementation(() => {
+        phase += 1;
+        if (phase === 1) return 2000;
+        if (phase === 2) return 1000;
+        return realPerfNow();
+      });
+      await coord.run(coverArtKey("u", "p", "neg-sample", 1), () =>
+        Promise.resolve(Buffer.from("neg"))
+      );
+      spy.mockRestore();
+
+      // Hold the only slot, then queue. Estimator is dormant (4 valid samples < 5) so admission
+      // must let the queued request through.
+      const held = hold(coord, "held");
+      const queued = coord.run(coverArtKey("u", "p", "after-neg", 1), () =>
+        Promise.resolve(Buffer.from("q"))
+      );
+      const state = await settledState(queued);
+      expect(state.rejected).toBe(false);
+
+      // Drain so the loop ends cleanly.
+      held.release();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe("headerString (axios >= 1.19 header values are not plain strings)", () => {

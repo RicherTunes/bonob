@@ -49,6 +49,9 @@ import {
   asToken,
   parseToken,
   BROWSER_HEADERS,
+  albumSummaryFromSong,
+  CoverArtBusyError,
+  DEFAULT_MAX_INDEX_SCAN_ALBUMS,
 } from "../src/subsonic";
 
 import { promises as dnsPromises } from "dns";
@@ -3078,3 +3081,441 @@ describe("Subsonic: album index scan aborts (and leaves no .tmp) on an inconsist
 
 // Minimal credentials stub for the snapshot-abort test (its assertions don't depend on auth).
 const credentialsStub = () => ({ username: "snap-user", password: "snap-pass" });
+
+// =============================================================================
+// Loop 2: residual branch/line coverage on src/subsonic.ts.
+// Each test either (a) kills a specific mutant on a previously-uncovered branch/line, or (b)
+// documents a branch proven unreachable (see the dead-branch ledger in the loop-2 report). The
+// shared mock infrastructure mirrors the "Subsonic: low-level error paths" block above so the new
+// cases stay self-contained.
+// =============================================================================
+describe("Subsonic: residual coverage (loop 2)", () => {
+  const url = new URLBuilder("http://127.0.0.22:4567/ctx");
+  const username = `cov2-${uuid()}`;
+  const password = `cov2-${uuid()}`;
+  const credentials = { username, password };
+  const salt = "saltysalty";
+  const mockRandomstring = jest.fn();
+  const mockGET = jest.fn();
+  const mockPOST = jest.fn();
+  const authParams = {
+    u: username,
+    v: "1.16.1",
+    c: "bonob",
+    t: t(password, salt),
+    s: salt,
+  };
+  const authParamsPlusJson = { ...authParams, f: "json" };
+  const headers = { "User-Agent": "bonob" };
+
+  const okStatus = (data: any) => ({ status: 200, data });
+  // subsonic-response envelope with body spread; omits inner fields when `body` does not set them
+  // (used to drive the `|| []` defensive arms where the server response genuinely lacks a field).
+  const envelope = (body: any = {}) => ({
+    "subsonic-response": {
+      status: "ok",
+      version: "1.16.1",
+      type: "subsonic",
+      serverVersion: "0.45.1",
+      ...body,
+    },
+  });
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+    (random.generateRandomString as jest.Mock) = mockRandomstring;
+    axios.get = mockGET;
+    axios.post = mockPOST;
+    mockRandomstring.mockReturnValue(salt);
+  });
+
+  describe("SSRF guard: IPv4 private-range predicates (loop 1 missed short-circuit arms)", () => {
+    // Each address lands on a different `||` clause of isPrivateIPv4's return expression. Loop 1
+    // covered only 127/10/169.254/192.168/172.16; the 0.*, 100.64/10 (CGNAT) and >=224 arms were
+    // never taken. Each boundary test kills the mutant that flips its comparisons.
+    it("blocks 0.0.0.0 (a===0 arm)", () => {
+      expect(isSafeExternalImageUrl("http://0.0.0.0/x.png")).toBe(false);
+    });
+
+    it("blocks 100.64.0.1 and ONLY the 100.64/10 CGNAT range (boundary both sides)", () => {
+      // inside the range -> blocked
+      expect(isSafeExternalImageUrl("http://100.64.0.1/x.png")).toBe(false);
+      expect(isSafeExternalImageUrl("http://100.127.0.1/x.png")).toBe(false);
+      // just outside either edge -> allowed
+      expect(isSafeExternalImageUrl("http://100.63.0.1/x.png")).toBe(true);
+      expect(isSafeExternalImageUrl("http://100.128.0.1/x.png")).toBe(true);
+      expect(isSafeExternalImageUrl("http://100.0.0.1/x.png")).toBe(true);
+    });
+
+    it("blocks multicast/reserved (a>=224 arm): 224.0.0.1 and 239.255.255.250", () => {
+      expect(isSafeExternalImageUrl("http://224.0.0.1/x.png")).toBe(false);
+      expect(isSafeExternalImageUrl("http://239.255.255.250/x.png")).toBe(false);
+      expect(isSafeExternalImageUrl("http://255.255.255.255/x.png")).toBe(false);
+    });
+  });
+
+  describe("SSRF guard: IPv6 unspecified address (::)", () => {
+    // expandIPv6 short-circuits "::" to eight zero hextets; isPrivateIPv6 then matches the
+    // ":: or ::1" arm. http://[::]/ must be blocked. Mutating the ::1/:: arm in isPrivateIPv6 to
+    // return false makes the unspecified address leak as safe.
+    it("blocks http://[::]/ (expandIPv6 :: early return -> isPrivateIPv6 zero-hextet arm)", () => {
+      expect(isSafeExternalImageUrl("http://[::]/x.png")).toBe(false);
+    });
+  });
+
+  describe("ping: TE.tryCatch error arm + falsy-status message", () => {
+    it("maps a network/transport rejection to AuthFailure(String(e))", async () => {
+      // Covers the (e) => new AuthFailure(String(e)) reject arm of ping's TE.tryCatch. A mutant
+      // that drops the error mapper (or returns a fixed AuthFailure) breaks the exact-string match.
+      mockGET.mockImplementationOnce(() => Promise.reject(new Error("connect ECONNREFUSED")));
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).ping(credentials)();
+      expect(result).toEqual(E.left(new AuthFailure("Error: connect ECONNREFUSED")));
+    });
+
+    it("maps a non-200 GET with a FALSY status onto the 'no!' status-message arm", async () => {
+      // status=0 is falsy, so `${response.status || "no!"}` yields "no!". Exercises both the
+      // getJSON non-200 throw arm and ping's AuthFailure mapper.
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve({ status: 0, data: envelope({}) })
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).ping(credentials)();
+      expect(result).toEqual(E.left(new AuthFailure("Subsonic failed with a no! status")));
+    });
+  });
+
+  describe("POST non-200 with falsy status", () => {
+    it("rejects with 'Subsonic POST failed with a no! status' (the POST-side status || 'no!' arm)", async () => {
+      // Mirrors the GET-side test above but for `post`. postJSON's only internal caller is
+      // getTranscodeDecision, so drive it through there.
+      mockPOST.mockImplementationOnce(() => Promise.resolve({ status: 0, data: {} }));
+      await expect(
+        new Subsonic(url, NO_CUSTOM_PLAYERS).getTranscodeDecision(
+          credentials,
+          "media-1",
+          SONOS_CLIENT_INFO
+        )
+      ).rejects.toEqual("Subsonic POST failed with a no! status");
+    });
+  });
+
+  describe("albumSummaryFromSong: || '' fallback arms", () => {
+    it("returns id='' and name='' when song has no albumId/album", () => {
+      // Covers both `song.albumId || ""` and `song.album || ""` fallbacks at once. Mutant that
+      // drops either `|| ""` leaves id/name as undefined and fails the strict equality.
+      const summary = albumSummaryFromSong({} as any);
+      expect(summary.id).toBe("");
+      expect(summary.name).toBe("");
+    });
+
+    it("preserves a present albumId and album", () => {
+      const summary = albumSummaryFromSong({
+        albumId: "al-1",
+        album: "Title",
+      } as any);
+      expect(summary.id).toBe("al-1");
+      expect(summary.name).toBe("Title");
+    });
+  });
+
+  describe("CoverArtBusyError default construction", () => {
+    // The constructor's default-message arm (`message = "cover art coordinator busy"`) is never
+    // used internally (every internal `new CoverArtBusyError(...)` passes an explicit message), so
+    // the only way to cover the arm is to construct one directly. A mutant changing the default
+    // breaks the message assertion.
+    it("default-constructs with the documented message, name and prototype", () => {
+      const err = new CoverArtBusyError();
+      expect(err.message).toBe("cover art coordinator busy");
+      expect(err.name).toBe("CoverArtBusyError");
+      expect(err).toBeInstanceOf(CoverArtBusyError);
+      expect(err).toBeInstanceOf(Error);
+    });
+  });
+
+  describe("DEFAULT_MAX_INDEX_SCAN_ALBUMS env override (IIFE positive-integer arm)", () => {
+    // The IIFE reads BNB_MAX_INDEX_SCAN_ALBUMS once at module load. The default path (env unset ->
+    // 20_000_000) runs at first import, but the positive-integer arm (`raw > 0 ? raw : default`)
+    // never does. We re-import the module under an isolateModules scope so the IIFE re-runs against
+    // a controlled env. A mutant that drops the `raw > 0` guard (or the IIFE) breaks the assertion.
+    it("honours a positive-integer BNB_MAX_INDEX_SCAN_ALBUMS", () => {
+      const orig = process.env.BNB_MAX_INDEX_SCAN_ALBUMS;
+      process.env.BNB_MAX_INDEX_SCAN_ALBUMS = "42";
+      try {
+        jest.isolateModules(() => {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const mod = require("../src/subsonic") as typeof import("../src/subsonic");
+          expect(mod.DEFAULT_MAX_INDEX_SCAN_ALBUMS).toBe(42);
+        });
+      } finally {
+        if (orig === undefined) delete process.env.BNB_MAX_INDEX_SCAN_ALBUMS;
+        else process.env.BNB_MAX_INDEX_SCAN_ALBUMS = orig;
+      }
+    });
+
+    it("rejects a non-positive/non-integer override and falls back to the documented default", () => {
+      // Covers the `&& raw > 0` short-circuit on a parseable-but-invalid value, proving the guard
+      // is `raw > 0`, not just `Number.isInteger(raw)`.
+      expect(DEFAULT_MAX_INDEX_SCAN_ALBUMS).toBe(20_000_000);
+      const orig = process.env.BNB_MAX_INDEX_SCAN_ALBUMS;
+      process.env.BNB_MAX_INDEX_SCAN_ALBUMS = "-5";
+      try {
+        jest.isolateModules(() => {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const mod = require("../src/subsonic") as typeof import("../src/subsonic");
+          expect(mod.DEFAULT_MAX_INDEX_SCAN_ALBUMS).toBe(20_000_000);
+        });
+      } finally {
+        if (orig === undefined) delete process.env.BNB_MAX_INDEX_SCAN_ALBUMS;
+        else process.env.BNB_MAX_INDEX_SCAN_ALBUMS = orig;
+      }
+    });
+  });
+
+  describe("buildAlbumIndex: empty page in-loop + scanAlbums missing-album arm", () => {
+    // Two related residuals: scanAlbums' `(r.albumList2.album || [])` arm (when the server omits
+    // the `album` field entirely), and the loop's `if (page.length === 0) { complete = true; break; }`
+    // which fires on a mid-scan empty page. We exercise both with one mock that returns an envelope
+    // lacking `album` on the first page: scanAlbums maps it to [], the loop sees length 0, sets
+    // complete, breaks, and the scan succeeds with total=0.
+    it("completes cleanly when the catalog's first page omits the `album` field entirely", async () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const indexCache = new SwrCache(clock, 60_000);
+      const sub = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        axiosImageFetcher,
+        SwrCache.disabled(),
+        indexCache
+      );
+      mockGET.mockImplementation(() =>
+        Promise.resolve(okStatus(envelope({ albumList2: {} })))
+      );
+      const idx = await sub.getAlbumIndex(credentials);
+      expect(idx.total).toBe(0);
+      expect(idx.buckets).toEqual([]);
+      expect(idx.years).toEqual([]);
+    });
+  });
+
+  describe("buildAlbumIndex: year-less albums (the `if (album.year)` guard)", () => {
+    // A catalog with a mix of year-bearing and year-less records must collect only the valid years.
+    // Mutating `if (album.year) yearsSet.add(album.year)` to drop the guard lets `undefined` into
+    // the set, corrupting `idx.years`.
+    it("skips records with no year when collecting distinct years", async () => {
+      const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+      const indexCache = new SwrCache(clock, 60_000);
+      const sub = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        axiosImageFetcher,
+        SwrCache.disabled(),
+        indexCache
+      );
+      const artist = anArtist();
+      const page: [Artist, AlbumSummary][] = [
+        [artist, anAlbumSummary({ id: "a-with-year", name: "Alpha", year: "2020" })],
+        [artist, anAlbumSummary({ id: "a-no-year", name: "Beta", year: undefined })],
+      ];
+      mockGET.mockImplementation(() =>
+        Promise.resolve(
+          okStatus(
+            envelope({
+              albumList2: {
+                album: page.map(([a, al]) => ({
+                  id: al.id,
+                  name: al.name,
+                  year: al.year,
+                  artist: a.name,
+                  artistId: a.id,
+                })),
+              },
+            })
+          )
+        )
+      );
+      const idx = await sub.getAlbumIndex(credentials);
+      expect(idx.total).toBe(2);
+      // toStrictEqual (not toEqual): jest's toEqual ignores `undefined` array elements, so a mutant
+      // that drops the `if (album.year)` guard and lets `undefined` into the set would slip past.
+      expect(idx.years).toStrictEqual(["2020"]);
+    });
+  });
+
+  // -----------------------------------------------------------------------------
+  // Defensive `|| []` / `|| undefined` arms on Subsonic response parsers. Loop 1 covered each
+  // method's happy path (server returns an array, possibly empty) but never the case where the
+  // server OMITS the field entirely - which is the exact arm the `|| []` guards. Each test below
+  // asserts the method returns an empty array (not a TypeError) when the field is absent, and a
+  // mutant that drops the `|| []` makes the `.map(...)`/`.filter(...)` throw on undefined.
+  // -----------------------------------------------------------------------------
+  describe("Subsonic response parsers: missing-collection field arms", () => {
+    it("getGenres: returns [] when `genres.genre` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ genres: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getGenres(credentials);
+      expect(result).toEqual([]);
+      expect(axios.get).toHaveBeenCalledWith(
+        url.append({ pathname: "/rest/getGenres" }).href(),
+        { params: asURLSearchParams(authParamsPlusJson), headers }
+      );
+    });
+
+    it("getArtistInfo: returns similarArtist: [] when the field is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ artistInfo2: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getArtistInfo(
+        credentials,
+        "artist-1"
+      );
+      expect(result.similarArtist).toEqual([]);
+      expect(axios.get).toHaveBeenCalledWith(
+        url.append({ pathname: "/rest/getArtistInfo2" }).href(),
+        {
+          params: asURLSearchParams({
+            ...authParamsPlusJson,
+            id: "artist-1",
+            count: 50,
+            includeNotPresent: true,
+          }),
+          headers,
+        }
+      );
+    });
+
+    it("getArtist: returns albums: [] when `artist.album` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(
+          okStatus(envelope({ artist: { id: "artist-1", name: "Name" } }))
+        )
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getArtist(
+        credentials,
+        "artist-1"
+      );
+      expect(result.albums).toEqual([]);
+      expect(result.id).toBe("artist-1");
+      expect(result.name).toBe("Name");
+    });
+
+    it("search3: returns empty arrays when artist/album/song are all absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ searchResult3: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).search3(
+        credentials,
+        { query: "anything" }
+      );
+      expect(result).toEqual({ artists: [], albums: [], songs: [] });
+    });
+
+    it("getAlbumList2 (volatile type): returns [] when `albumList2.album` is absent", async () => {
+      // `random` is in VOLATILE_ALBUM_TYPES, so getAlbumList2 calls fetchAlbumListPage directly
+      // (bypassing the cache) and exercises the `(response.albumList2.album || [])` arm at L2057.
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ albumList2: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getAlbumList2(credentials, {
+        type: "random",
+        _index: 0,
+        _count: 50,
+      });
+      expect(result.results).toEqual([]);
+    });
+
+    it("playlists: returns [] when `playlists.playlist` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ playlists: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).playlists(credentials);
+      expect(result).toEqual([]);
+    });
+
+    it("getSimilarSongs2: returns [] when `similarSongs2.song` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ similarSongs2: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getSimilarSongs2(
+        credentials,
+        "song-1"
+      );
+      expect(result).toEqual([]);
+    });
+
+    it("getTopSongs: returns [] when `topSongs.song` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ topSongs: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getTopSongs(
+        credentials,
+        "some artist"
+      );
+      expect(result).toEqual([]);
+    });
+
+    it("getInternetRadioStations: returns [] when `internetRadioStations.internetRadioStation` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(okStatus(envelope({ internetRadioStations: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getInternetRadioStations(
+        credentials
+      );
+      expect(result).toEqual([]);
+    });
+
+    it("getOpenSubsonicExtensions: returns [] when `openSubsonicExtensions` is absent", async () => {
+      mockGET.mockImplementationOnce(() => Promise.resolve(okStatus(envelope({}))));
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getOpenSubsonicExtensions(
+        credentials
+      );
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe("playlist: missing entry field arm", () => {
+    // The `playlist.entry || []` guard. A playlist response with NO entry list must yield an empty
+    // entries array (not a TypeError on `.map`).
+    it("returns entries: [] when `playlist.entry` is absent", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(
+          okStatus(
+            envelope({
+              playlist: { id: "pl-1", name: "Mix" },
+            })
+          )
+        )
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).playlist(
+        credentials,
+        "pl-1"
+      );
+      expect(result.entries).toEqual([]);
+      expect(result.id).toBe("pl-1");
+      expect(result.name).toBe("Mix");
+    });
+  });
+
+  describe("updatePlaylist: default-changes arm", () => {
+    // The optional 3rd parameter defaults to {}. Every production caller (subsonic_music_library)
+    // passes an explicit change set, so the default arm is only reachable by calling updatePlaylist
+    // directly with no 3rd arg. Mutating the default to inject a key (e.g. = { songIdToAdd: "X" })
+    // would surface in the request params.
+    it("issues an updatePlaylist request with only playlistId when no changes are supplied", async () => {
+      mockGET.mockImplementationOnce(() => Promise.resolve(okStatus(envelope({}))));
+
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).updatePlaylist(
+        credentials,
+        "pl-1"
+      );
+      expect(result).toBe(true);
+      expect(axios.get).toHaveBeenCalledWith(
+        url.append({ pathname: "/rest/updatePlaylist" }).href(),
+        {
+          params: asURLSearchParams({ ...authParamsPlusJson, playlistId: "pl-1" }),
+          headers,
+        }
+      );
+    });
+  });
+});
