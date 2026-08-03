@@ -408,6 +408,82 @@ describe("SwrCache", () => {
       jest.useRealTimers();
     }
   });
+
+  // peek() honours the same hard stale cap as get(): past maxStaleMs it reports nothing, so a
+  // caller that falls back until warm does not consume ancient data. A mutant that loosens the
+  // check (>= -> <) makes peek return the stale entry -> red.
+  it("peek() returns undefined once the settled entry is past maxStaleMs (and never fetches)", async () => {
+    const clock = new FixedClock(at);
+    const cache = new SwrCache(clock, 60_000, { maxStaleMs: 5 * 60_000 });
+    const f = deferredFetcher<string>();
+    await settle(cache, "k", f, "v");
+    expect(cache.peek<string>("k")).toBeDefined();
+    clock.add(5, "m"); // exactly past maxStale (5 * 60_000ms)
+    expect(cache.peek("k")).toBeUndefined();
+    expect(f.calls).toBe(1); // peek itself fetched nothing
+  });
+
+  // disabled() is a factory that must produce a TTL=0 cache (always calls through). A mutant that
+  // changes the 0 -> e.g. 60_000 makes the second get a cache hit (f.calls stays 1) -> red.
+  it("SwrCache.disabled() returns a pass-through cache (ttl<=0)", async () => {
+    const cache = SwrCache.disabled();
+    const f = deferredFetcher<number>();
+    const p1 = cache.get("k", f.fetch);
+    f.resolve(0, 1);
+    expect(await p1).toBe(1);
+    const p2 = cache.get("k", f.fetch);
+    f.resolve(1, 2);
+    expect(await p2).toBe(2);
+    expect(f.calls).toBe(2);
+  });
+
+  // A cold fetch that resolves AFTER its entry was LRU-evicted must NOT be persisted over a newer
+  // entry's store slot. The identity guard (line 183) is the only thing preventing that; drop it
+  // and 'a' shows up in the store even though it was evicted before it resolved.
+  it("does not persist a cold fetch that resolves after its entry was LRU-evicted", async () => {
+    const saved: Array<{ key: string; value: unknown }> = [];
+    const store = {
+      load: () => [],
+      save: (key: string, _at2: number, value: unknown) =>
+        saved.push({ key, value }),
+    };
+    const cache = new SwrCache(new FixedClock(at), 60_000, {
+      maxEntries: 1,
+      store,
+    });
+    const fa = deferredFetcher<string>();
+    const pa = cache.get("a", fa.fetch); // entry A in flight
+    // Evict A by cold-fetching B (maxEntries:1 -> oldest 'a' evicted)
+    const fb = deferredFetcher<string>();
+    const pb = cache.get("b", fb.fetch);
+    fb.resolve(0, "B");
+    expect(await pb).toBe("B");
+    // A resolves late; its success must be dropped (not persisted).
+    fa.resolve(0, "A");
+    await pa;
+    await flush();
+    expect(saved.find((e) => e.key === "a")).toBeUndefined();
+    expect(saved.find((e) => e.key === "b")).toBeDefined();
+  });
+
+  // Symmetric to the above on the REJECTION side: a cold fetch that rejects after a NEW entry has
+  // taken its key must not delete the replacement. The catch's identity guard (line 190) is what
+  // prevents that; drop it and the late rejection of A evicts A2.
+  it("does not delete a replacement entry when an earlier cold fetch under the same key later rejects", async () => {
+    const cache = new SwrCache(new FixedClock(at), 60_000);
+    const fa = deferredFetcher<string>();
+    const pa = cache.get("a", fa.fetch); // entry A in flight
+    cache.invalidate("a"); // drop A
+    const fb = deferredFetcher<string>();
+    const pb = cache.get("a", fb.fetch); // entry A2 now lives under 'a'
+    fb.resolve(0, "A2");
+    expect(await pb).toBe("A2");
+    fa.reject(0, new Error("A failed")); // A rejects late; catch must spare A2
+    await pa.catch(() => {}); // swallow the original caller's rejection
+    await flush();
+    expect(cache.peek<string>("a")).toBeDefined();
+    expect(await cache.peek<string>("a")).toBe("A2");
+  });
 });
 
 // helper: get + settle the just-issued fetch to a value
