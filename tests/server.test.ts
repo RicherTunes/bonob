@@ -2422,3 +2422,345 @@ describe("server", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Coverage extensions: mutation-killing tests for the routes/branches the
+// parametrized suite above never reaches. Each test names the mutation it kills.
+// ---------------------------------------------------------------------------
+
+describe("server (coverage extensions)", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+  });
+
+  describe("redactAccessTokenFromUrl regex fallback", () => {
+    // Mutating away the catch (or its regex) either crashes the access logger or leaks the token.
+    it("masks a bat token in a value new URL() refuses to parse, rather than throwing", () => {
+      // `new URL("http://[invalid?...", base)` throws TypeError -> the catch backstop runs and the
+      // regex must still redact any ?bat= token.
+      const redacted = redactAccessTokenFromUrl(
+        "http://[invalid?bat=TOPSECRET"
+      );
+      expect(redacted).not.toContain("TOPSECRET");
+      expect(redacted).toContain(`${BONOB_ACCESS_TOKEN_HEADER}=*****`);
+    });
+  });
+
+  describe("access logging (logRequests: true)", () => {
+    // Morgan writes one access-log line per request to process.stdout on response finish; capture
+    // that stream and assert what the custom :redacted-url / :redacted-referrer / :safe-user-agent
+    // tokens produced. Mutating any token to its raw morgan counterpart leaks the token or quote.
+    it("writes one line per request, masking the bat token in the request line AND the referrer, and sanitizing the user-agent (both referer and referrer spellings)", async () => {
+      const chunks: string[] = [];
+      const stdout = jest
+        .spyOn(process.stdout, "write")
+        .mockImplementation(((chunk: string | Uint8Array) => {
+          chunks.push(
+            typeof chunk === "string" ? chunk : Buffer.from(chunk).toString()
+          );
+          return true;
+        }) as any);
+      try {
+        const app = makeServer(
+          SONOS_DISABLED,
+          aService(),
+          url("http://localhost:1234"),
+          new InMemoryMusicService(),
+          { logRequests: true }
+        );
+        const token = "TOPSECRET-LOG-TOKEN-4242";
+        // A user-agent carrying a literal double-quote; sanitizeLogValue must escape it to \",
+        // otherwise the quoted morgan field would break (and the quote escapes validation).
+        const forgedUA = 'Sonos"quoted"';
+
+        // request 1: referer header carries the token back; user-agent carries the quote.
+        await request(app)
+          .get(`/about?${BONOB_ACCESS_TOKEN_HEADER}=${token}`)
+          .set("referer", `http://localhost:1234/login?${BONOB_ACCESS_TOKEN_HEADER}=${token}`)
+          .set("user-agent", forgedUA);
+
+        // request 2: no Referer header, only the legacy Referrer spelling (the `??` fallback).
+        await request(app)
+          .get(`/about?${BONOB_ACCESS_TOKEN_HEADER}=${token}`)
+          .set("referrer", `http://localhost:1234/login?${BONOB_ACCESS_TOKEN_HEADER}=${token}`);
+
+        // Morgan writes on res 'finish'; let any queued microtasks drain before reading.
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+
+        const logged = chunks.join("");
+
+        // The request-line token must be masked in BOTH log entries.
+        expect(
+          logged.split(`/about?${BONOB_ACCESS_TOKEN_HEADER}=*****`).length - 1
+        ).toBe(2);
+        // The referrer token must be masked too (the point of :redacted-referrer), once per request,
+        // regardless of whether it arrived via the referer or referrer spelling.
+        expect(
+          logged.split(`login?${BONOB_ACCESS_TOKEN_HEADER}=*****`).length - 1
+        ).toBe(2);
+        // The raw token must never appear in the access log.
+        expect(logged).not.toContain(token);
+        // Two requests -> two access-log lines.
+        expect(logged.split("\n").filter((l) => l.includes("/about")).length).toBe(2);
+        // The user-agent quote must be escaped (proves sanitizeLogValue ran on :safe-user-agent).
+        expect(logged).toContain('Sonos\\"quoted\\"');
+      } finally {
+        stdout.mockRestore();
+      }
+    });
+  });
+
+  describe("/icons", () => {
+    // Mutating the view name, emptying the icons map, or escaping the SVG body all turn this red.
+    it("renders an index page listing every icon name and inlining each svg", async () => {
+      const app = makeServer(
+        SONOS_DISABLED,
+        aService(),
+        url("http://localhost:1234"),
+        new InMemoryMusicService()
+      );
+      const res = await request(app).get("/icons");
+      expect(res.status).toEqual(200);
+      expect(res.text).toContain("artists");
+      expect(res.text).toContain("albums");
+      expect(res.text).toContain("yyyy");
+      expect(res.text).toContain("<svg");
+    });
+  });
+
+  describe("/art signed deezer + external systems", () => {
+    // Mirror the existing /art suite: a mock MusicService whose login resolves to an empty
+    // library. (The real InMemoryMusicService.login base64-parses the service token, but the art
+    // route passes the raw legacy token through — so a mock is the faithful boundary here.)
+    const artServer = (opts: Record<string, unknown>) => {
+      const musicService = { login: jest.fn().mockResolvedValue({}) };
+      return makeServer(
+        jest.fn() as unknown as Sonos,
+        aService(),
+        url("http://localhost:1234"),
+        musicService as unknown as MusicService,
+        opts
+      );
+    };
+
+    it("a signed deezer burn resolves the artist, then fetches via deezerImageResolver", async () => {
+      const resolved = "https://e-cdns-images.dzcdn.net/cover/42";
+      const deezerArtistImage = jest.fn().mockResolvedValue(resolved);
+      const deezerImageResolver = jest.fn().mockResolvedValue({
+        contentType: "image/jpeg",
+        data: Buffer.from("deezer-bytes"),
+      });
+      const apiTokens = new InMemoryAPITokens();
+      const apiToken = apiTokens.mint(uuid());
+
+      const app = artServer({
+        apiTokens: () => apiTokens,
+        deezerArtistImage,
+        deezerImageResolver,
+      });
+
+      const burn = formatForURL({ system: "deezer", resource: "artist:42" });
+
+      const res = await request(app)
+        .get(
+          `/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+        )
+        .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+      expect(res.status).toEqual(200);
+      expect(res.header["content-type"]).toEqual("image/jpeg");
+      expect(deezerArtistImage).toHaveBeenCalledWith("artist:42");
+      expect(deezerImageResolver).toHaveBeenCalledWith(resolved);
+    });
+
+    it("a signed deezer burn whose artist image resolves to nothing returns 404 (the ternary's undefined arm)", async () => {
+      // Mutating `url ? resolver(url) : undefined` to drop the undefined arm would call the resolver
+      // with undefined and either crash or serve a wrong 200.
+      const deezerArtistImage = jest.fn().mockResolvedValue(undefined);
+      const deezerImageResolver = jest.fn();
+      const apiTokens = new InMemoryAPITokens();
+      const apiToken = apiTokens.mint(uuid());
+
+      const app = artServer({
+        apiTokens: () => apiTokens,
+        deezerArtistImage,
+        deezerImageResolver,
+      });
+
+      const burn = formatForURL({ system: "deezer", resource: "artist:no-photo" });
+
+      const res = await request(app)
+        .get(
+          `/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+        )
+        .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+      expect(res.status).toEqual(404);
+      expect(deezerImageResolver).not.toHaveBeenCalled();
+    });
+
+    it("a signed external burn with a safe host is fetched via externalImageResolver (the external arm)", async () => {
+      // Mutating `urn.system == "external"` (or routing external through coverArt) changes which
+      // resolver runs and what status/body the client gets.
+      const externalImageResolver = jest.fn().mockResolvedValue({
+        contentType: "image/png",
+        data: Buffer.from("external-bytes"),
+      });
+      const apiTokens = new InMemoryAPITokens();
+      const apiToken = apiTokens.mint(uuid());
+
+      const app = artServer({
+        apiTokens: () => apiTokens,
+        externalImageResolver,
+      });
+
+      const burn = formatForURL({
+        system: "external",
+        resource: "https://example.com/cover.png",
+      });
+
+      const res = await request(app)
+        .get(
+          `/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+        )
+        .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+      expect(res.status).toEqual(200);
+      expect(res.header["content-type"]).toEqual("image/png");
+      expect(externalImageResolver).toHaveBeenCalledWith(
+        "https://example.com/cover.png"
+      );
+    });
+  });
+
+  describe("/art with a coverArt that carries no content-type", () => {
+    // Mutating `(coverArt.contentType || "")` to `coverArt.contentType` makes undefined.toLowerCase
+    // throw, which the catch turns into an opaque 500 instead of the deliberate 502.
+    it("returns 502 with no-store rather than crashing on undefined.toLowerCase()", async () => {
+      const musicService = { login: jest.fn() };
+      const musicLibrary = { coverArt: jest.fn() };
+      const apiTokens = new InMemoryAPITokens();
+      const apiToken = apiTokens.mint(uuid());
+
+      const app = makeServer(
+        jest.fn() as unknown as Sonos,
+        aService(),
+        url("http://localhost:1234"),
+        musicService as unknown as MusicService,
+        { apiTokens: () => apiTokens }
+      );
+
+      musicService.login.mockResolvedValue(musicLibrary);
+      // Deliberately omit contentType (an upstream that returns 200 bytes with no content-type).
+      musicLibrary.coverArt.mockResolvedValue({ data: Buffer.from("x") });
+
+      const burn = formatForURL({ system: "subsonic", resource: "art:no-ctype" });
+      const res = await request(app)
+        .get(
+          `/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+        )
+        .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+      expect(res.status).toEqual(502);
+      expect(res.header["cache-control"]).toMatch(/no-store/);
+    });
+  });
+
+  describe("applyContextPath: false", () => {
+    // Mutating `if (serverOpts.applyContextPath)` to always wrap (dropping the `return app` arm)
+    // mounts the app under the context path, so a direct /about 404s.
+    it("returns the app mounted at root, so /about resolves and /<context>/about does not", async () => {
+      const svc = aService({ name: "ctx-off" });
+      const app = makeServer(
+        SONOS_DISABLED,
+        svc,
+        url("http://localhost:1234/aContext"),
+        new InMemoryMusicService(),
+        { applyContextPath: false }
+      );
+
+      const ok = await request(app).get("/about");
+      expect(ok.status).toEqual(200);
+      expect(ok.body).toEqual({ service: { name: "ctx-off", sid: svc.sid } });
+
+      const miss = await request(app).get("/aContext/about");
+      expect(miss.status).toEqual(404);
+    });
+  });
+
+  describe("version fallback when an empty version is supplied", () => {
+    // Mutating `serverOpts.version || DEFAULT_SERVER_OPTS.version` to drop the `||` arm renders an
+    // empty version string instead of "v?".
+    it("renders the default version on / when version is the empty string", async () => {
+      const app = makeServer(
+        SONOS_DISABLED,
+        aService(),
+        url("http://localhost:1234"),
+        new InMemoryMusicService(),
+        { version: "" }
+      );
+      const res = await request(app).get("/");
+      expect(res.status).toEqual(200);
+      expect(res.text).toContain("v?");
+    });
+
+    it("renders the default version on /s1 when version is the empty string", async () => {
+      const app = makeServer(
+        SONOS_DISABLED,
+        aService(),
+        url("http://localhost:1234"),
+        new InMemoryMusicService(),
+        { version: "", enableS1: true }
+      );
+      const res = await request(app).get("/s1").set("accept-language", "en");
+      expect(res.status).toEqual(200);
+      expect(res.text).toContain("v?");
+    });
+  });
+
+  describe("/report/timePlayed non-track items", () => {
+    // Mutating `type == "track" ? ({...}) : null` to drop the null arm sends non-track items into
+    // musicLibrary.track, which must never happen.
+    it("does not scrobble (or even look up) an item whose id resolves to a non-track type", async () => {
+      const musicService = { login: jest.fn() };
+      const musicLibrary = {
+        track: jest.fn().mockResolvedValue(aTrack({ id: "ABC", duration: 200 })),
+        scrobble: jest.fn().mockResolvedValue(true),
+      };
+      const smapiAuthTokens = { verify: jest.fn() };
+      const app = makeServer(
+        jest.fn() as unknown as Sonos,
+        aService(),
+        url("http://localhost:1234"),
+        musicService as unknown as MusicService,
+        {
+          smapiAuthTokens: smapiAuthTokens as unknown as SmapiAuthTokens,
+        }
+      );
+      const authToken = `token-${uuid()}`;
+      const serviceToken = `svc-${uuid()}`;
+      smapiAuthTokens.verify.mockReturnValue(E.right(serviceToken));
+      musicService.login.mockResolvedValue(musicLibrary);
+
+      const res = await request(app)
+        .post("/report/timePlayed")
+        .send({
+          items: [
+            // final + album id -> type != "track" -> null -> filtered out before track()/scrobble().
+            {
+              mediaUrl: "x-sonos-http:album%3aABC.mp3?a=b&c=d",
+              type: "final",
+              durationPlayedMillis: 5000,
+            },
+          ],
+        })
+        .set("authorization", authToken);
+
+      expect(res.status).toEqual(200);
+      expect(res.body).toEqual({ scrobbled: 0 });
+      expect(musicLibrary.track).not.toHaveBeenCalled();
+      expect(musicLibrary.scrobble).not.toHaveBeenCalled();
+    });
+  });
+});
