@@ -66,7 +66,13 @@ export class SwrCache {
     this.persistMaxAgeMs = opts.persistMaxAgeMs ?? 7 * 24 * 60 * 60 * 1000; // 7 days
     // Restore a persisted cache on startup so the first browse after a restart isn't cold.
     if (this.store && ttlMs > 0) {
-      for (const e of this.store.load()) this.seed(e.key, this.revive(e.value), e.at);
+      // Seed OLDEST-first. The store hands back newest-first, and `entries` is a Map whose
+      // insertion order IS the LRU order that evictOverCap consumes from the front - so seeding in
+      // store order made the NEWEST entry the first eviction candidate, and a restart kept the
+      // oldest maxEntries while discarding the most recently written ones. The album and artist
+      // index entries are precisely the newest, so this quietly defeated the persistence design.
+      for (const e of [...this.store.load()].reverse())
+        this.seed(e.key, this.revive(e.value), e.at);
     }
   }
 

@@ -54,7 +54,16 @@ export function fileStore(
     load() {
       const out: { key: string; at: number; value: unknown }[] = [];
       for (const { path: p, size } of listByNewest().slice(0, maxFiles)) {
-        if (size > maxFileBytes) continue; // never read an oversized / hostile file
+        if (size > maxFileBytes) {
+          // Never read an oversized / hostile file - but SAY SO. Skipping silently turns a
+          // catalog outgrowing the cap into a permanent, invisible regression: the entry is
+          // dropped on every restart, every first browse is cold, and nothing anywhere explains
+          // why. That is precisely how a cliff like this stays undiagnosed for months.
+          logger.warn(
+            `Cache file ${path.basename(p)} is ${size} bytes, over the ${maxFileBytes}-byte read cap; skipping it. Its key will be cold on every restart until the cap is raised.`
+          );
+          continue;
+        }
         try {
           const e = JSON.parse(fs.readFileSync(p, "utf8"));
           if (

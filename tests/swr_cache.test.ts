@@ -251,6 +251,35 @@ describe("SwrCache", () => {
     expect(await got).toBe("ok");
   });
 
+  it("keeps the NEWEST persisted entries when the store has more than maxEntries", async () => {
+    // The store returns files newest-first, seeding inserted them in that order, and
+    // evictOverCap removes `entries.keys().next()` - the FIRST inserted. So a restart kept the
+    // OLDEST maxEntries and threw away the newest, which is backwards.
+    //
+    // Live consequence: the album/artist index entries are the ones written most recently, so on a
+    // catalog with more than maxEntries (50) persisted browse pages - genres x pages, years,
+    // recentlyAdded - the entry that matters is evicted during startup seeding and every restart
+    // pays a cold browse. This defeats the whole point of persisting the cache.
+    const now = dayjs(at).valueOf();
+    // newest-first, exactly as fileStore.load() returns them
+    const persisted = Array.from({ length: 60 }, (_, i) => ({
+      key: `k${i}`, // k0 is NEWEST, k59 is OLDEST
+      at: now - i * 1000,
+      value: `v${i}`,
+    }));
+    const store = { load: () => persisted, save: jest.fn() };
+
+    const cache = new SwrCache(new FixedClock(at), 60_000, { store, maxEntries: 50 });
+
+    expect(cache.size()).toBe(50);
+    // The 50 newest must survive...
+    expect(cache.peek("k0")).toBeDefined();
+    expect(cache.peek("k49")).toBeDefined();
+    // ...and the 10 oldest must be the ones dropped.
+    expect(cache.peek("k50")).toBeUndefined();
+    expect(cache.peek("k59")).toBeUndefined();
+  });
+
   it("seeds from a store on construction so a restart serves without a fetch", async () => {
     const store = {
       load: () => [{ key: "artists:sonos", at: at.valueOf(), value: ["a", "b"] }],

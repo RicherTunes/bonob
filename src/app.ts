@@ -73,7 +73,16 @@ const deepFreeze = (v: unknown): unknown => {
 // browse after a redeploy).
 const browseCacheTTLms = Number(ms(config.subsonic.cacheTTL)) || 0;
 const browseCacheStore = config.subsonic.cacheDir
-  ? fileStore(config.subsonic.cacheDir)
+  ? fileStore(config.subsonic.cacheDir, {
+      // The ARTIST INDEX lives in this cache, and it is by far the largest entry: ~150-300 bytes
+      // per artist, so it crosses the 16MiB default somewhere around 60-90k artists (this library
+      // is at 24,797 - roughly 2-3x headroom). Past the cap the file is skipped on every restart,
+      // so the Artists browse is permanently cold. The album index escaped this by getting its own
+      // store (albumIndexStore); the artist index is still here, so raise the cap for it instead of
+      // shipping a cliff. The skip is now also logged, so hitting any future cap is diagnosable
+      // rather than silent.
+      maxFileBytes: 256 * 1024 * 1024,
+    })
   : undefined;
 const browseCache = new SwrCache(clock, browseCacheTTLms, {
   store: browseCacheStore,
