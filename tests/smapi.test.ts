@@ -69,6 +69,23 @@ import { ExpiredTokenError, InvalidTokenError, SmapiAuthTokens, SmapiToken, ToSm
 
 const parseXML = (value: string) => new DOMParserImpl().parseFromString(value);
 
+// Builds a minimal in-memory artist index for the Artists-browse tests: `items` in scan order with
+// explicit `buckets` (defaults to one bucket over all items). The artists branch serves the flat
+// list (small catalog) or the A-Z letter menu (large) off the same shape the real index has, so the
+// bucket keys here are Navidrome's letters verbatim.
+const anArtistIndex = (
+  items: any[],
+  opts: { total?: number; buckets?: any[] } = {}
+) => ({
+  total: opts.total ?? items.length,
+  buckets:
+    opts.buckets ??
+    (items.length > 0
+      ? [{ key: "A", label: "A", offset: 0, count: items.length }]
+      : []),
+  items,
+});
+
 describe("splitId", () => {
   it("splits on the first colon so ids that contain colons keep their full typeId", () => {
     expect(splitId("root")).toEqual({ type: "root", typeId: "" });
@@ -805,6 +822,8 @@ describe("wsdl api", () => {
     albumCount: jest.fn(),
     peekAlbumCount: jest.fn(),
     peekArtists: jest.fn(),
+    artistIndex: jest.fn(),
+    peekArtistIndex: jest.fn(),
     tracks: jest.fn(),
     track: jest.fn(),
     topSongs: jest.fn(),
@@ -2200,19 +2219,63 @@ describe("wsdl api", () => {
               ].map(artistToArtistSummary);
 
               beforeEach(() => {
-                // Warm by default so the existing assertions serve real artists; a cold list serves
-                // a placeholder instead (tested below).
-                musicLibrary.peekArtists.mockReturnValue(
-                  Promise.resolve(artistSummaries)
+                // Warm by default with a SMALL catalog (total under the cap): the artists branch
+                // serves the flat list straight from the index. A large catalog (A-Z menu) and a
+                // cold index (placeholder) are covered in their own describes below.
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(anArtistIndex(artistSummaries))
                 );
               });
 
-              describe("when the artist list is not warm yet (cold)", () => {
+              describe("when the artist index is warm and the catalog is small (flat)", () => {
+                it("serves the flat list from the index, advertising only the real total", async () => {
+                  const result = await ws.getMetadataAsync({
+                    id: "artists",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: artistSummaries.map((it) =>
+                        artist(bonobUrlWithAccessToken, it)
+                      ),
+                      index: 0,
+                      total: artistSummaries.length,
+                    })
+                  );
+                  // the bucketed path never falls back to the legacy flat fetch
+                  expect(musicLibrary.artists).not.toHaveBeenCalled();
+                  expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
+                });
+
+                it("pages the flat list from the index", async () => {
+                  const result = await ws.getMetadataAsync({
+                    id: "artists",
+                    index: 1,
+                    count: 3,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: [
+                        artistSummaries[1]!,
+                        artistSummaries[2]!,
+                        artistSummaries[3]!,
+                      ].map((it) => artist(bonobUrlWithAccessToken, it)),
+                      index: 1,
+                      total: artistSummaries.length,
+                    })
+                  );
+                });
+              });
+
+              describe("when the artist index is not warm yet (cold)", () => {
                 it("returns a placeholder synchronously without blocking on the cold fetch", async () => {
-                  musicLibrary.peekArtists.mockReturnValue(undefined);
+                  musicLibrary.peekArtistIndex.mockReturnValue(undefined);
                   // A cold getArtists takes many seconds; here it never resolves, so if the code
                   // awaited it this test would hang. It must return the placeholder without awaiting.
-                  musicLibrary.artists.mockReturnValue(new Promise<never>(() => {}));
+                  musicLibrary.artistIndex.mockReturnValue(new Promise<never>(() => {}));
 
                   const result = await ws.getMetadataAsync({
                     id: "artists",
@@ -2232,12 +2295,12 @@ describe("wsdl api", () => {
                     albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                   });
                   // and it kicked the warm in the background
-                  expect(musicLibrary.artists).toHaveBeenCalled();
+                  expect(musicLibrary.artistIndex).toHaveBeenCalled();
                 });
 
                 it("swallows a failing background artist warm so it cannot surface as an unhandled rejection", async () => {
-                  musicLibrary.peekArtists.mockReturnValue(undefined);
-                  musicLibrary.artists.mockReturnValue(
+                  musicLibrary.peekArtistIndex.mockReturnValue(undefined);
+                  musicLibrary.artistIndex.mockReturnValue(
                     Promise.reject(new Error("warm failed"))
                   );
 
@@ -2252,7 +2315,7 @@ describe("wsdl api", () => {
                     });
                     const md = (result[0] as any).getMetadataResult;
                     expect(md.total).toEqual(1);
-                    expect(musicLibrary.artists).toHaveBeenCalled();
+                    expect(musicLibrary.artistIndex).toHaveBeenCalled();
                     await new Promise((resolve) => setTimeout(resolve, 0));
                     expect(unhandled).toEqual([]);
                   } finally {
@@ -2260,90 +2323,228 @@ describe("wsdl api", () => {
                   }
                 });
               });
+            });
 
-              describe("asking for all artists", () => {
-                it("should return them all", async () => {
-                  const index = 0;
-                  const count = 100;
+            describe("asking for the A-Z artist buckets (large catalog)", () => {
+              // total exceeds MAX_ARTISTS_FLAT, so Artists is split into per-letter buckets. The
+              // bucket keys are Navidrome's letters verbatim (NOT re-derived from the names).
+              const letterBuckets = [
+                { key: "P", label: "P", offset: 0, count: 2 },
+                { key: "R", label: "R", offset: 2, count: 1 },
+              ];
 
-                  musicLibrary.artists.mockResolvedValue({
-                    results: artistSummaries,
-                    total: artistSummaries.length,
-                  });
-
-                  const result = await ws.getMetadataAsync({
-                    id: "artists",
-                    index,
-                    count,
-                  });
-
-                  expect(result[0]).toEqual(
-                    getMetadataResult({
-                      mediaCollection: artistSummaries.map((it) => ({
-                        itemType: "artist",
-                        id: `artist:${it.id}`,
-                        artistId: `artist:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          { coverArt: it.image }
-                        ).href(),
-                      })),
-                      index: 0,
-                      total: artistSummaries.length,
+              beforeEach(() => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(
+                    anArtistIndex([], {
+                      total: MAX_ALBUMS_FLAT + 5000,
+                      buckets: letterBuckets,
                     })
-                  );
-                  expect(musicLibrary.artists).toHaveBeenCalledWith({
-                    _index: index,
-                    _count: count,
-                  });
-                  expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
-                });
+                  )
+                );
               });
 
-              describe("asking for a page of artists", () => {
-                const index = 1;
-                const count = 3;
-
-                it("should return it", async () => {
-                  const someArtists = [
-                    artistSummaries[1]!,
-                    artistSummaries[2]!,
-                    artistSummaries[3]!,
-                  ];
-                  musicLibrary.artists.mockResolvedValue({
-                    results: someArtists,
-                    total: artistSummaries.length,
-                  });
-
-                  const result = await ws.getMetadataAsync({
-                    id: "artists",
-                    index,
-                    count,
-                  });
-
-                  expect(result[0]).toEqual(
-                    getMetadataResult({
-                      mediaCollection: someArtists.map((it) => ({
-                        itemType: "artist",
-                        id: `artist:${it.id}`,
-                        artistId: `artist:${it.id}`,
-                        title: it.name,
-                        albumArtURI: coverArtURI(
-                          bonobUrlWithAccessToken,
-                          { coverArt: it.image }
-                        ).href(),
-                      })),
-                      index: 1,
-                      total: artistSummaries.length,
-                    })
-                  );
-                  expect(musicLibrary.artists).toHaveBeenCalledWith({
-                    _index: index,
-                    _count: count,
-                  });
-                  expect(apiTokens.mint).toHaveBeenCalledWith(serviceToken);
+              it("returns a bounded container per letter, not a huge flat list", async () => {
+                const result = await ws.getMetadataAsync({
+                  id: "artists",
+                  index: 0,
+                  count: 100,
                 });
+
+                expect(result[0]).toEqual(
+                  getMetadataResult({
+                    mediaCollection: [
+                      {
+                        itemType: "container",
+                        id: "artistsByLetter:P",
+                        title: "P",
+                        albumArtURI: iconArtURI(bonobUrl, "artists").href(),
+                      },
+                      {
+                        itemType: "container",
+                        id: "artistsByLetter:R",
+                        title: "R",
+                        albumArtURI: iconArtURI(bonobUrl, "artists").href(),
+                      },
+                    ],
+                    index: 0,
+                    total: 2,
+                  })
+                );
+              });
+
+              it("does not block on a cold artist index (returns a placeholder)", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(undefined);
+                musicLibrary.artistIndex.mockReturnValue(new Promise<never>(() => {}));
+
+                const result = await ws.getMetadataAsync({
+                  id: "artists",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(1);
+                expect(md.mediaCollection).toMatchObject({ id: "artists" });
+                expect(musicLibrary.artistIndex).toHaveBeenCalled();
+              });
+            });
+
+            describe("asking for a letter's artists (artistsByLetter)", () => {
+              const pArtists = [anArtist(), anArtist()].map(artistToArtistSummary);
+              const rArtists = [anArtist()].map(artistToArtistSummary);
+
+              it("serves the letter's page from the index, advertising only that letter's total", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(
+                    anArtistIndex([...pArtists, ...rArtists], {
+                      buckets: [
+                        { key: "P", label: "P", offset: 0, count: pArtists.length },
+                        {
+                          key: "R",
+                          label: "R",
+                          offset: pArtists.length,
+                          count: rArtists.length,
+                        },
+                      ],
+                    })
+                  )
+                );
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsByLetter:P",
+                  index: 0,
+                  count: 100,
+                });
+
+                expect(result[0]).toEqual(
+                  getMetadataResult({
+                    mediaCollection: pArtists.map((it) =>
+                      artist(bonobUrlWithAccessToken, it)
+                    ),
+                    index: 0,
+                    total: pArtists.length,
+                  })
+                );
+              });
+
+              it("splits an oversized letter into fixed-size sub-buckets", async () => {
+                // Letter P has more than MAX_ARTISTS_FLAT artists -> sub-chunks, not one big leaf.
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(
+                    anArtistIndex([], {
+                      total: MAX_ALBUMS_FLAT + 5000,
+                      buckets: [
+                        {
+                          key: "P",
+                          label: "P",
+                          offset: 0,
+                          count: MAX_ALBUMS_FLAT + 5000,
+                        },
+                      ],
+                    })
+                  )
+                );
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsByLetter:P",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.mediaCollection[0]).toMatchObject({ id: "artistsChunk:P_0" });
+                expect(md.mediaCollection[1]).toMatchObject({ id: "artistsChunk:P_1" });
+                // total is the number of sub-buckets
+                expect(md.total).toEqual(
+                  Math.ceil((MAX_ALBUMS_FLAT + 5000) / MAX_ALBUMS_FLAT)
+                );
+              });
+
+              it("does not block on a cold artist index (returns a placeholder)", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(undefined);
+                musicLibrary.artistIndex.mockReturnValue(new Promise<never>(() => {}));
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsByLetter:S",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(1);
+                expect(md.mediaCollection).toMatchObject({ id: "artistsByLetter:S" });
+                expect(musicLibrary.artistIndex).toHaveBeenCalled();
+              });
+            });
+
+            describe("asking for an artist sub-chunk (artistsChunk)", () => {
+              it("serves the chunk's page from the index, advertising only that chunk's total", async () => {
+                // Letter P spans two chunks; chunk 1 is items[MAX..]. Build a P bucket over enough
+                // items that chunk 1 holds the 5 remaining artists.
+                const allP = Array.from({ length: MAX_ALBUMS_FLAT + 5 }, (_, i) =>
+                  artistToArtistSummary(anArtist({ id: `p${i}` }))
+                );
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(
+                    anArtistIndex(allP, {
+                      buckets: [
+                        { key: "P", label: "P", offset: 0, count: allP.length },
+                      ],
+                    })
+                  )
+                );
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsChunk:P_1",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                // chunk 1 starts at offset MAX_ALBUMS_FLAT and holds the 5 remaining artists
+                expect(md.total).toEqual(5);
+                expect(md.mediaCollection.length).toEqual(5);
+                expect(md.mediaCollection[0]).toEqual(
+                  artist(bonobUrlWithAccessToken, allP[MAX_ALBUMS_FLAT]!)
+                );
+              });
+
+              it("returns an empty page for a malformed chunk id", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve(anArtistIndex([]))
+                );
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsChunk:P_bad",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(0);
+                // The handler returns mediaCollection: [], but this assertion goes through a real
+                // SOAP round-trip and an EMPTY array serializes to no element at all, arriving as
+                // undefined. (The same layer turns a ONE-element collection into an object rather
+                // than an array.) What matters is that the malformed chunk id yields no items and
+                // does not fault - asserted shape-agnostically rather than pinning the wire quirk.
+                expect([md.mediaCollection ?? []].flat()).toEqual([]);
+              });
+
+              it("does not block on a cold artist index (returns a placeholder)", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(undefined);
+                musicLibrary.artistIndex.mockReturnValue(new Promise<never>(() => {}));
+
+                const result = await ws.getMetadataAsync({
+                  id: "artistsChunk:P_0",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(1);
+                expect(md.mediaCollection).toMatchObject({ id: "artistsChunk:P_0" });
+                expect(musicLibrary.artistIndex).toHaveBeenCalled();
               });
             });
 

@@ -2997,6 +2997,45 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       expect(mockGET).toHaveBeenCalledTimes(1);
     });
 
+    it("getArtistIndex builds the letter index from Navidrome's grouping (keys verbatim, albumCount preserved)", async () => {
+      // asArtistsJson groups by the first char of the name into Navidrome index letters.
+      const a1 = anArtist({ name: "Aphex", albums: [anAlbum()] });
+      const b1 = anArtist({ name: "Boards", albums: [anAlbum(), anAlbum()] });
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(asArtistsJson([a1, b1])))
+      );
+
+      const idx = await cacheSubsonic.getArtistIndex(credentials);
+
+      // Letters are Navidrome's (A, B) verbatim — NOT re-derived from names — each bucket covering
+      // its artists, laid out contiguously.
+      expect(idx.total).toEqual(2);
+      expect(idx.buckets.map((b) => b.key)).toEqual(["A", "B"]);
+      expect(idx.buckets.map((b) => b.count)).toEqual([1, 1]);
+      // albumCount rides on the records so the album total can be summed from this one index.
+      expect(idx.items.map((a) => a.albumCount)).toEqual([1, 2]);
+      // the flat artist list is a view over the same items
+      const flat = await cacheSubsonic.getArtists(credentials);
+      expect(flat.map((a) => a.id)).toEqual(idx.items.map((a) => a.id));
+      // ...served from the cache (no second upstream fetch)
+      expect(mockGET).toHaveBeenCalledTimes(1);
+    });
+
+    it("peekArtistIndex is undefined until warm, then the resolved index", async () => {
+      expect(cacheSubsonic.peekArtistIndex(credentials)).toBeUndefined();
+      mockGET.mockImplementation(() =>
+        Promise.resolve(
+          ok(asArtistsJson([anArtist({ name: "Aphex", albums: [anAlbum()] })]))
+        )
+      );
+      cacheSubsonic.warmArtists(credentials);
+      await new Promise((r) => setImmediate(r));
+
+      const peeked = cacheSubsonic.peekArtistIndex(credentials);
+      expect(peeked).toBeDefined();
+      await expect(peeked!.then((i) => i.total)).resolves.toBe(1);
+    });
+
     it("warmAlbumIndex kicks the (heavy) index scan in the background", async () => {
       const indexCache = new SwrCache(clock, 60_000);
       const indexedSubsonic = new Subsonic(

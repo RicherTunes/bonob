@@ -16,6 +16,7 @@ import {
   Artist,
   AuthFailure,
   AuthSuccess,
+  ArtistRecord,
 } from "./music_library";
 import {
   Subsonic,
@@ -192,6 +193,12 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   peekArtists = (): Promise<unknown> | undefined =>
     this.subsonic.peekArtists(this.credentials);
+
+  artistIndex = (): Promise<AlbumIndex<ArtistRecord>> =>
+    this.subsonic.getArtistIndex(this.credentials);
+
+  peekArtistIndex = (): Promise<AlbumIndex<ArtistRecord>> | undefined =>
+    this.subsonic.peekArtistIndex(this.credentials);
 
   albumIndex = (): Promise<AlbumIndex<AlbumSummary>> =>
     this.subsonic.getAlbumIndex(this.credentials);

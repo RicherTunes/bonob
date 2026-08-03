@@ -23,7 +23,8 @@ import {
   Encoding,
   albumToAlbumSummary,
   TrackSummary,
-  AuthFailure
+  AuthFailure,
+  ArtistRecord,
 } from "./music_library";
 import sharp from "sharp";
 import _ from "underscore";
@@ -36,6 +37,7 @@ import { BUrn } from "./burn";
 import { SwrCache } from "./swr_cache";
 import { AlbumIndex, BucketBuilder } from "./album_index";
 import { AlbumSnapshotWriter } from "./album_snapshot";
+import { buildArtistIndex } from "./artist_index";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
 
@@ -1653,79 +1655,104 @@ export class Subsonic {
       )
     );
 
-  private fetchArtists = (
+  // Fetch /rest/getArtists once and build the artist INDEX, preserving Navidrome's index-letter
+  // grouping (index[].name) as the bucket keys rather than re-deriving letters from names. The
+  // records carry albumCount so the album total (albumCount / the alphabetical getAlbumList2 total)
+  // is still summed from this one cached source. Deep-frozen: the index + its records are shared
+  // across every cache hit and user, so a caller mutating in place would corrupt the cache.
+  private fetchArtistIndex = async (
     credentials: Credentials
-  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> =>
-    this.getJSONWithRetry<GetArtistsResponse>(credentials, "/rest/getArtists")
-      .then((it) => (it.artists.index || []).flatMap((it) => it.artist || []))
-      .then((artists) => {
-        // Deep-frozen: this array + its objects are shared across every cache hit and user,
-        // so a caller mutating in place (sort/splice/decorate) would corrupt the cache.
-        // Current callers treat it read-only (slice2 copies, getAlbumList2 reduces).
-        const mapped = artists.map((artist) =>
-          deepFreezeSummary({
-            id: `${artist.id}`,
-            name: artist.name,
-            albumCount: artist.albumCount,
-            image: artistImageURN(
-              {
-                artistId: artist.id,
-                artistImageURL: artist.artistImageUrl,
-                name: artist.name,
-              },
-              this.preferDeezerArtistArt
-            ),
-          })
-        );
-        Object.freeze(mapped);
-        return mapped;
-      });
+  ): Promise<AlbumIndex<ArtistRecord>> => {
+    const resp = await this.getJSONWithRetry<GetArtistsResponse>(
+      credentials,
+      "/rest/getArtists"
+    );
+    const groups = (resp.artists.index || []).map((g) => ({
+      name: g.name,
+      artist: (g.artist || []).map((a) =>
+        deepFreezeSummary({
+          id: `${a.id}`,
+          name: a.name,
+          albumCount: a.albumCount,
+          image: artistImageURN(
+            {
+              artistId: a.id,
+              artistImageURL: a.artistImageUrl,
+              name: a.name,
+            },
+            this.preferDeezerArtistArt
+          ),
+        })
+      ),
+    }));
+    const idx = buildArtistIndex(groups);
+    Object.freeze(idx.items);
+    for (const b of idx.buckets) Object.freeze(b);
+    Object.freeze(idx.buckets);
+    return idx;
+  };
 
-  // The full artist list is large (~10MB / ~8s on big libraries) and bonob re-fetches it on
-  // every Sonos browse page (getAlbumList2 also uses it for its total). SwrCache serves it
-  // stale-while-revalidate, so once warm EVERY browse is instant (a cold ~8s fetch on the
-  // browse path exceeds Sonos's SMAPI timeout), coalesces concurrent Sonos pages onto one
-  // fetch, and is bounded/hardened. Keyed per user (Navidrome has per-user library ACLs).
-  getArtists = (
+  // The full artist list is large (~10MB / multi-second on big libraries) and bonob re-fetches it
+  // on every Sonos browse page (the album total is summed from it too). SwrCache serves it
+  // stale-while-revalidate, so once warm EVERY browse is instant, concurrent pages coalesce onto one
+  // fetch, and it is bounded/hardened. The cached value is the letter index.
+  //
+  // The key is versioned v2 because the cached value changed shape (flat array -> letter index): a
+  // persisted v1 (flat-array) entry from a prior bonob must never be misread as an index, so on the
+  // first run after upgrade the v1 file is orphaned and the v2 key starts cold (one placeholder
+  // browse, then warm — the same bump the album index did for albumIndex:v3).
+  private artistsKey = (credentials: Credentials): string =>
+    `artists:v2:${credentials.username}`;
+
+  // The cached artist index (letters + items): the single source for the Artists browse AND the
+  // album total. Keyed per user (Navidrome has per-user library ACLs).
+  getArtistIndex = (
     credentials: Credentials
-  ): Promise<(IdName & { albumCount: number; image: BUrn | undefined })[]> =>
-    this.cache.get(`artists:${credentials.username}`, () =>
-      this.fetchArtists(credentials)
+  ): Promise<AlbumIndex<ArtistRecord>> =>
+    this.cache.get(this.artistsKey(credentials), () =>
+      this.fetchArtistIndex(credentials)
     );
 
-  // Pre-warm the artist list (the ~8s cold fetch behind both the Artists browse AND the album
-  // total) in the background, so the first browse of a session isn't cold. Called on login, so
-  // the warm has a head start before the user drills into a section. Safe to call often: the
-  // cache coalesces and only re-fetches when stale.
+  // Non-blocking peek at the artist index: the settled index, or undefined when in-flight/cold, so
+  // a cold Artists browse returns a placeholder instead of blocking on the multi-second getArtists.
+  peekArtistIndex = (
+    credentials: Credentials
+  ): Promise<AlbumIndex<ArtistRecord>> | undefined =>
+    this.cache.peek<AlbumIndex<ArtistRecord>>(this.artistsKey(credentials));
+
+  // The flat artist list, derived from the index items. Kept for callers that sum albumCount or
+  // slice a flat page; the index is the source of truth and this is a cheap view over idx.items.
+  getArtists = (credentials: Credentials): Promise<ArtistRecord[]> =>
+    this.getArtistIndex(credentials).then((idx) => idx.items);
+
+  // Pre-warm the artist index (the multi-second cold fetch behind the Artists browse AND the album
+  // total) in the background, so the first browse of a session isn't cold. Called on login. Safe to
+  // call often: the cache coalesces and only re-fetches when stale.
   warmArtists = (credentials: Credentials): void =>
-    this.cache.warm(`artists:${credentials.username}`, () =>
-      this.fetchArtists(credentials)
+    this.cache.warm(this.artistsKey(credentials), () =>
+      this.fetchArtistIndex(credentials)
     );
 
   // Total album count, summed from the (cached) artist list - the same source getAlbumList2 uses
-  // for its total. Cheap once getArtists is warm (no extra network). Used to decide whether the
-  // catalog is large enough to need the bucketed A-Z index; small libraries skip it entirely.
+  // for its total. Cheap once the artist index is warm (no extra network). Used to decide whether
+  // the catalog is large enough to need the bucketed album A-Z index; small libraries skip it.
   albumCount = (credentials: Credentials): Promise<number> =>
     this.getArtists(credentials).then((artists) =>
       _.inject(artists, (total, artist) => total + artist.albumCount, 0)
     );
 
-  // Non-blocking peek at the album count: undefined when the artist list is not warm yet, so a live
+  // Non-blocking peek at the album count: undefined when the artist index is not warm yet, so a live
   // Albums browse can avoid a multi-second cold getArtists; otherwise the already-resolved count.
   peekAlbumCount = (credentials: Credentials): Promise<number> | undefined =>
-    this.cache
-      .peek<(IdName & { albumCount: number })[]>(
-        `artists:${credentials.username}`
-      )
-      ?.then((artists) =>
-        _.inject(artists, (total, artist) => total + artist.albumCount, 0)
-      );
+    this.peekArtistIndex(credentials)?.then((idx) =>
+      _.inject(idx.items, (total, artist) => total + artist.albumCount, 0)
+    );
 
-  // Non-blocking peek at the artist list itself: the settled cached list, or undefined when it is
-  // in-flight or cold. Lets a cold Artists browse fall back to a placeholder rather than block on
-  // the multi-second full-artist fetch (which would blow Sonos's ~5s timeout).
+  // Non-blocking peek at the artist list itself: the settled cached value, or undefined when it is
+  // in-flight or cold. Lets a cold Artists browse fall back to a placeholder rather than block on the
+  // multi-second full-artist fetch (which would blow Sonos's ~5s timeout). Value unused (warmth only).
   peekArtists = (credentials: Credentials): Promise<unknown> | undefined =>
-    this.cache.peek(`artists:${credentials.username}`);
+    this.cache.peek(this.artistsKey(credentials));
 
   // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
   // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
