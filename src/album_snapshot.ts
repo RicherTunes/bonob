@@ -134,13 +134,27 @@ function validateTrailer(
   // A truncated/extended/edited records region breaks this equality.
   const trailerStart = fileSize - 8 - trailerByteLen;
   if (offsets[o.total] !== trailerStart) return null;
-  // `years` is optional (a pre-change v3 file has none). If present it must be a string[]; anything
-  // else is corruption, and a corrupt trailer is refused rather than served.
+  // `years` is optional (a pre-change v3 file has none). If present each entry must be a string OR
+  // a finite number, and numbers are COERCED rather than refused.
+  //
+  // Requiring string[] here was a real outage-grade bug: Navidrome returns `year` as a JSON number
+  // while the album.year type says string, so the writer emitted numeric years and this validator
+  // rejected the trailer it had just written. load() returned zero entries and every restart threw
+  // away a valid 30MB index and paid a full ~17-minute rescan - silently, because a rejected
+  // snapshot is indistinguishable from no snapshot. Found only by reading the live file off the VPS.
+  //
+  // Accepting numbers keeps every already-written file loadable; the writer now normalizes to
+  // strings so new files are homogeneous.
   let years: string[] | undefined;
   if (o.years !== undefined) {
-    if (!Array.isArray(o.years) || !(o.years as unknown[]).every((y) => typeof y === "string"))
+    if (
+      !Array.isArray(o.years) ||
+      !(o.years as unknown[]).every(
+        (y) => typeof y === "string" || (typeof y === "number" && Number.isFinite(y))
+      )
+    )
       return null;
-    years = o.years as string[];
+    years = (o.years as unknown[]).map((y) => String(y));
   }
   return { v: o.v, key: o.key, at: o.at, total: o.total, buckets, offsets, years };
 }
@@ -283,7 +297,10 @@ export class AlbumSnapshotWriter {
       total,
       buckets,
       offsets: this.offsets,
-      years,
+      // Normalize at the WRITE side too, so new files are homogeneous rather than relying on the
+      // reader's coercion. album.year is typed string but Navidrome sends a JSON number, and
+      // writing that raw is what made the validator reject its own output.
+      years: years && years.map((y) => String(y)),
     };
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
     const footer = Buffer.alloc(8);
