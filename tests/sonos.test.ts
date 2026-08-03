@@ -40,6 +40,36 @@ describe("sonos", () => {
     mockSonosManagerConstructor.mockClear();
   });
 
+  describe("PRESENTATION_AND_STRINGS_VERSION", () => {
+    // It is computed once at module load from BNB_DEBUG. The suite (and every other test) loads
+    // with BNB_DEBUG unset, so only the "23" arm fires. Re-importing under BNB_DEBUG=true exercises
+    // the timestamp arm. A mutant that flips `=== "true"`, drops the ternary, or hardcodes "23"
+    // makes one of the assertions below red.
+    it("is the stable '23' by default, but a fresh unix timestamp when BNB_DEBUG=true (dev cache-busting)", () => {
+      expect(PRESENTATION_AND_STRINGS_VERSION).toEqual("23");
+
+      const previous = process.env["BNB_DEBUG"];
+      const t0 = Math.round(Date.now() / 1000);
+      let debugVersion: string | undefined;
+      try {
+        process.env["BNB_DEBUG"] = "true";
+        jest.isolateModules(() => {
+          debugVersion = require("../src/sonos").PRESENTATION_AND_STRINGS_VERSION;
+        });
+      } finally {
+        if (previous === undefined) delete process.env["BNB_DEBUG"];
+        else process.env["BNB_DEBUG"] = previous;
+      }
+      const t1 = Math.round(Date.now() / 1000);
+
+      expect(debugVersion).not.toEqual("23");
+      expect(Number(debugVersion!)).toBeGreaterThanOrEqual(t0);
+      expect(Number(debugVersion!)).toBeLessThanOrEqual(t1);
+      // The already-imported module is unaffected (env was unset when it loaded).
+      expect(PRESENTATION_AND_STRINGS_VERSION).toEqual("23");
+    });
+  });
+
   describe("asService", () => {
     it("should convert", () => {
       const musicService: MusicService = {

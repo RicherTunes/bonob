@@ -171,6 +171,26 @@ describe("SwrCache", () => {
     expect(f.calls).toBe(2);
   });
 
+  it("evictOverCap terminates when the map empties under a degenerate maxEntries<0 (no infinite loop)", async () => {
+    // maxEntries has no floor (`opts.maxEntries ?? 50`), so a negative cap keeps the
+    // `while (this.entries.size > maxEntries)` loop true for an EMPTY map; the
+    // `if (oldest === undefined) break` is the only thing that lets evictOverCap return. A mutant
+    // that drops the break infinite-loops (this.entries.delete(undefined) is a no-op, size stays 0)
+    // and this test hangs instead of resolving -> red.
+    const cache = new SwrCache(new FixedClock(at), 60_000, { maxEntries: -1 });
+    const f = deferredFetcher<number>();
+    const p = cache.get("k", f.fetch); // insert, then evictOverCap empties the map and hits the break
+    f.resolve(0, 1);
+    await p;
+    expect(cache.size()).toBe(0);
+    // The entry was evicted: a follow-up get is a cold miss (a fresh fetch happens).
+    const f2 = deferredFetcher<number>();
+    const p2 = cache.get("k", f2.fetch);
+    expect(f2.calls).toBe(1);
+    f2.resolve(0, 2);
+    await p2;
+  });
+
   it("enforces maxStale even while a refresh is in flight (a hung refresh can't extend it)", async () => {
     const clock = new FixedClock(at);
     const cache = new SwrCache(clock, 60_000, { maxStaleMs: 5 * 60_000 });
