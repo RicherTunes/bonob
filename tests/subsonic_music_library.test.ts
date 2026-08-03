@@ -4401,3 +4401,105 @@ describe("SubsonicMusicLibrary searchTracks orphan recovery (no albumId after ge
     expect(sub.toTracks).toHaveBeenCalledWith([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Branchless pass-through delegators: each method forwards to exactly one
+// subsonic client call with the library's credentials (and id, where applicable).
+// These are NOT vacuous getter tests - pinning the forwarded method name, the
+// credentials arg, and (where the return is observable) the resolved value kills
+// any mutation that reroutes the delegation, drops the credentials, or swaps the
+// return. A `this.subsonic.albumCount(this.credentials)` -> `this.subsonic.album(...)`
+// mutation, or a `this.credentials` -> `undefined` mutation, makes each test fail.
+// ---------------------------------------------------------------------------
+describe("SubsonicMusicLibrary pass-through delegators", () => {
+  const credentials = { username: "del-user", password: "del-pass" };
+
+  const build = () => {
+    const sub = {
+      albumCount: jest.fn().mockResolvedValue(42),
+      peekAlbumCount: jest.fn().mockReturnValue(undefined),
+      peekArtists: jest.fn().mockReturnValue(undefined),
+      getAlbumIndex: jest
+        .fn()
+        .mockResolvedValue({ total: 7, buckets: [], items: [], years: ["1990"] }),
+      peekAlbumIndex: jest.fn().mockReturnValue(undefined),
+      getAlbum: jest.fn().mockResolvedValue({ id: "a1", name: "Album One" }),
+      getGenres: jest.fn().mockResolvedValue([{ name: "Pop" }]),
+      starredSongs: jest.fn().mockResolvedValue([{ id: "starred-1" }]),
+    };
+    const library = new SubsonicMusicLibrary(
+      sub as unknown as Subsonic,
+      credentials,
+      {} as unknown as CustomPlayers
+    );
+    return { library, sub };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("albumCount() delegates to subsonic.albumCount(credentials) and returns its promise", async () => {
+    const { library, sub } = build();
+    const result = await library.albumCount();
+    expect(sub.albumCount).toHaveBeenCalledTimes(1);
+    expect(sub.albumCount).toHaveBeenCalledWith(credentials);
+    expect(result).toEqual(42);
+  });
+
+  it("peekAlbumCount() delegates to subsonic.peekAlbumCount(credentials) and returns undefined when cold", () => {
+    const { library, sub } = build();
+    const result = library.peekAlbumCount();
+    expect(sub.peekAlbumCount).toHaveBeenCalledTimes(1);
+    expect(sub.peekAlbumCount).toHaveBeenCalledWith(credentials);
+    expect(result).toBeUndefined();
+  });
+
+  it("peekArtists() delegates to subsonic.peekArtists(credentials) and returns undefined when cold", () => {
+    const { library, sub } = build();
+    const result = library.peekArtists();
+    expect(sub.peekArtists).toHaveBeenCalledTimes(1);
+    expect(sub.peekArtists).toHaveBeenCalledWith(credentials);
+    expect(result).toBeUndefined();
+  });
+
+  it("albumIndex() delegates to subsonic.getAlbumIndex(credentials) and returns the index", async () => {
+    const { library, sub } = build();
+    const result = await library.albumIndex();
+    expect(sub.getAlbumIndex).toHaveBeenCalledTimes(1);
+    expect(sub.getAlbumIndex).toHaveBeenCalledWith(credentials);
+    expect(result).toEqual({ total: 7, buckets: [], items: [], years: ["1990"] });
+  });
+
+  it("peekAlbumIndex() delegates to subsonic.peekAlbumIndex(credentials) and returns undefined when not warm", () => {
+    const { library, sub } = build();
+    const result = library.peekAlbumIndex();
+    expect(sub.peekAlbumIndex).toHaveBeenCalledTimes(1);
+    expect(sub.peekAlbumIndex).toHaveBeenCalledWith(credentials);
+    expect(result).toBeUndefined();
+  });
+
+  it("album(id) delegates to subsonic.getAlbum(credentials, id) and returns the album", async () => {
+    const { library, sub } = build();
+    const result = await library.album("a1");
+    expect(sub.getAlbum).toHaveBeenCalledTimes(1);
+    expect(sub.getAlbum).toHaveBeenCalledWith(credentials, "a1");
+    expect(result).toEqual({ id: "a1", name: "Album One" });
+  });
+
+  it("genres() delegates to subsonic.getGenres(credentials) and returns the genres", async () => {
+    const { library, sub } = build();
+    const result = await library.genres();
+    expect(sub.getGenres).toHaveBeenCalledTimes(1);
+    expect(sub.getGenres).toHaveBeenCalledWith(credentials);
+    expect(result).toEqual([{ name: "Pop" }]);
+  });
+
+  it("starredSongs() delegates to subsonic.starredSongs(credentials) and returns the songs", async () => {
+    const { library, sub } = build();
+    const result = await library.starredSongs();
+    expect(sub.starredSongs).toHaveBeenCalledTimes(1);
+    expect(sub.starredSongs).toHaveBeenCalledWith(credentials);
+    expect(result).toEqual([{ id: "starred-1" }]);
+  });
+});
