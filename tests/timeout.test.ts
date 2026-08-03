@@ -1,4 +1,4 @@
-import { withTimeout, faultOrFallback, SMAPI_BROWSE_TIMEOUT_MS } from "../src/timeout";
+import { withTimeout, faultOrFallback, describeReason, SMAPI_BROWSE_TIMEOUT_MS } from "../src/timeout";
 import logger from "../src/logger";
 
 describe("withTimeout", () => {
@@ -185,6 +185,29 @@ describe("faultOrFallback (browse backstop catch)", () => {
 
   it("keeps the browse deadline under Sonos's 5s SMAPI timeout", () => {
     expect(SMAPI_BROWSE_TIMEOUT_MS).toBeLessThan(5000);
+  });
+});
+
+describe("describeReason", () => {
+  it("renders null/undefined as their string form (not '[object Object]')", () => {
+    // Pins the `e === null || e === undefined ? String(e)` arm: a mutant that drops this arm
+    // (so null falls through to the object branch) yields '[object: ]' instead of 'null'.
+    expect(describeReason(null)).toEqual("null");
+    expect(describeReason(undefined)).toEqual("undefined");
+  });
+
+  it("renders a primitive (non-Error, non-string, non-object) as String(e)", () => {
+    // Pins the final `else String(e)`: a number is typeof 'number', so it must NOT take the
+    // object branch. Inverting `typeof e === 'object'` -> `!==` makes 42 take the object branch
+    // and emit '[object: ]' -> red.
+    expect(describeReason(42)).toEqual("42");
+    expect(describeReason(true)).toEqual("true");
+  });
+
+  it("names an object without a constructor (Object.create(null)) as 'object'", () => {
+    // Pins the `?? 'object'` fallback in the constructor-name lookup: Object.create(null) has no
+    // constructor, so constructor?.name is undefined and the nullish-coalescing arm must fire.
+    expect(describeReason(Object.create(null))).toEqual("[object: ]");
   });
 });
 
