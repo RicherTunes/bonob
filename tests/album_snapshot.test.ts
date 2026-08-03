@@ -4,6 +4,7 @@ import path from "path";
 import { createHash } from "crypto";
 
 import { AlbumSummary } from "../src/music_library";
+import logger from "../src/logger";
 import {
   BucketBuilder,
   buildAlbumIndexFromPages,
@@ -507,5 +508,328 @@ describe("album_snapshot: years persist in the trailer and survive a restart", (
     fs.writeFileSync(built.snapshotFile, Buffer.concat([recordsRegion, newTrailerBuf, footer]));
     // offsets[total] still equals the (unchanged) record-region length, so only the years check fails.
     expect(albumIndexStore(dir).load()).toEqual([]);
+  });
+});
+
+// --- helpers for the recovery / mutation-killing tests below ---
+
+// Rewrite a built snapshot's trailer in place: parse the existing trailer JSON, run `mutate` on it,
+// re-serialize, and rewrite the file as [records region][new trailer][footer (new len, same magic)].
+// The records region is byte-identical and the footer magic is preserved, so readTrailerSync still
+// reaches validateTrailer, and trailerStart always recomputes to the (unchanged) records-region end.
+// Each caller mutates EXACTLY one field, so the targeted validateTrailer guard is the one that fires.
+const overwriteTrailer = (file: string, mutate: (t: any) => void) => {
+  const raw = fs.readFileSync(file);
+  const size = raw.length;
+  const trailerLen = raw.readUInt32LE(size - 8);
+  const magic = raw.readUInt32LE(size - 4);
+  const trailerStart = size - 8 - trailerLen;
+  const trailer = JSON.parse(raw.subarray(trailerStart, size - 8).toString("utf8"));
+  mutate(trailer);
+  const newTrailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
+  const footer = Buffer.alloc(8);
+  footer.writeUInt32LE(newTrailerBuf.length, 0);
+  footer.writeUInt32LE(magic, 4);
+  fs.writeFileSync(file, Buffer.concat([raw.subarray(0, trailerStart), newTrailerBuf, footer]));
+};
+
+// A byte buffer of exactly `len` bytes that decodes as TWO valid JSON values (so a page expecting ONE
+// record sees a count mismatch). Layout: `"x"\n` then `"<pad>"\n`. Both lines are valid JSON; pad
+// fills the remainder with 'x's inside a JSON string so the byte length matches the original record.
+const twoJsonLinesFilling = (len: number): Buffer => {
+  const pad = len - 7; // 4 (line1) + pad + 3 (quote+quote+newline)
+  if (pad <= 0) throw new Error(`record too short to split: ${len}`);
+  return Buffer.concat([
+    Buffer.from('"x"\n'),
+    Buffer.from('"'),
+    Buffer.alloc(pad, 0x78),
+    Buffer.from('"\n'),
+  ]);
+};
+
+// validateTrailer is the guard against a half-written snapshot being served as complete. Each row
+// corrupts ONE trailer field in a way that the magic, length, JSON parse, and record-region invariant
+// all still hold, so readTrailerSync reaches validateTrailer and the targeted guard is the SOLE one
+// that fires (every corruption below is accepted if and only if its own guard is removed).
+describe("album_snapshot: validateTrailer refuses each structurally corrupt trailer", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-validate-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const cases: Array<[string, (t: any) => void]> = [
+    ["version is not ALBUM_SNAPSHOT_VERSION", (t) => { t.v = 2; }],
+    ["key is empty", (t) => { t.key = ""; }],
+    ["at is zero", (t) => { t.at = 0; }],
+    ["at is non-finite", (t) => { t.at = Number.NaN; }],
+    ["offsets length is not total+1 (longer, offsets[total] preserved)", (t) => {
+      t.offsets = [...t.offsets, ...Array(9).fill(0)];
+    }],
+    ["bucket.key is not a string", (t) => { t.buckets[0].key = 9; }],
+    ["bucket.offset breaks run contiguity", (t) => { t.buckets[0].offset = 1; }],
+    ["bucket counts no longer sum to total", (t) => {
+      t.buckets[t.buckets.length - 1].count += 1;
+    }],
+    ["offsets[0] is not zero", (t) => { t.offsets[0] = 1; }],
+    ["an offset is negative", (t) => { t.offsets[1] = -1; }],
+    ["an offset exceeds the uint32 ceiling", (t) => { t.offsets[1] = 0x100000000; }],
+    ["an offset is not an integer", (t) => { t.offsets[1] = 1.5; }],
+    ["offsets[total] no longer lands at the trailer start", (t) => {
+      t.offsets[t.total] = t.offsets[t.total] + 5;
+    }],
+  ];
+
+  it.each(cases)("refuses a trailer whose %s", async (_label, mutate) => {
+    const built = await buildDiskIndex(dir, "albumIndex:v3:user", catalog(10, "c"));
+    overwriteTrailer(built.snapshotFile, mutate);
+    expect(albumIndexStore(dir).load()).toEqual([]);
+  });
+});
+
+describe("album_snapshot: crash / partial-write recovery arms", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-recover-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("readTrailerSync swallows a stat failure and refuses the file (defensive outer catch)", () => {
+    // A snapshot file that vanishes between readdirSync and readTrailerSync (or whose stat otherwise
+    // fails) must not take the whole load() down: readTrailerSync's outer try/catch turns it into a
+    // refused (skipped) file. Build first (no spy), then make statSync throw for the load.
+    return buildDiskIndex(dir, "albumIndex:v3:user", catalog(5, "c")).then(() => {
+      const spy = jest.spyOn(fs, "statSync").mockImplementation(() => {
+        throw new Error("boom");
+      });
+      try {
+        expect(albumIndexStore(dir).load()).toEqual([]);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
+  it("write() refuses a record that would cross the 4 GiB addressable limit", async () => {
+    // The resident index is a Uint32Array, so a record past 4 GiB can never be located. The guard is
+    // a pure arithmetic check on (flushedBytes + batchBytes + buf.length); fake flushedBytes near the
+    // ceiling (avoids 4 GiB of real I/O) and confirm the next record is rejected.
+    const w = new AlbumSnapshotWriter(dir, "albumIndex:v3:big");
+    await w.open();
+    (w as any).flushedBytes = 0xffffffff - 10;
+    await expect(w.write({ id: "x" })).rejects.toThrow(/4 GiB addressable limit/);
+    await w.abort();
+  });
+
+  it("flush() refuses when a batch is pending but open() was never called", async () => {
+    const w = new AlbumSnapshotWriter(dir, "albumIndex:v3:noflush");
+    await w.write({ id: "a" }); // buffers under the flush threshold, no fh required
+    await expect((w as any).flush()).rejects.toThrow(/used before open/);
+  });
+
+  it("finalize() refuses before open()", async () => {
+    const w = new AlbumSnapshotWriter(dir, "albumIndex:v3:nofinalize");
+    await expect(w.finalize([])).rejects.toThrow(/used before open/);
+  });
+
+  it("abort() drops the temp file and writes no .dat", async () => {
+    const w = new AlbumSnapshotWriter(dir, "albumIndex:v3:abort");
+    await w.open();
+    await w.write({ id: "a" });
+    expect(fs.readdirSync(dir).filter((n) => n.endsWith(".tmp")).length).toBe(1);
+    await w.abort();
+    expect(
+      fs.readdirSync(dir).filter((n) => n.endsWith(".tmp") || n.endsWith(".dat"))
+    ).toEqual([]);
+  });
+});
+
+describe("album_snapshot: on-disk decode guards refuse right-bytes / wrong-structure reads", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-decode-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("readAlbumIndexPage refuses when decoded record count is wrong (right byte count, wrong shape)", async () => {
+    const built = await buildDiskIndex(dir, "albumIndex:v3:user", catalog(10, "c"));
+    // Overwrite the FIRST record's byte range [0, offsets[1]) with TWO valid JSON values that fill
+    // exactly the same number of bytes. The byte-range read returns the right COUNT of bytes; the
+    // newline split now yields 2 records for a page that expected 1 → refused rather than served.
+    const firstEnd = built.offsets![1]!;
+    const raw = fs.readFileSync(built.snapshotFile);
+    fs.writeFileSync(
+      built.snapshotFile,
+      Buffer.concat([twoJsonLinesFilling(firstEnd), raw.subarray(firstEnd)])
+    );
+    await expect(readAlbumIndexPage(built, "A", 0, 1)).rejects.toThrow(/decode mismatch/);
+  });
+
+  it("readAlbumIndexAll refuses when decoded record count is wrong", async () => {
+    const built = await buildDiskIndex(dir, "albumIndex:v3:user", catalog(10, "c"));
+    const firstEnd = built.offsets![1]!;
+    const raw = fs.readFileSync(built.snapshotFile);
+    fs.writeFileSync(
+      built.snapshotFile,
+      Buffer.concat([twoJsonLinesFilling(firstEnd), raw.subarray(firstEnd)])
+    );
+    await expect(readAlbumIndexAll(built, 0, 1)).rejects.toThrow(/decode mismatch/);
+  });
+});
+
+describe("album_snapshot: disk-bound enforcer tolerates failure", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-boundrec-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("tolerates a missing directory (readdirSync throws → return)", async () => {
+    const missing = path.join(os.tmpdir(), "bonob-no-such-dir-" + Date.now());
+    expect(fs.existsSync(missing)).toBe(false);
+    await expect(enforceSnapshotBounds(missing, {})).resolves.toBeUndefined();
+  });
+
+  it("continues evicting when one rm fails (best-effort, never throws)", async () => {
+    // Three generations of one key; the OLDEST is beyond keepPerKey=2 (Layer 1), the middle is
+    // reclaimable (Layer 2). Make rm reject for the middle file only: it must be left in place, the
+    // other eviction must still happen, and enforceSnapshotBounds must NOT throw.
+    const key = "albumIndex:v3:rmfail";
+    const newest = writeNamedSnapshot(dir, key, 3_000, 100); // rank 0 — protected
+    const mid = writeNamedSnapshot(dir, key, 2_000, 100); // rank 1 — reclaimable (rm will fail)
+    const oldest = writeNamedSnapshot(dir, key, 1_000, 100); // rank 2 — beyond keepPerKey (Layer 1)
+
+    const realRm = fs.promises.rm.bind(fs.promises);
+    const spy = jest.spyOn(fs.promises, "rm").mockImplementation(((
+      p: any,
+      o?: any
+    ) =>
+      String(p) === mid
+        ? Promise.reject(new Error("locked"))
+        : realRm(p, o)) as any);
+
+    try {
+      await enforceSnapshotBounds(dir, {
+        maxBytes: 1,
+        keepPerKey: 2,
+        protectPerKey: 1,
+      });
+      expect(fs.existsSync(newest)).toBe(true); // active index protected
+      expect(fs.existsSync(oldest)).toBe(false); // Layer 1 eviction succeeded
+      expect(fs.existsSync(mid)).toBe(true); // rm failed → best-effort left in place
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("Layer 2 evicts the globally-oldest reclaimable generations first (comparator direction)", async () => {
+    // Five generations of one key, keepPerKey 4, protectPerKey 1, a 250-byte cap. After Layer 1
+    // drops the single oldest, Layer 2 must evict the OLDEST of the reclaimable set until under the
+    // cap — i.e. g2000 then g3000, leaving g4000. Inverting the comparator evicts g4000/g3000 first
+    // and leaves g2000, which this assertion catches.
+    const key = "albumIndex:v3:l2cmp";
+    const g1 = writeNamedSnapshot(dir, key, 1_000, 100); // rank 4 — Layer 1
+    const g2 = writeNamedSnapshot(dir, key, 2_000, 100); // reclaimable, oldest
+    const g3 = writeNamedSnapshot(dir, key, 3_000, 100); // reclaimable
+    const g4 = writeNamedSnapshot(dir, key, 4_000, 100); // reclaimable, kept under the cap
+    const g5 = writeNamedSnapshot(dir, key, 5_000, 100); // rank 0 — protected
+
+    await enforceSnapshotBounds(dir, { maxBytes: 250, keepPerKey: 4, protectPerKey: 1 });
+
+    expect(fs.existsSync(g5)).toBe(true);
+    expect(fs.existsSync(g4)).toBe(true); // survived because g2+g3 reclaimed first
+    expect(fs.existsSync(g3)).toBe(false);
+    expect(fs.existsSync(g2)).toBe(false);
+    expect(fs.existsSync(g1)).toBe(false);
+  });
+});
+
+describe("album_snapshot: store startup recovery arms", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-store-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("albumIndexStore logs and continues when it cannot create the store dir", () => {
+    const spyMk = jest.spyOn(fs, "mkdirSync").mockImplementation(() => {
+      throw new Error("cannot mkdir");
+    });
+    const spyWarn = jest.spyOn(logger, "warn").mockImplementation((() => undefined) as any);
+    try {
+      expect(() => albumIndexStore(dir)).not.toThrow();
+      expect(spyWarn).toHaveBeenCalled();
+    } finally {
+      spyMk.mockRestore();
+      spyWarn.mockRestore();
+    }
+  });
+
+  it("load() sweeps stale .tmp files at startup", async () => {
+    await buildDiskIndex(dir, "albumIndex:v3:user", catalog(3, "c"));
+    const staleTmp = path.join(
+      dir,
+      `albumSnapshot.v3.${keyHashOf("albumIndex:v3:user")}.${gen(500)}.tmp`
+    );
+    fs.writeFileSync(staleTmp, Buffer.alloc(20));
+    expect(fs.existsSync(staleTmp)).toBe(true);
+    const loaded = albumIndexStore(dir).load();
+    expect(fs.existsSync(staleTmp)).toBe(false);
+    expect(loaded.length).toBe(1);
+  });
+
+  it("load() tolerates a rmSync failure during the .tmp sweep (best-effort)", async () => {
+    await buildDiskIndex(dir, "albumIndex:v3:user", catalog(3, "c"));
+    const staleTmp = path.join(
+      dir,
+      `albumSnapshot.v3.${keyHashOf("albumIndex:v3:user")}.${gen(500)}.tmp`
+    );
+    fs.writeFileSync(staleTmp, Buffer.alloc(20));
+    const spy = jest.spyOn(fs, "rmSync").mockImplementation(() => {
+      throw new Error("locked");
+    });
+    try {
+      // The .tmp sweep is best-effort; a failure must not prevent the .dat from loading.
+      expect(() => albumIndexStore(dir).load()).not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("load() returns [] when the store directory cannot be read", () => {
+    const spy = jest.spyOn(fs, "readdirSync").mockImplementation(() => {
+      throw new Error("io");
+    });
+    try {
+      expect(albumIndexStore(dir).load()).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("load() keeps the newest-at entry for a key (does not overwrite with an older generation)", async () => {
+    // Two valid snapshots for the same key. We swap their `at` values so the FIRST-iterated file
+    // (older generation token) carries the NEWER at: it sets the bar, and the second file's older at
+    // must NOT overwrite it (the `trailer.at > existing.at` guard's else arm).
+    const a = await buildDiskIndex(dir, "albumIndex:v3:user", catalog(4, "a"));
+    const b = await buildDiskIndex(dir, "albumIndex:v3:user", catalog(4, "b"));
+    const atA = 9_000;
+    const atB = 1_000;
+    overwriteTrailer(a.snapshotFile!, (t: any) => { t.at = atA; });
+    overwriteTrailer(b.snapshotFile!, (t: any) => { t.at = atB; });
+
+    const loaded = albumIndexStore(dir).load();
+    expect(loaded.length).toBe(1);
+    expect(loaded[0]!.at).toBe(atA); // the newer-at wins regardless of iteration order
   });
 });
