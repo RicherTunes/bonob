@@ -5,6 +5,7 @@ import {
   albumIndexRangesFor,
   albumIndexLetterTotal,
   albumIndexAll,
+  albumIndexPage,
   DEFAULT_IGNORED_ARTICLES,
 } from "../src/album_index";
 
@@ -174,5 +175,56 @@ describe("albumIndexRangesFor", () => {
     expect(first[1]).toBe(idx.buckets[2]);
     // A letter with no runs yields a stable empty array (still O(1)).
     expect(albumIndexRangesFor(idx, "Z")).toEqual([]);
+  });
+});
+
+describe("albumIndexPage", () => {
+  // A snapshot with scattered same-letter runs: A(0,2), B(2,3), A(5,1), C(6,1). The paging math
+  // must gather a letter's albums across its runs while skipping over interleaved other letters.
+  const idx = buildAlbumIndexFromPages([
+    names("Apple", "Avocado", "Banana", "Berry", "Bread", "Apex", "Cherry"),
+  ]);
+
+  it("yields an empty page (and zero total) for a malformed index with no snapshot", () => {
+    // Defence-in-depth backstop: an old/malformed index (items not an array, but buckets present) must
+    // NOT throw on index.items[i] - it short-circuits to an empty page. A non-empty bucket is needed
+    // here so removing the guard actually reaches the indexing line and throws.
+    const malformed = {
+      total: 1,
+      buckets: [{ key: "A", label: "A", offset: 0, count: 1 }],
+    } as any;
+    expect(albumIndexPage(malformed, "A", 0, 10)).toEqual({ items: [], total: 0 });
+  });
+
+  it("returns the letter's full total even when the page is entirely past its runs", () => {
+    // pageIndex beyond every A run: skip exhausts both ranges, no items taken, but the container must
+    // still advertise the letter's real total so Sonos shows the right count.
+    const page = albumIndexPage(idx, "A", 10, 5);
+    expect(page.items).toEqual([]);
+    expect(page.total).toEqual(3);
+  });
+
+  it("skips a WHOLE run when pageIndex lands past the first run", () => {
+    // pageIndex=2, pageCount=2 for "A": skip(2) >= first A run's count(2) -> skip the whole run,
+    // then take from the second A run (Apex at offset 5).
+    const page = albumIndexPage(idx, "A", 2, 2);
+    expect(page.items.map((a) => a.name)).toEqual(["Apex"]);
+    expect(page.total).toEqual(3);
+  });
+
+  it("gathers a page ACROSS scattered same-letter runs (skipping interleaved other letters)", () => {
+    // pageIndex=1, pageCount=2 for "A": take the tail of the first A run (Avocado) then continue into
+    // the second A run (Apex), ignoring the B run that sits between them in the snapshot.
+    const page = albumIndexPage(idx, "A", 1, 2);
+    expect(page.items.map((a) => a.name)).toEqual(["Avocado", "Apex"]);
+    expect(page.total).toEqual(3);
+  });
+
+  it("pages within a single run without crossing into the next", () => {
+    // pageIndex=1, pageCount=2 for "B": the B run is [Banana, Berry, Bread]; page 1 size 2 is
+    // [Berry, Bread] only, total is B's whole count.
+    const page = albumIndexPage(idx, "B", 1, 2);
+    expect(page.items.map((a) => a.name)).toEqual(["Berry", "Bread"]);
+    expect(page.total).toEqual(3);
   });
 });
