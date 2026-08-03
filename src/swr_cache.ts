@@ -193,7 +193,23 @@ export class SwrCache {
   }
 
   private refresh<T>(key: string, fetch: () => Promise<T>, stale: Entry): void {
-    this.withBackstop(this.invoke(fetch))
+    // The backstop bounds how long a CALLER waits; it cannot abort the work already running. So
+    // `inFlight` is cleared by the UNDERLYING fetch settling, never by the backstop firing -
+    // otherwise a fetch that overruns its backstop leaves the key open and every later stale access
+    // starts another concurrent one, stacking forever. That is reachable here rather than
+    // theoretical: the album index fetch is a full catalog scan (~15 min at 107k albums) against a
+    // 20-minute backstop, and each pile-on is another full scan aimed at Navidrome.
+    const underlying = this.invoke(fetch);
+    underlying.then(
+      () => {
+        stale.inFlight = false;
+      },
+      () => {
+        stale.inFlight = false; // keep serving stale; a later access may retry
+      }
+    );
+
+    this.withBackstop(underlying)
       .then((v) => {
         // Only replace if the stale entry is still current — an LRU eviction or an
         // invalidate() in the meantime must not be resurrected by a late refresh.
@@ -209,7 +225,7 @@ export class SwrCache {
         }
       })
       .catch(() => {
-        stale.inFlight = false; // keep serving stale; a later access may retry
+        // Deliberately does NOT clear inFlight - see above. The underlying settle handler owns it.
       });
   }
 

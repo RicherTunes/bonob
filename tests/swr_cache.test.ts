@@ -343,6 +343,54 @@ describe("SwrCache", () => {
     expect(f.calls).toBe(1); // peek itself fetched nothing
   });
 
+  it("backstop on a REFRESH does not admit a second concurrent fetch while the first still runs", async () => {
+    // The backstop bounds how long a CALLER waits; it cannot abort the underlying work. The
+    // rejection handler used to clear `inFlight`, so the next stale access started a SECOND fetch
+    // while the first was still running - and so on, stacking indefinitely.
+    //
+    // Reachable rather than theoretical: the album index fetch is a full catalog scan (~15 min at
+    // 107k albums) against a 20-minute backstop, and each pile-on is another full scan aimed at
+    // Navidrome. Nothing awaits a promise here that is not guaranteed to settle.
+    jest.useFakeTimers();
+    const micro = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+    try {
+      const clock = new FixedClock(at);
+      const cache = new SwrCache(clock, 60_000, { backstopMs: 1000, maxStaleMs: 60 * 60_000 });
+      const f = deferredFetcher<string>();
+
+      const first = cache.get("k", f.fetch);
+      f.resolve(0, "v1");
+      expect(await first).toBe("v1");
+      expect(f.calls).toBe(1);
+
+      // Stale -> kicks a background refresh (fetch #2) that we never settle.
+      clock.add(2, "m");
+      expect(await cache.get("k", f.fetch)).toBe("v1");
+      expect(f.calls).toBe(2);
+
+      // The refresh's backstop fires while fetch #2 is STILL RUNNING.
+      jest.advanceTimersByTime(1001);
+      await micro();
+
+      // A further stale access must serve stale and must NOT start fetch #3.
+      expect(await cache.get("k", f.fetch)).toBe("v1");
+      await micro();
+      expect(f.calls).toBe(2);
+
+      // Once the real fetch finally settles, the key accepts refreshes again.
+      f.resolve(1, "v2");
+      await micro();
+      clock.add(10, "m");
+      void cache.get("k", f.fetch);
+      await micro();
+      expect(f.calls).toBe(3);
+      f.resolve(2, "v3");
+      await micro();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("backstop: a hung fetch rejects after backstopMs (and frees the key)", async () => {
     jest.useFakeTimers();
     try {
