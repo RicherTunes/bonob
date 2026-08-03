@@ -27,6 +27,7 @@ import sonos, {
   PRESENTATION_AND_STRINGS_VERSION,
   BONOB_CAPABILITIES,
   asRemoveCustomdForm,
+  stripTrailingSlash,
 } from "../src/sonos";
 
 import { aSonosDevice, aService } from "./builders";
@@ -109,6 +110,33 @@ describe("sonos", () => {
         ip: "127.0.0.222",
         port: 123,
       });
+    });
+
+    it("defaults group to '' when GroupName is missing (the || fallback)", () => {
+      // Covers the `sonosDevice.GroupName || ""` fallback: a mutant that drops it sets group to
+      // undefined, which would also leak the raw (possibly undefined) Sonos field to callers.
+      const device = {
+        Name: "solo",
+        Host: "127.0.0.5",
+        Port: 9,
+      } as SonosDevice;
+      expect(asDevice(device)).toEqual({
+        name: "solo",
+        group: "",
+        ip: "127.0.0.5",
+        port: 9,
+      });
+    });
+  });
+
+  describe("stripTrailingSlash", () => {
+    it("removes exactly one trailing slash, and leaves a slash-free URL untouched", () => {
+      // Pins both arms of the ternary: a mutant that strips nothing (or strips the wrong count)
+      // turns at least one assertion red.
+      expect(stripTrailingSlash("http://example.com/")).toEqual("http://example.com");
+      expect(stripTrailingSlash("http://example.com")).toEqual("http://example.com");
+      // only the LAST slash is trimmed, leaving interior path segments intact
+      expect(stripTrailingSlash("http://example.com/path/")).toEqual("http://example.com/path");
     });
   });
 
