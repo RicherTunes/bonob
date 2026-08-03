@@ -1,5 +1,14 @@
 import { hostname } from "os";
-import config, { COLOR, envVar } from "../src/config";
+import config, {
+  COLOR,
+  envVar,
+  sonosMaxContainerTotal,
+  albumSnapshotMaxBytes,
+  albumSnapshotKeepPerKey,
+  albumSnapshotProtectPerKey,
+  DEFAULT_SONOS_MAX_CONTAINER_TOTAL,
+  DEFAULT_ALBUM_SNAPSHOT_MAX_BYTES,
+} from "../src/config";
 
 describe("envVar", () => {
   const OLD_ENV = process.env;
@@ -484,5 +493,74 @@ describe("config", () => {
       true,
       (config) => config.reportNowPlaying
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Standalone numeric env-knobs exported from config but read at call time (not
+// via the default config() factory). Each is a thin () => bnbEnvVar(...) wrapper:
+// the tests pin the default, the override, and (where the bound matters) the
+// validation pattern, so a mutation to the env-var name, the default, or the
+// parser turns red.
+// ---------------------------------------------------------------------------
+describe("standalone numeric config knobs", () => {
+  const OLD_ENV = process.env;
+
+  beforeEach(() => {
+    jest.resetModules();
+    process.env = { ...OLD_ENV };
+  });
+
+  afterEach(() => {
+    process.env = OLD_ENV;
+  });
+
+  describe("sonosMaxContainerTotal", () => {
+    it("defaults to DEFAULT_SONOS_MAX_CONTAINER_TOTAL", () => {
+      expect(sonosMaxContainerTotal()).toEqual(DEFAULT_SONOS_MAX_CONTAINER_TOTAL);
+    });
+
+    it("parses BNB_SONOS_MAX_CONTAINER_TOTAL as an int", () => {
+      process.env["BNB_SONOS_MAX_CONTAINER_TOTAL"] = "12345";
+      expect(sonosMaxContainerTotal()).toEqual(12345);
+    });
+
+    it("rejects a non-positive value via the validation pattern", () => {
+      process.env["BNB_SONOS_MAX_CONTAINER_TOTAL"] = "0";
+      expect(() => sonosMaxContainerTotal()).toThrow();
+    });
+  });
+
+  describe("albumSnapshotMaxBytes", () => {
+    it("defaults to DEFAULT_ALBUM_SNAPSHOT_MAX_BYTES", () => {
+      expect(albumSnapshotMaxBytes()).toEqual(DEFAULT_ALBUM_SNAPSHOT_MAX_BYTES);
+    });
+
+    it("parses BNB_ALBUM_SNAPSHOT_MAX_BYTES as an int", () => {
+      process.env["BNB_ALBUM_SNAPSHOT_MAX_BYTES"] = "1073741824";
+      expect(albumSnapshotMaxBytes()).toEqual(1073741824);
+    });
+  });
+
+  describe("albumSnapshotKeepPerKey", () => {
+    it("defaults to 2", () => {
+      expect(albumSnapshotKeepPerKey()).toEqual(2);
+    });
+
+    it("parses BNB_ALBUM_SNAPSHOT_KEEP_PER_KEY as an int", () => {
+      process.env["BNB_ALBUM_SNAPSHOT_KEEP_PER_KEY"] = "5";
+      expect(albumSnapshotKeepPerKey()).toEqual(5);
+    });
+  });
+
+  describe("albumSnapshotProtectPerKey", () => {
+    it("defaults to 1", () => {
+      expect(albumSnapshotProtectPerKey()).toEqual(1);
+    });
+
+    it("parses BNB_ALBUM_SNAPSHOT_PROTECT_PER_KEY as an int", () => {
+      process.env["BNB_ALBUM_SNAPSHOT_PROTECT_PER_KEY"] = "3";
+      expect(albumSnapshotProtectPerKey()).toEqual(3);
+    });
   });
 });

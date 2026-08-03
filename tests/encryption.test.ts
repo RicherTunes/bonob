@@ -1,5 +1,7 @@
 import { left, right } from 'fp-ts/Either'
 
+import jws from 'jws';
+
 import { cryptoEncryption, jwsEncryption } from '../src/encryption';
 
 describe("jwsEncryption", () => {
@@ -55,6 +57,24 @@ describe("jwsEncryption", () => {
     expect(e.decrypt("not-a-jws")).toEqual(left("Invalid signature"));
     expect(e.decrypt("")).toEqual(left("Invalid signature"));
     expect(e.decrypt("a.b")).toEqual(left("Invalid signature"));
+  });
+
+  it("returns left('Failed to decrypt jws') when a verified token cannot be decoded", () => {
+    // The decrypt path verifies first, then decodes. jws.verify does NOT call
+    // jws.decode (it uses jwa directly), so stubbing decode to return null
+    // isolates the `decode -> fromNullable -> match` tail: the O.none branch must
+    // yield left("Failed to decrypt jws") rather than pass or throw. jws.verify
+    // runs for real against the genuine signature, so this is NOT bypassing the
+    // security check - it simulates a token that verifies but won't decode.
+    const e = jwsEncryption("real-secret");
+    const token = e.encrypt("payload-value");
+
+    const decodeSpy = jest.spyOn(jws, "decode").mockReturnValue(null as any);
+    try {
+      expect(e.decrypt(token)).toEqual(left("Failed to decrypt jws"));
+    } finally {
+      decodeSpy.mockRestore();
+    }
   });
 })
 
