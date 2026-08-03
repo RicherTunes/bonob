@@ -355,6 +355,57 @@ describe("CoverArtCoordinator coalescing + concurrency", () => {
     await expect(coord.run(coverArtKey("u", "p", "no-retry", 1), task)).rejects.toBeDefined();
     expect(task).toHaveBeenCalledTimes(1);
   });
+
+  it("frees the slot when a QUEUED task rejects after being handed a freed slot", async () => {
+    // The inherited-slot path (onSettled -> startTask(next.task) -> result.then(resolve, reject)
+    // AND result.then(onSettled, onSettled)) releases the active count on a queued-task REJECT,
+    // not only on resolve. Without that reject arm a queued failure would leak the slot and the
+    // coordinator would deadlock once every slot had been handed to a failing queued task.
+    const coord = new CoverArtCoordinator({ maxConcurrency: 1, maxQueue: 4, queueTimeoutMs: 5000 });
+
+    const block = deferred<void>();
+    const started: string[] = [];
+
+    // First task occupies the only slot.
+    const running = coord.run(
+      coverArtKey("u", "p", "hold", 1),
+      () => {
+        started.push("hold");
+        return block.promise.then(() => Buffer.from("hold"));
+      }
+    );
+
+    // Second task queues; it will REJECT once handed the slot.
+    const queuedReject = new Error("queued boom");
+    const queued = coord.run(
+      coverArtKey("u", "p", "queued", 1),
+      () => {
+        started.push("queued");
+        return Promise.reject(queuedReject);
+      }
+    );
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(started).toEqual(["hold"]);
+
+    // Release the held slot -> the queued task runs and rejects.
+    block.resolve(undefined);
+    await expect(running).resolves.toEqual(Buffer.from("hold"));
+    await expect(queued).rejects.toBe(queuedReject);
+
+    // The slot must be free again: a fresh distinct request runs IMMEDIATELY (no queue wait),
+    // proving the rejected queued task released it.
+    const fresh = coord.run(
+      coverArtKey("u", "p", "fresh", 1),
+      () => {
+        started.push("fresh");
+        return Promise.resolve(Buffer.from("fresh"));
+      }
+    );
+    await expect(fresh).resolves.toEqual(Buffer.from("fresh"));
+    expect(started).toEqual(["hold", "queued", "fresh"]);
+  });
 });
 
 describe("CoverArtCoordinator admission control (never promise a wait it cannot honour)", () => {

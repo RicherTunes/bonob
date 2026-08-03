@@ -1,7 +1,7 @@
 import { option as O, either as E } from "fp-ts";
 import { randomUUID as uuid } from "crypto";
 import { createHash } from "crypto";
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync } from "fs";
 import os from "os";
 import path from "path";
 
@@ -46,6 +46,9 @@ import {
   OpenSubsonicExtension,
   SONOS_CLIENT_INFO,
   TranscodeDecision,
+  asToken,
+  parseToken,
+  BROWSER_HEADERS,
 } from "../src/subsonic";
 
 import { promises as dnsPromises } from "dns";
@@ -2652,3 +2655,426 @@ describe("Subsonic", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Additional mutation-killing coverage for src/subsonic.ts.
+// Each block below targets a previously-uncovered branch/line and has been
+// confirmed RED under a deliberate mutation of the exact code path exercised.
+// ---------------------------------------------------------------------------
+
+describe("isSafeExternalImageUrl: IPv6 special-prefix coverage", () => {
+  // These literals are valid IPv6 (new URL accepts them, isIP === 6), so they reach the
+  // isPrivateIPv6 prefix checks. The existing tests covered the public (false) branches and the
+  // IPv4-mapped/NAT64/6to4 true branches; the ULA / link-local / multicast / all-zeros true branches
+  // were unexercised.
+  it("blocks unique-local (fc00::/7) addresses", () => {
+    expect(isSafeExternalImageUrl("http://[fc00::1]/x")).toBe(false);
+    expect(isSafeExternalImageUrl("http://[fd12:3456::1]/x")).toBe(false);
+  });
+
+  it("blocks link-local (fe80::/10) addresses", () => {
+    expect(isSafeExternalImageUrl("http://[fe80::1]/x")).toBe(false);
+  });
+
+  it("blocks multicast (ff00::/8) addresses", () => {
+    expect(isSafeExternalImageUrl("http://[ff02::1]/x")).toBe(false);
+  });
+
+  it("still allows a public IPv6 host (regression guard against an over-broad mask)", () => {
+    expect(isSafeExternalImageUrl("http://[2606:4700:4700::1111]/x")).toBe(true);
+  });
+});
+
+describe("resolvedExternalHostIsSafe: DNS-resolution SSRF edges", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("treats a host that resolves to ZERO addresses as unsafe (addresses.length > 0 guard)", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockResolvedValue([] as any);
+    expect(await resolvedExternalHostIsSafe("https://empty.example/x")).toBe(false);
+  });
+
+  it("returns false (does not throw) when DNS resolution itself throws", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockRejectedValue(new Error("ENOTFOUND"));
+    expect(await resolvedExternalHostIsSafe("https://broken.example/x")).toBe(false);
+  });
+
+  it("decodes a dotted IPv4-mapped IPv6 address (::ffff:8.8.8.8) as the PUBLIC embedded IPv4 -> safe", async () => {
+    // new URL() canonicalizes the dotted form away, so this branch of expandIPv6 is only reachable
+    // via a DNS-resolved address string, which is exactly what resolvedExternalHostIsSafe feeds to
+    // isUnsafeExternalImageHost. A public embedded IPv4 must come out SAFE.
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "::ffff:8.8.8.8", family: 6 }] as any);
+    expect(await resolvedExternalHostIsSafe("https://mapped.example/x")).toBe(true);
+  });
+
+  it("decodes a dotted IPv4-mapped IPv6 address (::ffff:127.0.0.1) as the PRIVATE embedded IPv4 -> unsafe", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "::ffff:127.0.0.1", family: 6 }] as any);
+    expect(await resolvedExternalHostIsSafe("https://mapped-private.example/x")).toBe(false);
+  });
+});
+
+describe("pinnedSafeExternalLookup: no-address edge", () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it("throws (does not return undefined) when the host resolves to zero addresses", async () => {
+    jest.spyOn(dnsPromises, "lookup").mockResolvedValue([] as any);
+    await expect(pinnedSafeExternalLookup("void.example")).rejects.toThrow(
+      /no address for external art host 'void.example'/
+    );
+  });
+});
+
+describe("axiosImageFetcher (SSRF guard + image fetch wiring)", () => {
+  let get: jest.Mock;
+  afterEach(() => {
+    jest.restoreAllMocks();
+    axios.get = jest.fn();
+  });
+
+  it("returns undefined for an unsafe host without fetching (guard short-circuits)", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "127.0.0.1", family: 4 }] as any);
+    get = jest.fn();
+    axios.get = get as any;
+    const result = await axiosImageFetcher("http://127.0.0.1/secret.jpg");
+    expect(result).toBeUndefined();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("fetches and returns {contentType, data} for a safe host", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }] as any);
+    const data = Buffer.from("the-bytes");
+    get = jest.fn();
+    get.mockImplementation(() =>
+      Promise.resolve({ status: 200, headers: { "content-type": "image/jpeg" }, data })
+    );
+    axios.get = get as any;
+    const result = await axiosImageFetcher("https://images.example/a.jpg");
+    expect(result).toEqual({ contentType: "image/jpeg", data });
+    expect(get).toHaveBeenCalledWith(
+      "https://images.example/a.jpg",
+      expect.objectContaining({
+        headers: BROWSER_HEADERS,
+        responseType: "arraybuffer",
+        timeout: 10000,
+        maxRedirects: 0,
+      })
+    );
+  });
+
+  it("collapses an absent content-type to '' (refused downstream as art, not served as unknown bytes)", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }] as any);
+    get = jest.fn();
+    get.mockImplementation(() =>
+      Promise.resolve({ status: 200, headers: {}, data: Buffer.from("x") })
+    );
+    axios.get = get as any;
+    const result = await axiosImageFetcher("https://images.example/b.jpg");
+    expect(result).toEqual({ contentType: "", data: Buffer.from("x") });
+  });
+
+  it("returns undefined when the upstream fetch rejects (network error swallowed)", async () => {
+    jest
+      .spyOn(dnsPromises, "lookup")
+      .mockResolvedValue([{ address: "93.184.216.34", family: 4 }] as any);
+    get = jest.fn();
+    get.mockImplementation(() => Promise.reject(new Error("ECONNRESET")));
+    axios.get = get as any;
+    const result = await axiosImageFetcher("https://images.example/c.jpg");
+    expect(result).toBeUndefined();
+  });
+});
+
+describe("TranscodingCustomPlayers.from: invalid configuration", () => {
+  it("throws on a config item with more than one '>' separator", () => {
+    expect(() => TranscodingCustomPlayers.from("audio/mp3>audio/ogg>audio/flac")).toThrow(
+      /Invalid configuration item/
+    );
+  });
+
+  it("still parses a single untranscoded mapping (regression guard)", () => {
+    const cp = TranscodingCustomPlayers.from("audio/flac");
+    expect(cp.encodingFor({ mimeType: "audio/flac" })).toEqual(
+      O.of({ player: "bonob+audio/flac", mimeType: "audio/flac" })
+    );
+  });
+});
+
+describe("service tokens (asToken / parseToken)", () => {
+  it("round-trips credentials through the encrypted (enc:) format", () => {
+    const creds = { username: "u-" + uuid(), password: "p-" + uuid() };
+    expect(parseToken(asToken(creds))).toEqual(creds);
+  });
+
+  it("rethrows a corrupted enc: token whose envelope has the wrong version (invalid-token guard)", () => {
+    const corrupt = "enc:" + b64Encode(JSON.stringify({ v: 99, iv: "x", tag: "y", ciphertext: "z" }));
+    expect(() => parseToken(corrupt)).toThrow("Invalid encrypted service token");
+  });
+
+  it("falls back to the legacy plain-b64 JSON format for a non-enc: token", () => {
+    const creds = { username: "legacy", password: "legacy-pass" };
+    const legacy = b64Encode(JSON.stringify(creds));
+    expect(parseToken(legacy)).toEqual(creds);
+  });
+});
+
+// Self-contained Subsonic instance for the low-level paths not already covered above.
+describe("Subsonic: low-level error paths + warm/peek", () => {
+  const url = new URLBuilder("http://127.0.0.22:4567/some-context-path");
+  const username = `cov-user-${uuid()}`;
+  const password = `cov-pass-${uuid()}`;
+  const credentials = { username, password };
+  const salt = "saltysalty";
+  const mockRandomstring = jest.fn();
+  const mockGET = jest.fn();
+  const mockPOST = jest.fn();
+
+  const authParams = {
+    u: username,
+    v: "1.16.1",
+    c: "bonob",
+    t: t(password, salt),
+    s: salt,
+  };
+  const headers = { "User-Agent": "bonob" };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+    (random.generateRandomString as jest.Mock) = mockRandomstring;
+    axios.get = mockGET;
+    axios.post = mockPOST;
+    mockRandomstring.mockReturnValue(salt);
+  });
+
+  describe("getStarred", () => {
+    it("returns a Set of the starred song ids", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(
+          ok(
+            subsonicOK({
+              starred2: { song: [{ id: "s1" }, { id: "s2" }, { id: "s1" }] },
+            })
+          )
+        )
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).getStarred(credentials);
+      expect(result).toBeInstanceOf(Set);
+      expect([...result].sort()).toEqual(["s1", "s2"]);
+      expect(axios.get).toHaveBeenCalledWith(
+        url.append({ pathname: "/rest/getStarred2" }).href(),
+        { params: asURLSearchParams({ ...authParams, f: "json" }), headers }
+      );
+    });
+  });
+
+  describe("starredSongs", () => {
+    it("maps complete song records to playable track summaries (no per-song round trip)", async () => {
+      const trackA = aTrack();
+      const trackB = aTrack();
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(
+          ok(
+            subsonicOK({
+              starred2: { song: [asSongJson(trackA), asSongJson(trackB)] },
+            })
+          )
+        )
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).starredSongs(credentials);
+      expect(result.map((r) => r.id)).toEqual([trackA.id, trackB.id]);
+      expect(result.map((r) => r.name)).toEqual([trackA.name, trackB.name]);
+    });
+
+    it("returns an empty array when getStarred2 reports no songs (the || [] guard)", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve(ok(subsonicOK({ starred2: {} })))
+      );
+      const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).starredSongs(credentials);
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe("getTranscodeDecision", () => {
+    const mediaId = `media-${uuid()}`;
+
+    it("rejects with 'Subsonic POST failed' when the POST returns a non-200 status", async () => {
+      mockPOST.mockImplementationOnce(() =>
+        Promise.resolve({ status: 500, data: {} })
+      );
+      await expect(
+        new Subsonic(url, NO_CUSTOM_PLAYERS).getTranscodeDecision(
+          credentials,
+          mediaId,
+          SONOS_CLIENT_INFO
+        )
+      ).rejects.toEqual("Subsonic POST failed with a 500 status");
+    });
+
+    it("rejects with 'Subsonic error:' when the POST envelope reports an application error", async () => {
+      mockPOST.mockImplementationOnce(() =>
+        Promise.resolve(
+          ok({
+            "subsonic-response": {
+              status: "failed",
+              version: "1.16.1",
+              type: "subsonic",
+              serverVersion: "0.45.1",
+              error: { code: "0", message: "getTranscodeDecision not supported" },
+            },
+          })
+        )
+      );
+      await expect(
+        new Subsonic(url, NO_CUSTOM_PLAYERS).getTranscodeDecision(
+          credentials,
+          mediaId,
+          SONOS_CLIENT_INFO
+        )
+      ).rejects.toEqual("Subsonic error:getTranscodeDecision not supported");
+    });
+  });
+
+  describe("getOpenSubsonicExtensions: non-404 errors propagate", () => {
+    it("rethrows a 500 axios error instead of swallowing it as an empty list", async () => {
+      const err = Object.assign(new Error("Request failed with status code 500"), {
+        isAxiosError: true,
+        response: { status: 500, data: {} },
+      });
+      mockGET.mockImplementation(() => Promise.reject(err));
+      // getJSONWithRetry retries 5xx once, so the upstream is hit twice before the error surfaces.
+      await expect(
+        new Subsonic(url, NO_CUSTOM_PLAYERS).getOpenSubsonicExtensions(credentials)
+      ).rejects.toBe(err);
+      expect(mockGET).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe("warm / peek methods (non-blocking cache access)", () => {
+    const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+    let cacheSubsonic: Subsonic;
+
+    beforeEach(() => {
+      clock.time = dayjs("2024-01-01T00:00:00Z");
+      cacheSubsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        axiosImageFetcher,
+        new SwrCache(clock, 5 * 60_000)
+      );
+    });
+
+    it("peekAlbumCount / peekArtists are undefined before the artist list is warm", () => {
+      expect(cacheSubsonic.peekAlbumCount(credentials)).toBeUndefined();
+      expect(cacheSubsonic.peekArtists(credentials)).toBeUndefined();
+    });
+
+    it("warmArtists pre-fetches the artist list; afterwards peek* return the warm value", async () => {
+      const artist1 = anArtist({ name: "A Artist", albums: [anAlbum(), anAlbum()] });
+      mockGET.mockImplementation(() => Promise.resolve(ok(asArtistsJson([artist1]))));
+
+      cacheSubsonic.warmArtists(credentials);
+      // warm kicks a fetch in the background; let it settle.
+      await new Promise((r) => setImmediate(r));
+
+      const expectedCount = artist1.albums.length;
+      await expect(cacheSubsonic.peekAlbumCount(credentials)).resolves.toBe(expectedCount);
+      await expect(cacheSubsonic.peekArtists(credentials)).resolves.toBeDefined();
+      // The artists were fetched exactly once by the warm; a subsequent getArtists reads the cache.
+      expect(mockGET).toHaveBeenCalledTimes(1);
+      await cacheSubsonic.getArtists(credentials);
+      expect(mockGET).toHaveBeenCalledTimes(1);
+    });
+
+    it("warmAlbumIndex kicks the (heavy) index scan in the background", async () => {
+      const indexCache = new SwrCache(clock, 60_000);
+      const indexedSubsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        axiosImageFetcher,
+        SwrCache.disabled(),
+        indexCache
+      );
+      const artist = anArtist();
+      // First page then an empty page terminates the scan.
+      let n = 0;
+      mockGET.mockImplementation((_u: string, _config: any) => {
+        if (String(_u).includes("getArtists")) {
+          return Promise.resolve(ok(asArtistsJson([artist])));
+        }
+        const page =
+          n++ === 0 ? [anAlbumSummary({ id: "ix-1", name: "Alpha" })] : [];
+        return Promise.resolve(
+          ok(getAlbumListJson(page.map((a) => [artist, a] as [Artist, AlbumSummary])))
+        );
+      });
+
+      indexedSubsonic.warmAlbumIndex(credentials);
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setImmediate(r));
+      // The warm produced a settled, peekable index with the one album bucketed.
+      const peeked = indexedSubsonic.peekAlbumIndex(credentials);
+      expect(peeked).toBeDefined();
+      await expect(peeked!.then((i) => i.total)).resolves.toBe(1);
+    });
+  });
+});
+
+describe("Subsonic: album index scan aborts (and leaves no .tmp) on an inconsistent scan with a snapshot dir", () => {
+  it("removes the half-written snapshot temp file when the scan rejects (writer.abort path)", async () => {
+    const clock = new FixedClock(dayjs("2024-01-01T00:00:00Z"));
+    const indexCache = new SwrCache(clock, 60_000);
+    const snap = mkdtempSync(path.join(os.tmpdir(), "bonob-snap-abort-"));
+    try {
+      const onDisk = new Subsonic(
+        new URLBuilder("http://127.0.0.22:4567/ctx"),
+        NO_CUSTOM_PLAYERS,
+        axiosImageFetcher,
+        SwrCache.disabled(),
+        indexCache,
+        false,
+        {},
+        undefined,
+        snap
+      );
+      const artist = anArtist();
+      const firstPage = Array.from({ length: 500 }, (_, i) =>
+        anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
+      );
+      const driftedSecondPage = [anAlbumSummary({ id: "album-499", name: "Dup" })];
+
+      const mockGET = jest.fn();
+      const mockRandom = jest.fn().mockReturnValue("saltysalty");
+      axios.get = mockGET;
+      (random.generateRandomString as jest.Mock) = mockRandom;
+      mockGET.mockImplementation((_u: string, config: any) => {
+        const offset = Number(config.params.get("offset"));
+        const page = offset === 0 ? firstPage : driftedSecondPage;
+        return Promise.resolve(
+          ok(getAlbumListJson(page.map((a) => [artist, a] as [Artist, AlbumSummary])))
+        );
+      });
+
+      await expect(onDisk.getAlbumIndex(credentialsStub())).rejects.toThrow(
+        "Inconsistent album index scan"
+      );
+      await new Promise((r) => setImmediate(r));
+      // The writer was aborted: no leftover .tmp snapshot remains in the directory.
+      const leftovers = readdirSync(snap).filter((f) => f.endsWith(".tmp"));
+      expect(leftovers).toEqual([]);
+    } finally {
+      rmSync(snap, { recursive: true, force: true });
+    }
+  });
+});
+
+// Minimal credentials stub for the snapshot-abort test (its assertions don't depend on auth).
+const credentialsStub = () => ({ username: "snap-user", password: "snap-pass" });
