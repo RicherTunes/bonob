@@ -183,5 +183,28 @@ describe("BUrn", () => {
       expect(parse(formatForURL(burn))).toEqual(burn);
     });
   });
+
+  describe("invalid input", () => {
+    // Covers BURN.parse's no-match arm (-> undefined), BURN.validate's `!b` arm, and parse()'s
+    // validation throw. A mutant that drops the `validationErrors.length > 0` throw returns a
+    // bogus {system: undefined, resource: undefined} instead of throwing -> red.
+    it("rejects a string that is not a burn at all", () => {
+      expect(() => parse("not-a-burn")).toThrow(/Invalid burn: 'not-a-burn'/);
+    });
+
+    it("rejects a malformed encrypted burn (decrypt failure throws, not silently swallowed)", () => {
+      // Covers the E.match error branch in the encrypted parse path. A mutant that returns the
+      // error instead of throwing (e.g. `(err) => err`) makes this red.
+      expect(() => parse("bnb:encrypted:cannot-decrypt-this")).toThrow();
+    });
+
+    it("preserves an unknown system through shorthand formatting (the || fallback)", () => {
+      // SHORTHAND_MAPPINGS has no entry for 'made-up-system', so format must fall back to the
+      // original system string. Drop the fallback and the system becomes 'undefined'.
+      expect(
+        format({ system: "made-up-system", resource: "r" }, { shorthand: true })
+      ).toEqual("bnb:made-up-system:r");
+    });
+  });
 });
 
