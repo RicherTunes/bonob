@@ -26,7 +26,8 @@ import {
   ratingAsInt,
   ratingFromInt,
   internetRadioStation,
-  findLoginToken
+  findLoginToken,
+  MAX_ALBUMS_FLAT,
 } from "../src/smapi";
 
 import { keys as i8nKeys } from "../src/i8n";
@@ -53,6 +54,7 @@ import {
   artistToArtistSummary,
   MusicService,
   playlistToPlaylistSummary,
+  AuthFailure,
 } from "../src/music_library";
 import { APITokens } from "../src/api_tokens";
 import dayjs from "dayjs";
@@ -999,6 +1001,33 @@ describe("wsdl api", () => {
               expect(smapiAuthTokens.issue).toHaveBeenCalledWith(refreshedServiceToken);
             });
           });
+
+          describe("when the music service fails to refresh the token", () => {
+            it("returns a LoginUnauthorized fault", async () => {
+              smapiAuthTokens.verify.mockReturnValue(E.right(serviceToken));
+              musicService.refreshToken.mockReturnValue(
+                TE.left(new AuthFailure("refresh failed"))
+              );
+
+              const ws = await createClientAsync(`${service.uri}?wsdl`, {
+                endpoint: service.uri,
+                httpClient: supersoap(server),
+              });
+              randomlySetAuthenticationMethod(ws, smapiAuthToken.token);
+
+              await ws
+                .refreshAuthTokenAsync({})
+                .then(() => fail("shouldnt get here"))
+                .catch((e: any) => {
+                  expect(e.root.Envelope.Body.Fault).toEqual({
+                    faultcode: "Client.LoginUnauthorized",
+                    faultstring:
+                      "Failed to authenticate, try Re-Authorising your account in the sonos app",
+                  });
+                });
+              expect(musicService.refreshToken).toHaveBeenCalledWith(serviceToken);
+            });
+          });
         });
 
         describe("search", () => {
@@ -1281,6 +1310,65 @@ describe("wsdl api", () => {
           itShouldHandleInvalidCredentials((ws) =>
             ws.getMetadataAsync({ id: "root", index: 0, count: 0 })
           );
+
+          // The `login()` helper has a branch the itShouldHandleInvalidCredentials ladder cannot
+          // reach: auth SUCCEEDS (valid token) but musicService.login() then rejects, and an
+          // expired token whose refresh ALSO fails. Both must surface as LoginUnauthorized.
+          describe("when a valid token verifies but the music service login rejects", () => {
+            it("returns a LoginUnauthorized fault, not the raw backend error", async () => {
+              smapiAuthTokens.verify.mockReturnValue(E.right(serviceToken));
+              apiTokens.mint.mockReturnValue(apiToken);
+              musicService.login.mockRejectedValue(new Error("backend down"));
+
+              const ws = await createClientAsync(`${service.uri}?wsdl`, {
+                endpoint: service.uri,
+                httpClient: supersoap(server),
+              });
+              randomlySetAuthenticationMethod(ws, smapiAuthToken.token);
+
+              await ws
+                .getMetadataAsync({ id: "root", index: 0, count: 0 })
+                .then(() => fail("shouldnt get here"))
+                .catch((e: any) => {
+                  expect(e.root.Envelope.Body.Fault).toEqual({
+                    faultcode: "Client.LoginUnauthorized",
+                    faultstring:
+                      "Failed to authenticate, try Re-Authorising your account in the sonos app",
+                  });
+                });
+              expect(musicService.login).toHaveBeenCalledWith(serviceToken);
+            });
+          });
+
+          describe("when an expired token cannot be refreshed", () => {
+            it("returns a LoginUnauthorized fault", async () => {
+              smapiAuthTokens.verify.mockReturnValue(
+                E.left(new ExpiredTokenError(serviceToken))
+              );
+              musicService.refreshToken.mockReturnValue(
+                TE.left(new AuthFailure("refresh failed"))
+              );
+
+              const ws = await createClientAsync(`${service.uri}?wsdl`, {
+                endpoint: service.uri,
+                httpClient: supersoap(server),
+              });
+              randomlySetAuthenticationMethod(ws, smapiAuthToken.token);
+
+              await ws
+                .getMetadataAsync({ id: "root", index: 0, count: 0 })
+                .then(() => fail("shouldnt get here"))
+                .catch((e: any) => {
+                  expect(e.root.Envelope.Body.Fault).toEqual({
+                    faultcode: "Client.LoginUnauthorized",
+                    faultstring:
+                      "Failed to authenticate, try Re-Authorising your account in the sonos app",
+                  });
+                });
+              expect(musicService.refreshToken).toHaveBeenCalledWith(serviceToken);
+              expect(musicService.login).not.toHaveBeenCalled();
+            });
+          });
 
           describe("when valid credentials are provided", () => {
             let ws: Client;
@@ -1947,6 +2035,25 @@ describe("wsdl api", () => {
                 expect(md.total).toEqual(0);
                 expect(md.count).toEqual(0);
               });
+
+              it("omits artistId when the favourite song's artist has no id", async () => {
+                // a TrackSummary whose artist.id is undefined: topSongMetadata must emit
+                // artistId: undefined, NOT a synthetic "artist:undefined"
+                const noIdArtist = anArtistSummary();
+                noIdArtist.id = undefined;
+                const t = aTrack({ artist: noIdArtist });
+                musicLibrary.starredSongs.mockResolvedValue([t]);
+
+                const result = await ws.getMetadataAsync({
+                  id: "favouriteSongs",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                const items = ([] as any[]).concat(md.mediaMetadata);
+                expect(items[0].trackMetadata.artistId).toBeUndefined();
+              });
             });
 
             describe("asking for artists", () => {
@@ -1992,6 +2099,31 @@ describe("wsdl api", () => {
                   });
                   // and it kicked the warm in the background
                   expect(musicLibrary.artists).toHaveBeenCalled();
+                });
+
+                it("swallows a failing background artist warm so it cannot surface as an unhandled rejection", async () => {
+                  musicLibrary.peekArtists.mockReturnValue(undefined);
+                  musicLibrary.artists.mockReturnValue(
+                    Promise.reject(new Error("warm failed"))
+                  );
+
+                  const unhandled: unknown[] = [];
+                  const onUR = (reason: unknown) => unhandled.push(reason);
+                  process.on("unhandledRejection", onUR);
+                  try {
+                    const result = await ws.getMetadataAsync({
+                      id: "artists",
+                      index: 0,
+                      count: 100,
+                    });
+                    const md = (result[0] as any).getMetadataResult;
+                    expect(md.total).toEqual(1);
+                    expect(musicLibrary.artists).toHaveBeenCalled();
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    expect(unhandled).toEqual([]);
+                  } finally {
+                    process.removeListener("unhandledRejection", onUR);
+                  }
                 });
               });
 
@@ -2640,6 +2772,94 @@ describe("wsdl api", () => {
                   expect(musicLibrary.albumCount).toHaveBeenCalled();
                   expect(musicLibrary.albums).not.toHaveBeenCalled();
                 });
+
+                it("swallows a failing background album-count warm so it cannot surface as an unhandled rejection", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.peekAlbumCount.mockReturnValue(undefined);
+                  musicLibrary.albumCount.mockReturnValue(
+                    Promise.reject(new Error("warm failed"))
+                  );
+
+                  const unhandled: unknown[] = [];
+                  const onUR = (reason: unknown) => unhandled.push(reason);
+                  process.on("unhandledRejection", onUR);
+                  try {
+                    const result = await ws.getMetadataAsync({
+                      id: "albums",
+                      index: 0,
+                      count: 100,
+                    });
+                    const md = (result[0] as any).getMetadataResult;
+                    expect(md.total).toEqual(1);
+                    expect(musicLibrary.albumCount).toHaveBeenCalled();
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    expect(unhandled).toEqual([]);
+                  } finally {
+                    process.removeListener("unhandledRejection", onUR);
+                  }
+                });
+              });
+
+              describe("deciding small vs large from the warm count (index cold)", () => {
+                it("kicks the index build and serves the placeholder when count > MAX_ALBUMS_FLAT", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.peekAlbumCount.mockReturnValue(
+                    Promise.resolve(MAX_ALBUMS_FLAT + 5000)
+                  );
+                  // a rejecting warm proves the fire-and-forget .catch swallows the failure
+                  // rather than surfacing it on the browse path
+                  musicLibrary.albumIndex.mockReturnValue(
+                    Promise.reject(new Error("build boom"))
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albums",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  expect(md.mediaCollection).toMatchObject({ id: "albums" });
+                  // the large path kicks the index and never touches the live albums fetch
+                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                  expect(musicLibrary.albums).not.toHaveBeenCalled();
+                });
+
+                it("serves the flat list LIVE at exactly the cap (count === MAX_ALBUMS_FLAT), never building the index", async () => {
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.peekAlbumCount.mockReturnValue(
+                    Promise.resolve(MAX_ALBUMS_FLAT)
+                  );
+                  const page = [pop1, pop2];
+                  musicLibrary.albums.mockResolvedValue({
+                    results: page,
+                    total: MAX_ALBUMS_FLAT,
+                  });
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albums",
+                    index: 0,
+                    count: 2,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: page.map((it) =>
+                        album(bonobUrlWithAccessToken, it)
+                      ),
+                      index: 0,
+                      total: MAX_ALBUMS_FLAT,
+                    })
+                  );
+                  expect(musicLibrary.albums).toHaveBeenCalledWith({
+                    type: "alphabeticalByName",
+                    _index: 0,
+                    _count: 2,
+                  });
+                  // at exactly the cap the catalog is NOT considered large: no index build
+                  expect(musicLibrary.albumIndex).not.toHaveBeenCalled();
+                });
               });
 
               describe("asking for a letter's albums (albumsByLetter)", () => {
@@ -2838,6 +3058,110 @@ describe("wsdl api", () => {
                   expect(md.count).toEqual(0);
                   // an empty mediaCollection collapses to undefined over the SOAP round-trip
                   expect(md.mediaCollection ?? []).toEqual([]);
+                });
+
+                it("does not block on a cold index for a valid chunk, kicking the build and serving a placeholder", async () => {
+                  // valid chunk id (P_0 passes the parser) but the index is not warm yet
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.albumIndex.mockReturnValue(
+                    Promise.reject(new Error("build boom"))
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsChunk:P_0",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  expect(md.total).toEqual(1);
+                  expect(md.mediaCollection).toMatchObject({
+                    itemType: "albumList",
+                    id: "albumsChunk:P_0",
+                    title: "Indexing your albums… (open again shortly)",
+                  });
+                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                });
+
+                it("treats a chunk id with no underscore as chunk 0 of the letter", async () => {
+                  // "albumsChunk:P" has no _<n>; the parser defaults to chunk 0
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: 2,
+                      buckets: [{ key: "P", label: "P", offset: 0, count: 2 }],
+                      items: [pop1, pop2],
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsChunk:P",
+                    index: 0,
+                    count: 100,
+                  });
+
+                  expect(result[0]).toEqual(
+                    getMetadataResult({
+                      mediaCollection: [pop1, pop2].map(albumItem),
+                      index: 0,
+                      total: 2,
+                    })
+                  );
+                });
+
+                it("swallows a failing background index warm so it cannot surface as an unhandled rejection", async () => {
+                  // The fire-and-forget warm is `void albumIndex().catch(() => undefined)`: the catch
+                  // is the only thing stopping a rejecting warm from becoming an unhandled rejection.
+                  musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                  musicLibrary.albumIndex.mockReturnValue(
+                    Promise.reject(new Error("warm failed"))
+                  );
+
+                  const unhandled: unknown[] = [];
+                  const onUR = (reason: unknown) => unhandled.push(reason);
+                  process.on("unhandledRejection", onUR);
+                  try {
+                    const result = await ws.getMetadataAsync({
+                      id: "albumsByLetter:S",
+                      index: 0,
+                      count: 100,
+                    });
+                    const md = (result[0] as any).getMetadataResult;
+                    expect(md.total).toEqual(1);
+                    expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                    // cross a macrotask boundary so an unhandled rejection would have fired
+                    await new Promise((resolve) => setTimeout(resolve, 0));
+                    expect(unhandled).toEqual([]);
+                  } finally {
+                    process.removeListener("unhandledRejection", onUR);
+                  }
+                });
+
+                it("serves a letter whose total is exactly at the cap as a page, not chunk containers", async () => {
+                  // letterTotal === MAX_ALBUMS_FLAT must NOT be split (the split uses a strict >).
+                  const items = new Array(MAX_ALBUMS_FLAT).fill(pop1);
+                  musicLibrary.peekAlbumIndex.mockReturnValue(
+                    Promise.resolve({
+                      total: MAX_ALBUMS_FLAT,
+                      buckets: [
+                        { key: "P", label: "P", offset: 0, count: MAX_ALBUMS_FLAT },
+                      ],
+                      items,
+                    })
+                  );
+
+                  const result = await ws.getMetadataAsync({
+                    id: "albumsByLetter:P",
+                    index: 0,
+                    count: 5,
+                  });
+
+                  const md = (result[0] as any).getMetadataResult;
+                  // advertised as the letter total (a page), NOT as ceil(cap/cap)=1 chunk container
+                  expect(md.total).toEqual(MAX_ALBUMS_FLAT);
+                  const served = ([] as any[]).concat(md.mediaCollection);
+                  expect(served.length).toEqual(5);
+                  // albums, not albumsChunk:* containers
+                  expect(served.every((c) => c.id.startsWith("album:"))).toBe(true);
                 });
               });
 
@@ -3459,6 +3783,63 @@ describe("wsdl api", () => {
                   },
                 });
                 expect(musicLibrary.album).toHaveBeenCalledWith(album.id);
+              });
+            });
+
+            describe("getExtendedMetadataText", () => {
+              it("returns an empty result for an unsupported textType without fetching artist data", async () => {
+                const root = await ws.getExtendedMetadataTextAsync({
+                  id: `track:${uuid()}`,
+                  type: "ALBUM_REVIEW",
+                });
+
+                expect(root[0]).toEqual({ getExtendedMetadataTextResult: "" });
+                // the unsupported-textType path must NOT call out to artist() for a bio
+                expect(musicLibrary.artist).not.toHaveBeenCalled();
+              });
+
+              it("returns an empty string for ARTIST_BIO when the artist has no biography", async () => {
+                const artist = anArtist({
+                  biography: undefined,
+                  similarArtists: [],
+                  albums: [],
+                });
+                musicLibrary.artist.mockResolvedValue(artist);
+
+                const root = await ws.getExtendedMetadataTextAsync({
+                  id: `artist:${artist.id}`,
+                  type: "ARTIST_BIO",
+                });
+
+                expect(root[0]).toEqual({ getExtendedMetadataTextResult: "" });
+                expect(musicLibrary.artist).toHaveBeenCalledWith(artist.id);
+              });
+            });
+
+            describe("asking for a playlist", () => {
+              it("returns the playlist as a single mediaCollection", async () => {
+                const pl = aPlaylist();
+                musicLibrary.playlist.mockResolvedValue(pl);
+
+                const root = await ws.getExtendedMetadataAsync({
+                  id: `playlist:${pl.id}`,
+                });
+
+                expect(root[0]).toEqual({
+                  getExtendedMetadataResult: {
+                    mediaCollection: {
+                      itemType: "playlist",
+                      id: `playlist:${pl.id}`,
+                      title: pl.name,
+                      albumArtURI: coverArtURI(bonobUrlWithAccessToken, pl).href(),
+                      canPlay: true,
+                      attributes: {
+                        userContent: "true",
+                      },
+                    },
+                  },
+                });
+                expect(musicLibrary.playlist).toHaveBeenCalledWith(pl.id);
               });
             });
 
