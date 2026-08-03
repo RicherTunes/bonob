@@ -37,6 +37,7 @@ import {
   MAX_ALBUMS_FLAT,
 } from "./album_index";
 import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
+import { MAX_ARTISTS_FLAT } from "./artist_index";
 import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
 import {
   isExpiredTokenError,
@@ -1050,14 +1051,14 @@ function bindSmapiSoapServiceToExpress(
                       ],
                     });
                   case "artists": {
-                    // The full artist list is a multi-second cold fetch (~6-13s for a big library);
-                    // blocking on it blows the Sonos ~5s timeout ("not responding" the first time,
-                    // works the second). If it is not warm yet, kick the warm in the background and
-                    // return a bounded placeholder; the next browse serves real artists from the
-                    // now-warm cache. Mirrors the cold album-index handling.
-                    if (!musicLibrary.peekArtists()) {
-                      void musicLibrary.artists(paging).catch(() => undefined);
-                      return getMetadataResult({
+                    // The artist index is the cached getArtists response with Navidrome's index-letter
+                    // grouping preserved (NOT re-derived from names). Warm -> serve the flat list for a
+                    // small catalog, or the A-Z letter menu for a large one (no single container may
+                    // advertise the whole-catalog artist total — the same S2 ceiling that forced albums
+                    // into buckets). Cold -> kick the warm and return a bounded placeholder, exactly as
+                    // the Albums branch does.
+                    const artistsPlaceholder = () =>
+                      getMetadataResult({
                         mediaCollection: [
                           {
                             itemType: "container",
@@ -1071,14 +1072,159 @@ function bindSmapiSoapServiceToExpress(
                         index: 0,
                         total: 1,
                       });
+                    const peekedArtists = musicLibrary.peekArtistIndex();
+                    if (peekedArtists) {
+                      return peekedArtists.then(async (idx) => {
+                        // A catalog that shrank back under the cap can still serve flat from the index.
+                        if (idx.total <= MAX_ARTISTS_FLAT) {
+                          return getMetadataResult({
+                            mediaCollection: (
+                              await readAlbumIndexAll(
+                                idx,
+                                paging._index,
+                                paging._count
+                              )
+                            ).map((it) => artist(urlWithToken(apiKey), it)),
+                            index: paging._index,
+                            total: idx.total,
+                          });
+                        }
+                        const letters = albumIndexLetters(idx);
+                        return getMetadataResult({
+                          mediaCollection: letters.map((b) => ({
+                            itemType: "container",
+                            id: `artistsByLetter:${b.key}`,
+                            title: b.label,
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "artists").href()
+                            ),
+                          })),
+                          index: 0,
+                          total: letters.length,
+                        });
+                      });
                     }
-                    return musicLibrary.artists(paging).then((result) => {
+                    // Cold: never block the browse on the multi-second getArtists. Kick the warm and
+                    // show the retry placeholder.
+                    void musicLibrary.artistIndex().catch(() => undefined);
+                    return artistsPlaceholder();
+                  }
+                  case "artistsByLetter": {
+                    const peekedLetter = musicLibrary.peekArtistIndex();
+                    if (!peekedLetter) {
+                      // Never block a leaf browse on the multi-second getArtists; kick the warm and
+                      // show the retry placeholder instead.
+                      void musicLibrary.artistIndex().catch(() => undefined);
                       return getMetadataResult({
-                        mediaCollection: result.results.map((it) =>
+                        mediaCollection: [
+                          {
+                            itemType: "container",
+                            id: `artistsByLetter:${typeId}`,
+                            title: "Loading your artists… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "artists").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    }
+                    return peekedLetter.then(async (idx) => {
+                      const letterTotal = albumIndexLetterTotal(idx, typeId);
+                      if (letterTotal > MAX_ARTISTS_FLAT) {
+                        // A single letter is itself too big for one S2 container; split it into
+                        // fixed-size sub-buckets so no leaf ever advertises an oversized total.
+                        const chunks = Math.ceil(letterTotal / MAX_ARTISTS_FLAT);
+                        const chunkIndexes = range(chunks).slice(
+                          paging._index,
+                          paging._index + paging._count
+                        );
+                        return getMetadataResult({
+                          mediaCollection: chunkIndexes.map((i) => ({
+                            itemType: "container",
+                            id: `artistsChunk:${typeId}_${i}`,
+                            title: `${typeId} · part ${i + 1}`,
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "artists").href()
+                            ),
+                          })),
+                          index: paging._index,
+                          total: chunks,
+                        });
+                      }
+                      // Serve the letter's page straight from the index (drift-proof: no live
+                      // re-fetch by offset). Advertise only this letter's total.
+                      const page = await readAlbumIndexPage(
+                        idx,
+                        typeId,
+                        paging._index,
+                        paging._count
+                      );
+                      return getMetadataResult({
+                        mediaCollection: page.items.map((it) =>
                           artist(urlWithToken(apiKey), it)
                         ),
                         index: paging._index,
-                        total: result.total,
+                        total: page.total,
+                      });
+                    });
+                  }
+                  case "artistsChunk": {
+                    // A sub-bucket of an oversized letter: "artistsChunk:<key>_<n>". Parse from the
+                    // right so a "#" key works (mirrors albumsChunk).
+                    const sep = typeId.lastIndexOf("_");
+                    const chunkKey = sep >= 0 ? typeId.slice(0, sep) : typeId;
+                    const chunkText = sep >= 0 ? typeId.slice(sep + 1) : "0";
+                    const chunk = Number(chunkText);
+                    if (!/^\d+$/.test(chunkText) || !Number.isSafeInteger(chunk)) {
+                      return getMetadataResult({
+                        mediaCollection: [],
+                        index: paging._index,
+                        total: 0,
+                      });
+                    }
+                    const peekedChunk = musicLibrary.peekArtistIndex();
+                    if (!peekedChunk) {
+                      void musicLibrary.artistIndex().catch(() => undefined);
+                      return getMetadataResult({
+                        mediaCollection: [
+                          {
+                            itemType: "container",
+                            id: `artistsChunk:${typeId}`,
+                            title: "Loading your artists… (open again shortly)",
+                            albumArtURI: albumArtURI(
+                              iconArtURI(bonobUrl, "artists").href()
+                            ),
+                          },
+                        ],
+                        index: 0,
+                        total: 1,
+                      });
+                    }
+                    return peekedChunk.then(async (idx) => {
+                      const base = chunk * MAX_ARTISTS_FLAT;
+                      const letterTotal = albumIndexLetterTotal(idx, chunkKey);
+                      const chunkTotal = Math.max(
+                        0,
+                        Math.min(MAX_ARTISTS_FLAT, letterTotal - base)
+                      );
+                      const take = Math.min(
+                        paging._count,
+                        Math.max(0, chunkTotal - paging._index)
+                      );
+                      const page = await readAlbumIndexPage(
+                        idx,
+                        chunkKey,
+                        base + paging._index,
+                        take
+                      );
+                      return getMetadataResult({
+                        mediaCollection: page.items.map((it) =>
+                          artist(urlWithToken(apiKey), it)
+                        ),
+                        index: paging._index,
+                        total: chunkTotal,
                       });
                     });
                   }

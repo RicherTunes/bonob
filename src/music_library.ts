@@ -23,6 +23,16 @@ export type ArtistSummary = {
   image: BUrn | undefined;
 };
 
+// One row of the cached artist index. Carries albumCount so the album total (albumCount and the
+// alphabetical getAlbumList2 total) is still summed from this one source — the index is the single
+// cached view of the getArtists response, and the flat artist list is derived from its items.
+export type ArtistRecord = {
+  id: string;
+  name: string;
+  albumCount: number;
+  image: BUrn | undefined;
+};
+
 export type SimilarArtist = ArtistSummary & { inLibrary: boolean };
 
 // todo: maybe is should be artist.summary rather than an artist also being a summary?
@@ -212,6 +222,13 @@ export interface MusicLibrary {
   // Non-blocking peek at the artist list: undefined until warm (settled), so a cold Artists browse
   // returns a placeholder instead of blocking on the multi-second full-artist fetch. Value unused.
   peekArtists(): Promise<unknown> | undefined;
+  // Cached artist index (Navidrome's index-letter grouping preserved, NOT re-derived from names),
+  // used to break the huge flat Artists list into bounded per-letter buckets so no single container
+  // advertises the whole-catalog artist total. The single cached view of getArtists.
+  artistIndex(): Promise<AlbumIndex<ArtistRecord>>;
+  // Non-blocking peek at the artist index: undefined until warm, so a cold Artists browse returns a
+  // placeholder instead of blocking on the multi-second getArtists; otherwise the resolved index.
+  peekArtistIndex(): Promise<AlbumIndex<ArtistRecord>> | undefined;
   album(id: string): Promise<Album>;
   track(trackId: string): Promise<Track>;
   genres(): Promise<Genre[]>;

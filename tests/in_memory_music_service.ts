@@ -5,6 +5,7 @@ import { pipe } from "fp-ts/lib/function";
 import { ordString, fromCompare } from "fp-ts/lib/Ord";
 import { shuffle } from "underscore";
 import { buildAlbumIndexFromPages } from "../src/album_index";
+import { buildArtistIndex } from "../src/artist_index";
 
 import { b64Encode, b64Decode } from "../src/b64";
 
@@ -25,6 +26,22 @@ import {
   Rating,
 } from "../src/music_library";
 import { BUrn } from "../src/burn";
+
+// The in-memory service has no Navidrome to group artists by index letter, so for the small test
+// fixtures every artist is placed in one bucket and only the flat browse path is exercised. The
+// records carry albumCount so the AlbumIndex<ArtistRecord> interface is satisfied.
+const inMemoryArtistIndex = (artists: Artist[]) =>
+  buildArtistIndex([
+    {
+      name: "A",
+      artist: artists.map((a) => ({
+        id: a.id!,
+        name: a.name,
+        albumCount: a.albums.length,
+        image: artistToArtistSummary(a).image,
+      })),
+    },
+  ]);
 
 export class InMemoryMusicService implements MusicService {
   users: Record<string, string> = {};
@@ -120,6 +137,8 @@ export class InMemoryMusicService implements MusicService {
       peekAlbumCount: () =>
         Promise.resolve(this.artists.flatMap((a) => a.albums).length),
       peekArtists: () => Promise.resolve(this.artists),
+      artistIndex: () => Promise.resolve(inMemoryArtistIndex(this.artists)),
+      peekArtistIndex: () => Promise.resolve(inMemoryArtistIndex(this.artists)),
       album: (id: string) =>
         pipe(
           this.artists.flatMap((it) => it.albums).find((it) => it.id === id),
