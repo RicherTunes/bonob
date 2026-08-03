@@ -14,6 +14,8 @@ import {
   STRINGS_ROUTE,
   getMetadataResult,
   splitId,
+  withSplitId,
+  SOAP_PATH,
   PRESENTATION_MAP_ROUTE,
   SONOS_RECOMMENDED_IMAGE_SIZES,
   track,
@@ -29,6 +31,7 @@ import {
   findLoginToken,
   MAX_ALBUMS_FLAT,
 } from "../src/smapi";
+import logger from "../src/logger";
 
 import { keys as i8nKeys } from "../src/i8n";
 import {
@@ -76,6 +79,39 @@ describe("splitId", () => {
     // ids whose typeId itself contains colons must NOT be truncated
     expect(splitId("artist:a:b")).toEqual({ type: "artist", typeId: "a:b" });
     expect(splitId("topSongs:a:b")).toEqual({ type: "topSongs", typeId: "a:b" });
+  });
+});
+
+describe("withSplitId", () => {
+  // Directly exercises the withSplitId combinator (the declaration line is otherwise only ever
+  // hit indirectly through handler chains). A mutant that drops the spread of splitId(id), or
+  // hard-codes the typeId, makes the merged object wrong -> red.
+  it("merges the split type/typeId into the target object", () => {
+    const base = { musicLibrary: "ml", apiKey: "k" };
+    expect(withSplitId("track:abc")(base)).toEqual({
+      musicLibrary: "ml",
+      apiKey: "k",
+      type: "track",
+      typeId: "abc",
+    });
+  });
+
+  it("preserves ids whose typeId itself contains colons (split-on-first-colon)", () => {
+    expect(withSplitId("topSongs:a:b:c")({ x: 1 })).toEqual({
+      x: 1,
+      type: "topSongs",
+      typeId: "a:b:c",
+    });
+  });
+
+  it("returns an empty typeId when there is no colon", () => {
+    expect(withSplitId("root")({ x: 1 })).toEqual({ x: 1, type: "root", typeId: "" });
+  });
+
+  it("does not mutate the target it receives", () => {
+    const target = { a: 1 };
+    withSplitId("album:9")(target);
+    expect(target).toEqual({ a: 1 });
   });
 });
 
@@ -443,6 +479,76 @@ describe("getMetadataResult", () => {
   });
 });
 
+describe("searchResult", () => {
+  // Mirrors the getMetadataResult coverage, but for the search-shaped response. Existing tests
+  // only build searchResult with mediaCollection, leaving its `mediaMetadata &&` sanitize arm
+  // uncovered; this block exercises both arms and the count summing.
+  describe("XML sanitization (mediaMetadata arm)", () => {
+    it("strips XML-1.0-invalid control characters from emitted mediaMetadata text", () => {
+      const bad = String.fromCharCode(4); // U+0004, illegal in XML 1.0
+      const result = searchResult({
+        mediaMetadata: [
+          {
+            itemType: "track",
+            id: "track:1",
+            title: "Awaken" + bad + " My Love!",
+          },
+        ],
+      });
+      const item = result.searchResult.mediaMetadata![0];
+      expect(item.title).toEqual("Awaken My Love!");
+    });
+  });
+
+  describe("when there are a no mediaCollections & no mediaMetadata", () => {
+    it("should have zero count and neither key", () => {
+      const result = searchResult({ index: 33, total: 99 });
+      expect(result).toEqual({
+        searchResult: {
+          count: 0,
+          index: 33,
+          total: 99,
+        },
+      });
+    });
+  });
+
+  describe("when there are a number of mediaCollections but no mediaMetadata", () => {
+    it("emits mediaCollection and omits the mediaMetadata key entirely (&& short-circuits)", () => {
+      const mediaCollection = [{}, {}];
+      const result = searchResult({ mediaCollection, index: 22, total: 3 });
+      expect(result).toEqual({
+        searchResult: {
+          count: 2,
+          index: 22,
+          total: 3,
+          mediaCollection,
+        },
+      });
+      // A mutant that drops the `&&` guard (always spreads {mediaMetadata: sanitizeXml(undefined)})
+      // would add a `mediaMetadata: undefined` key here.
+      expect(result.searchResult).not.toHaveProperty("mediaMetadata");
+    });
+  });
+
+  describe("when there are both a number of mediaMetadata & mediaCollections", () => {
+    it("should sum the counts and emit both (sanitized)", () => {
+      const mediaCollection = [{}, {}, {}];
+      const mediaMetadata = [{}, {}];
+      const result = searchResult({ mediaCollection, mediaMetadata, index: 22, total: 3 });
+      expect(result).toEqual({
+        searchResult: {
+          count: 5,
+          index: 22,
+          total: 3,
+          mediaCollection,
+          mediaMetadata,
+        },
+      });
+    });
+  });
+});
+
 describe("track", () => {
   it("should map into a sonos expected track", () => {
     const bonobUrl = url("http://localhost:4567/foo?access-token=1234");
@@ -780,6 +886,34 @@ describe("wsdl api", () => {
       }
 
       describe("soap api", () => {
+        describe("soapyService.log error routing", () => {
+          // The soap library invokes soapyService.log('error', err, req) from its synchronous
+          // catch in _processRequestXml (node-soap server.js ~L247) when a request body cannot be
+          // parsed. Our switch routes that to logger.error({level:'error', data}). A malformed-XML
+          // POST is the smallest request that triggers it; a mutant that drops the `case "error":`
+          // arm (or retargets it) stops logger.error receiving {level:'error'} -> red.
+          it("routes a soap-lib 'error' log to logger.error when the request body is unparseable", async () => {
+            const errorSpy = jest.spyOn(logger, "error");
+            try {
+              const res = await request(server)
+                .post(bonobUrl.append({ pathname: SOAP_PATH }).path())
+                .set("Content-Type", "text/xml; charset=utf-8")
+                .send("<<<this is not valid xml>>>");
+              // The soap lib replies 500 to an unparseable body (it throws in wsdl.xmlToObject).
+              expect([500, 400]).toContain(res.status);
+              const routedThroughErrorArm = errorSpy.mock.calls.some(
+                (args) =>
+                  args[0] &&
+                  typeof args[0] === "object" &&
+                  (args[0] as { level?: string }).level === "error"
+              );
+              expect(routedThroughErrorArm).toBe(true);
+            } finally {
+              errorSpy.mockRestore();
+            }
+          });
+        });
+
         describe("getAppLink", () => {
           it("should do something", async () => {
             const ws = await createClientAsync(`${service.uri}?wsdl`, {
