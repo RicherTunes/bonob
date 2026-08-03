@@ -25,7 +25,10 @@ import {
   DEFAULT_COVER_ART_HTTP_TIMEOUT_MS,
   CoverArtUnavailableError,
   CoverArtUpstreamError,
+  ALBUM_SCAN_PAGE_SIZE,
 } from "../src/subsonic";
+import { MAX_ALBUMS_FLAT } from "../src/album_index";
+import logger from "../src/logger";
 
 import {
   SubsonicMusicService,
@@ -2519,6 +2522,20 @@ describe("SubsonicMusicLibrary", () => {
       const result = await subsonic.coverArt(coverArtURN, 180);
       expect(result).toEqual({ contentType: "image/jpeg", data: Buffer.from("the bytes") });
     });
+
+    // A 200 carrying NO content-type must collapse contentType to "" (not undefined): the HTTP layer
+    // answers an image/* check, and undefined would crash it. The `?? ""` default is the guard.
+    it("returns an empty contentType string when the upstream 200 has no content-type header", async () => {
+      mockGET.mockImplementationOnce(() =>
+        Promise.resolve({
+          status: 200,
+          headers: {}, // content-type deliberately absent from an otherwise well-formed response
+          data: Buffer.from("the bytes"),
+        })
+      );
+      const result = await subsonic.coverArt(coverArtURN, 180);
+      expect(result).toEqual({ contentType: "", data: Buffer.from("the bytes") });
+    });
   });
   describe("rate", () => {
     const trackId = uuid();
@@ -4111,5 +4128,276 @@ describe("SubsonicMusicLibrary", () => {
         );
       });
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// login: the fire-and-forget warm-up chain (warmArtists + the albumCount -> warmAlbumIndex gate).
+// These exercise the real branching in SubsonicMusicService.login, which is otherwise entirely
+// uncovered: the strict `count > MAX_ALBUMS_FLAT` threshold (both arms) and the `.catch` that
+// insulates login from an albumCount failure.
+// ---------------------------------------------------------------------------
+describe("SubsonicMusicService.login", () => {
+  const credentials = { username: "login-user", password: "login-pass" };
+
+  // login is fire-and-forget on the (slow) albumCount -> warmAlbumIndex chain. Flush that chain by
+  // draining microtasks: setImmediate is faked under fake timers (a known trap here), so the
+  // Promise.resolve loop is the safe flush.
+  const flush = async () => {
+    for (let i = 0; i < 8; i++) await Promise.resolve();
+  };
+
+  const build = (
+    albumCount: jest.Mock
+  ): { service: SubsonicMusicService; sub: any } => {
+    const sub = {
+      ping: jest.fn(),
+      warmArtists: jest.fn(),
+      albumCount,
+      warmAlbumIndex: jest.fn(),
+    };
+    const service = new SubsonicMusicService(sub as unknown as Subsonic);
+    return { service, sub };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("returns a SubsonicMusicLibrary and pre-warms the artist list with the parsed credentials", async () => {
+    const { service, sub } = build(jest.fn().mockResolvedValue(0));
+
+    const library = await service.login(asToken(credentials));
+
+    expect(library).toBeInstanceOf(SubsonicMusicLibrary);
+    // warmArtists receives the credentials round-tripped through parseToken(asToken(...)).
+    expect(sub.warmArtists).toHaveBeenCalledWith(credentials);
+    await flush();
+  });
+
+  it("warms the album index when the catalog is LARGER than MAX_ALBUMS_FLAT", async () => {
+    const { service, sub } = build(jest.fn().mockResolvedValue(MAX_ALBUMS_FLAT + 1));
+
+    await service.login(asToken(credentials));
+    await flush();
+
+    expect(sub.warmAlbumIndex).toHaveBeenCalledWith(credentials);
+  });
+
+  it("does NOT warm the album index at exactly MAX_ALBUMS_FLAT (the threshold is strict >)", async () => {
+    // count == MAX_ALBUMS_FLAT must NOT trigger the multi-minute scan. This pins the boundary so a
+    // `>` -> `>=` mutation turns red (combined with the larger-catalog test above, which kills `<`).
+    const { service, sub } = build(jest.fn().mockResolvedValue(MAX_ALBUMS_FLAT));
+
+    await service.login(asToken(credentials));
+    await flush();
+
+    expect(sub.warmAlbumIndex).not.toHaveBeenCalled();
+  });
+
+  it("still resolves login (and never warms the index) when albumCount rejects", async () => {
+    // The fire-and-forget chain's own .catch(() => undefined) insulates login: an albumCount failure
+    // must not reject login nor trigger an index warm.
+    const { service, sub } = build(jest.fn().mockRejectedValue(new Error("albumCount boom")));
+
+    await expect(service.login(asToken(credentials))).resolves.toBeInstanceOf(SubsonicMusicLibrary);
+    await flush();
+
+    expect(sub.warmAlbumIndex).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// years(): the O(1) warm-album-index path and the paging-fallback branches. The real-Subsonic
+// years() test elsewhere only exercises the no-cache paging fallback; these mock-subsonic tests pin
+// the warm path (peekAlbumIndex returns a resolved index), the empty/missing years guards, the
+// no-year skip, and the incomplete-paging warning.
+// ---------------------------------------------------------------------------
+describe("SubsonicMusicLibrary years() index + paging branches", () => {
+  const credentials = { username: "years-user", password: "years-pass" };
+
+  const build = (): { library: SubsonicMusicLibrary; sub: any } => {
+    const sub = {
+      peekAlbumIndex: jest.fn(),
+      getAlbumList2: jest.fn(),
+    };
+    const library = new SubsonicMusicLibrary(
+      sub as unknown as Subsonic,
+      credentials,
+      {} as unknown as CustomPlayers
+    );
+    return { library, sub };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("serves years from a WARM album index newest-first, without paging the catalog", async () => {
+    // peekAlbumIndex returns an already-resolved promise: the O(1) warm path. Years are stored
+    // ascending in the snapshot and served newest-first here, so [1970,1980,1990] -> [1990,1980,1970].
+    const { library, sub } = build();
+    sub.peekAlbumIndex.mockReturnValue(Promise.resolve({ years: ["1970", "1980", "1990"] }));
+
+    const result = await library.years();
+
+    expect(result).toEqual([{ year: "1990" }, { year: "1980" }, { year: "1970" }]);
+    expect(sub.getAlbumList2).not.toHaveBeenCalled();
+  });
+
+  it("falls through to paging when the warm index carries an EMPTY years list", async () => {
+    // idx.years present but length 0: the `length > 0` guard is false, so years() degrades to paging.
+    const { library, sub } = build();
+    sub.peekAlbumIndex.mockReturnValue(Promise.resolve({ years: [] }));
+    sub.getAlbumList2.mockResolvedValue({ results: [], total: 0 });
+
+    const result = await library.years();
+
+    expect(result).toEqual([]);
+    expect(sub.getAlbumList2).toHaveBeenCalled();
+  });
+
+  it("falls through to paging when the warm index has NO years field at all", async () => {
+    // idx.years undefined: the `idx.years &&` short-circuit is false, so years() degrades to paging.
+    const { library, sub } = build();
+    sub.peekAlbumIndex.mockReturnValue(Promise.resolve({ total: 0, buckets: [] }));
+    sub.getAlbumList2.mockResolvedValue({ results: [], total: 0 });
+
+    const result = await library.years();
+
+    expect(result).toEqual([]);
+    expect(sub.getAlbumList2).toHaveBeenCalled();
+  });
+
+  it("skips albums that have no year while collecting distinct years from the paged catalog", async () => {
+    const { library, sub } = build();
+    sub.peekAlbumIndex.mockReturnValue(undefined);
+    // A page mixing albums with and without a year: the no-year ones must be skipped (not added as
+    // undefined) and duplicates collapse in the Set.
+    sub.getAlbumList2.mockImplementation(async (_c: any, q: any) => {
+      if (q._index === 0)
+        return {
+          results: [
+            { year: undefined },
+            { year: "1980" },
+            { year: undefined },
+            { year: "1970" },
+            { year: "1980" },
+          ],
+          total: 4,
+        };
+      return { results: [], total: 4 }; // short page -> complete
+    });
+
+    const result = await library.years();
+
+    // distinct years, sorted ascending then reversed -> newest first
+    expect(result).toEqual([{ year: "1980" }, { year: "1970" }]);
+  });
+
+  it("warns when paging hits the MAX_ALBUMS_FLAT bound without the catalog ever completing", async () => {
+    // Every page comes back FULL (== ALBUM_SCAN_PAGE_SIZE), so `results.length < PAGE_SIZE` is never
+    // true and the loop runs the whole MAX_ALBUMS_FLAT bound without setting `complete`. The
+    // `if (!complete)` branch then logs the incomplete-years warning.
+    const { library, sub } = build();
+    sub.peekAlbumIndex.mockReturnValue(undefined);
+    const fullPage = Array.from({ length: ALBUM_SCAN_PAGE_SIZE }, () => ({ year: "2000" }));
+    sub.getAlbumList2.mockResolvedValue({ results: fullPage, total: 999999 });
+
+    const warnSpy = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+
+    const result = await library.years();
+
+    // Only "2000" survived (distinct), but paging ran the full bound and warned.
+    expect(result).toEqual([{ year: "2000" }]);
+    expect(warnSpy).toHaveBeenCalled();
+    // The loop paged the WHOLE catalog (never a short page), proving the warning isn't spuriously
+    // hit on a catalog that actually completed.
+    expect(sub.getAlbumList2.mock.calls.length).toBe(MAX_ALBUMS_FLAT / ALBUM_SCAN_PAGE_SIZE);
+
+    warnSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scrobble vs nowPlaying: the two differ ONLY by the `submission` boolean passed to
+// subsonic.scrobble. The source carries a `todo: unit test the difference` comment; pinning both
+// directions kills a swap of the boolean.
+// ---------------------------------------------------------------------------
+describe("SubsonicMusicLibrary scrobble vs nowPlaying (submission flag)", () => {
+  const credentials = { username: "scrobble-user", password: "scrobble-pass" };
+
+  const build = (): { library: SubsonicMusicLibrary; sub: any } => {
+    const sub = { scrobble: jest.fn().mockResolvedValue(true) };
+    const library = new SubsonicMusicLibrary(
+      sub as unknown as Subsonic,
+      credentials,
+      {} as unknown as CustomPlayers
+    );
+    return { library, sub };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("scrobble submits with submission=true (a real scrobble)", async () => {
+    const { library, sub } = build();
+    await library.scrobble("t1");
+    expect(sub.scrobble).toHaveBeenCalledWith(credentials, "t1", true);
+  });
+
+  it("nowPlaying submits with submission=false (now-playing, NOT a scrobble)", async () => {
+    const { library, sub } = build();
+    await library.nowPlaying("t1");
+    expect(sub.scrobble).toHaveBeenCalledWith(credentials, "t1", false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// searchTracks orphan recovery: the branch where getSong SUCCEEDS but still returns no albumId.
+// The hit must be dropped individually (undefined) rather than rendered as a dead, unresolvable
+// album tile. Uses a mock subsonic to control search3/getSong/toTracks directly.
+// ---------------------------------------------------------------------------
+describe("SubsonicMusicLibrary searchTracks orphan recovery (no albumId after getSong)", () => {
+  const credentials = { username: "search-user", password: "search-pass" };
+
+  const build = (): { library: SubsonicMusicLibrary; sub: any } => {
+    const sub = {
+      search3: jest.fn(),
+      getSong: jest.fn(),
+      // Mirror the real toTracks contract loosely: it maps the combined song list to tracks.
+      toTracks: jest.fn((songs: any[]) => songs.map((s) => ({ id: s.id }))),
+    };
+    const library = new SubsonicMusicLibrary(
+      sub as unknown as Subsonic,
+      credentials,
+      {} as unknown as CustomPlayers
+    );
+    return { library, sub };
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it("drops a hit whose getSong recovery still returns no albumId (no dead tile)", async () => {
+    const { library, sub } = build();
+    // search3 returns an orphan song (no albumId)...
+    sub.search3.mockResolvedValue({
+      artists: [],
+      albums: [],
+      songs: [{ id: "orphan", title: "Orphan", contentType: "audio/mp3" }],
+    });
+    // ...and getSong comes back STILL without an albumId -> the `full && full.albumId` guard fails
+    // on the albumId operand, so full is discarded (undefined) and the orphan is dropped.
+    sub.getSong.mockResolvedValue({ id: "orphan", title: "Orphan", contentType: "audio/mp3" });
+
+    const result = await library.searchTracks("orphan");
+
+    expect(result).toEqual([]);
+    // withAlbum is empty (the only hit had no albumId) and rescued is empty (recovery returned
+    // undefined), so toTracks receives the EMPTY combined list.
+    expect(sub.toTracks).toHaveBeenCalledWith([]);
   });
 });
