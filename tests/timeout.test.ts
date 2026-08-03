@@ -86,6 +86,13 @@ describe("withTimeout observability", () => {
     expect(logged).not.toContain("SUPERSECRETJWTPAYLOAD");
     expect(logged).not.toContain("eyJhbGciOiJIUzI1NiJ9");
     expect(logged).not.toContain("authToken");
+
+    // And nothing is logged AT ALL. Asserting only the absence of the credential left the
+    // isSmapiFault guard unpinned: describeReason renders objects by shape, so deleting the guard
+    // still leaked nothing and the test stayed green. An independent mutation run caught that. The
+    // guard's other job is semantic - a SMAPI fault is the protocol working, not a degradation - so
+    // losing it would warn on every routine token refresh. That is what this pins.
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("never serializes an arbitrary object rejection's contents", async () => {
