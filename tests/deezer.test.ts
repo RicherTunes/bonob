@@ -65,4 +65,12 @@ describe("deezerArtistImageUrl", () => {
     expect(await deezerArtistImageUrl("  ")).toBeUndefined();
     expect(mockGet).not.toHaveBeenCalled();
   });
+
+  it("returns undefined for an empty (falsy) name without calling Deezer", async () => {
+    // Exercises the `(name || "")` falsy arm: an empty name falls back to "" which trims to "",
+    // so the search is skipped. Discriminates from a mutant fallback like `name || "x"`, which
+    // would call axios with q="x".
+    expect(await deezerArtistImageUrl("")).toBeUndefined();
+    expect(mockGet).not.toHaveBeenCalled();
+  });
 });

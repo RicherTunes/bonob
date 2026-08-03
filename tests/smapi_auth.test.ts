@@ -177,5 +177,26 @@ describe("auth", () => {
         );
       });
     });
+
+    describe("when verify throws a non-Error value", () => {
+      it("should return an InvalidTokenError with the generic message (not e.message)", () => {
+        // Covers the final `else` in the catch: a rejection that is neither a TokenExpiredError
+        // nor an Error-shaped value (no name/message). jwt.verify normally throws Errors, so the
+        // branch is only reachable when it throws something else; spy it to throw a bare string.
+        const spy = jest
+          .spyOn(jwt, "verify")
+          .mockImplementation(() => {
+            throw "weird-non-error";
+          });
+        try {
+          const result = smapiLoginTokens.verify({ token: "anything" });
+          expect(result).toEqual(
+            E.left(new InvalidTokenError("Failed to verify token"))
+          );
+        } finally {
+          spy.mockRestore();
+        }
+      });
+    });
   });
 });
