@@ -444,6 +444,25 @@ describe("sonos", () => {
         expect(await sonos({ enabled: true, seedHost: "" }).devices()).toEqual([]);
       });
     });
+
+    describe("when device discovery REJECTS", () => {
+      it("swallows the rejection and returns no devices (the .catch arm)", async () => {
+        // Covers the .catch in sonosDevices: a mutant that re-throws (or returns a non-empty
+        // array) makes devices() reject (or return devices that were never discovered).
+        const sonosManager = {
+          InitializeWithDiscovery: jest
+            .fn()
+            .mockRejectedValue(new Error("discovery blew up")),
+          Devices: [device1, device2],
+        };
+
+        mockSonosManagerConstructor.mockReturnValue(
+          (sonosManager as unknown) as SonosManager
+        );
+
+        expect(await sonos({ enabled: true, seedHost: undefined }).devices()).toEqual([]);
+      });
+    });
   });
 
   describe("sonos service discovery", () => {
