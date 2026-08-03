@@ -833,3 +833,200 @@ describe("album_snapshot: store startup recovery arms", () => {
     expect(loaded[0]!.at).toBe(atA); // the newer-at wins regardless of iteration order
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Loop 2 RESIDUAL. Each test below is a MUTATION-KILLER (verified green → mutated src red →
+// restored). Branches that are genuinely masked/dead are NOT tested here — they are proven in the
+// dead-branch ledger at the bottom of this file. "One real mutation-killing test > ten line-touchers."
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("album_snapshot: Loop 2 residual mutation-killers", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-l2-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // L257 `if (this.batch.length === 0) return`. flush() must short-circuit on an empty batch BEFORE
+  // the fh check, so a flush with nothing pending is safe even on an UNOPENED writer. Removing the
+  // guard makes flush() reach `if (!fh) throw "used before open"` for this input. (The "opened +
+  // empty batch" path that finalize() takes is harmless either way — the no-op for-loop absorbs it —
+  // so the unopened-empty case is the SOLE mutation-killing input.)
+  it("flush() on an empty batch never requires open() (L257)", async () => {
+    const w = new AlbumSnapshotWriter(dir, "albumIndex:v3:emptyflush");
+    await expect((w as any).flush()).resolves.toBeUndefined();
+  });
+
+  // L349 default-param `= {}`. enforceSnapshotBounds reads opts.maxBytes/keepPerKey/protectPerKey via
+  // `??`, so an empty opts object is fine — but a MISSING opts (undefined) only works because of the
+  // `= {}` default. Removing the default makes `opts.maxBytes` throw TypeError on a no-arg call.
+  it("enforceSnapshotBounds() applies defaults when opts is omitted entirely (L349)", async () => {
+    await expect(enforceSnapshotBounds(dir)).resolves.toBeUndefined();
+    // And it really ran (didn't just no-op): a stray .tmp would be swept.
+    const staleTmp = path.join(
+      dir,
+      `albumSnapshot.v3.${keyHashOf("albumIndex:v3:user")}.${gen(500)}.tmp`
+    );
+    fs.writeFileSync(staleTmp, Buffer.alloc(10));
+    await enforceSnapshotBounds(dir); // no opts
+    expect(fs.existsSync(staleTmp)).toBe(false);
+  });
+
+  // L528/L529 in-memory deferral in readAlbumIndexAll. The analogous readAlbumIndexPage deferral
+  // (L490) is covered; this one was not. Removing the guard makes `index.offsets[start]` throw on a
+  // resident (no-snapshotFile) index.
+  it("readAlbumIndexAll falls back to the synchronous slice for an in-memory index (L529)", async () => {
+    const mem = buildAlbumIndexFromPages([names("Apple", "Avocado", "Banana")]);
+    const first = await readAlbumIndexAll(mem, 0, 2);
+    expect(first.map((a) => a.name)).toEqual(["Apple", "Avocado"]);
+    const past = await readAlbumIndexAll(mem, 5, 2);
+    expect(past).toEqual([]); // off the end
+  });
+
+  // L401 per-key ranking comparator `(a,b) => a.gen<b.gen ? 1 : a.gen>b.gen ? -1 : 0`. Existing
+  // tests sort <=2 files per key, so V8 evaluates only one comparison direction; both ` < ` and ` > `
+  // arms need a multi-element sort to fire. Inverting the comparator keeps the wrong generation, which
+  // the survival assertions catch (mutation-killing the DIRECTION of every arm the sort evaluates).
+  it("ranks four generations so only the newest survives keepPerKey=1 (L401 both directions)", async () => {
+    const key = "albumIndex:v3:rank4";
+    const g1 = writeNamedSnapshot(dir, key, 1_000, 100); // oldest
+    const g2 = writeNamedSnapshot(dir, key, 2_000, 100);
+    const g3 = writeNamedSnapshot(dir, key, 3_000, 100);
+    const g4 = writeNamedSnapshot(dir, key, 4_000, 100); // newest
+    await enforceSnapshotBounds(dir, { keepPerKey: 1, protectPerKey: 1 });
+    expect(fs.existsSync(g4)).toBe(true);
+    expect(fs.existsSync(g3)).toBe(false);
+    expect(fs.existsSync(g2)).toBe(false);
+    expect(fs.existsSync(g1)).toBe(false);
+  });
+
+  // L417: the beyondCap `.sort(...)` line + comparator. The filter (L416) is the mutation-killed part
+  // (inverting it evicts the retained generations instead), so the survival assertions are real. The
+  // sort order itself is cosmetic (the loop evicts ALL of beyondCap), but cross-key files make readdir
+  // return them in keyHash order ≠ gen order, so V8's insertion sort evaluates BOTH comparator
+  // directions — covering the `a.gen < b.gen` arm that same-key (ascending-gen) inputs cannot.
+  it("Layer 1 evicts every generation beyond the per-key cap across keys (L417)", async () => {
+    // keyHashes: a(022..) < e(2ce..) < b(53b..). readdir returns a's file before e's, so beyondCap
+    // = [a-old(gen5000)? ...] — gen order is decoupled from readdir order across keys.
+    const ka = "albumIndex:v3:a";
+    const ke = "albumIndex:v3:e";
+    const aOld = writeNamedSnapshot(dir, ka, 2_000, 100); // a, rank 1 — beyond cap (keepPerKey 1)
+    const aNew = writeNamedSnapshot(dir, ka, 5_000, 100); // a, rank 0 — retained
+    const eOld = writeNamedSnapshot(dir, ke, 1_000, 100); // e, rank 1 — beyond cap
+    const eNew = writeNamedSnapshot(dir, ke, 6_000, 100); // e, rank 0 — retained
+    await enforceSnapshotBounds(dir, { keepPerKey: 1, protectPerKey: 1 });
+    expect(fs.existsSync(aNew)).toBe(true);
+    expect(fs.existsSync(eNew)).toBe(true);
+    expect(fs.existsSync(aOld)).toBe(false); // filter L416: a's rank-1 is beyond cap
+    expect(fs.existsSync(eOld)).toBe(false); // filter L416: e's rank-1 is beyond cap
+  });
+
+  // L429 Layer-2 reclaimable comparator, CROSS-KEY so V8's insertion sort evaluates the
+  // `a.gen < b.gen` direction (same-key inputs are readdir-ascending, which only yield `>`). Three
+  // keys, each a protected newest + a reclaimable older gen; a 450 B cap reclaims exactly two of the
+  // three reclaimable files OLDEST-first. Inverting the comparator reclaims NEWEST-first, leaving the
+  // oldest reclaimable (b, gen 1000) on disk instead of the newest reclaimable (a, gen 3000) — the
+  // a/b survival assertions flip, killing the comparator-direction mutation.
+  it("Layer 2 reclaims oldest reclaimable across keys until under the cap (L429 both directions)", async () => {
+    // readdir order by keyHash: a(022) < e(2ce) < b(53b). reclaimable in readdir order:
+    //   [a-gen3000, e-gen2000, b-gen1000] — strictly DESCENDING by gen, so inserting each into the
+    //   sorted prefix compares an OLDER first arg → the `a.gen < b.gen` arm fires.
+    const aNew = writeNamedSnapshot(dir, "albumIndex:v3:a", 5_000, 100); // a rank 0 (protected)
+    const aOld = writeNamedSnapshot(dir, "albumIndex:v3:a", 3_000, 100); // a rank 1 (reclaimable)
+    const eNew = writeNamedSnapshot(dir, "albumIndex:v3:e", 4_000, 100); // e rank 0 (protected)
+    const eOld = writeNamedSnapshot(dir, "albumIndex:v3:e", 2_000, 100); // e rank 1 (reclaimable)
+    const bNew = writeNamedSnapshot(dir, "albumIndex:v3:b", 6_000, 100); // b rank 0 (protected)
+    const bOld = writeNamedSnapshot(dir, "albumIndex:v3:b", 1_000, 100); // b rank 1 (reclaimable)
+    // 6 files × 100 B = 600 B; cap 450 → reclaim 150 B: evict bOld(gen1000) then eOld(gen2000),
+    // leaving aOld(gen3000) on disk. Inverted comparator evicts aOld then eOld, leaving bOld.
+    await enforceSnapshotBounds(dir, { maxBytes: 450, keepPerKey: 2, protectPerKey: 1 });
+    expect(fs.existsSync(aOld)).toBe(true); // newest reclaimable — survives correct-oldest-first
+    expect(fs.existsSync(bOld)).toBe(false); // oldest reclaimable — evicted first
+    expect(fs.existsSync(eOld)).toBe(false); // next-oldest — evicted to meet the cap
+    expect(fs.existsSync(aNew)).toBe(true);
+    expect(fs.existsSync(eNew)).toBe(true);
+    expect(fs.existsSync(bNew)).toBe(true);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DEAD-BRANCH LEDGER — branches/lines left uncovered because they are MASKED defense-in-depth or
+// unreachable. Each entry was VERIFIED by mutating the source (weakening/removing the guard) and
+// confirming the full suite stayed green — i.e. NO test could tell, because a later guard or the
+// outer try/catch produces the identical outcome for every reachable input. "Defense-in-depth is
+// valid only with a masking guard" — the masking guard is named in each entry.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// readTrailerSync (L150): everything sits inside `try { ... } catch { return null; }` (L173). VERIFIED
+// by deleting ALL FIVE inner checks at once (size<8, readSync!==8, trailerByteLen<=0|size<8+len,
+// readSync!==len, and the inner JSON.parse catch) while keeping the read calls — full suite green.
+//
+//   L154 `size < 8`: a sub-8-byte file then openSync + readSync at the negative offset size-8 throws
+//   → outer catch → null. (Or the all-zero footer → magic 0 ≠ SNAPSHOT_MAGIC at L161.) Masked by the
+//   outer catch / L161.
+//   L158 `readSync(...) !== 8`: a short footer read leaves bytes 4-7 zero → magic 0 → refused at L161.
+//   Masked by L161 (magic check).
+//   L162 `trailerByteLen <= 0`: with trailerByteLen=0 the read of 0 bytes yields "" → JSON.parse("")
+//   throws → outer catch → null. (size<8+len is false since size≥8.) Masked by L170/outer catch.
+//   L164 `readSync(...) !== trailerByteLen`: a short trailer read yields partial/garbage → JSON.parse
+//   throws → outer catch → null. Masked by L170/outer catch.
+//   L170 inner `catch { return null; }` around JSON.parse: without it, JSON.parse throws straight to
+//   the outer catch → null. Masked by the outer catch (L173).
+//
+// validateTrailer (L101): every early type/shape guard is masked by a LATER guard that refuses the
+//   same input, so removing any single one does not change load()'s outcome. VERIFIED one-by-one.
+//
+//   L106 `!t || typeof t !== "object"`: a primitive (number/string/boolean) reaches `.v` → undefined
+//   → refused at L108; null → `.v` throws → readTrailerSync's outer catch → null. Masked by L108 /
+//   outer catch. (Verified: dropping `typeof !== "object"` left the suite green.)
+//   L111 `typeof o.total !== "number"`: Number.isInteger is false for EVERY non-number, so the very
+//   next operand (`!Number.isInteger(o.total)`) catches the same values. Masked by L111's own
+//   `!Number.isInteger` operand. (Verified: dropping `typeof !== "number"` left the suite green.)
+//   L112 `!Array.isArray(o.buckets)`: a non-iterable buckets throws in `for..of` → outer catch; a
+//   string buckets iterates chars whose `.key` is undefined → refused at L121. Masked by L121 / outer
+//   catch. (Verified: dropping the buckets isArray operand left the suite green.)
+//   L121 `!b` (null bucket): without the guard, `null.key` throws → outer catch → null. Masked by the
+//   outer catch. (The `typeof b.key/label !== "string"` arms ARE mutation-killed by the existing
+//   "bucket.key is not a string" case — only the `!b` short-circuit is masked.)
+//   L122 `typeof b.offset/count !== "number"`: without it, a non-number offset trips L123's
+//   `!Number.isInteger` and a non-number count breaks the L126 sum. Masked by L123 / L126.
+//
+// AlbumSnapshotWriter:
+//   L253 auto-flush `if (batchBytes >= flushThreshold)`: a pure performance path — every record is
+//   flushed at finalize() regardless, so the on-disk byte content is identical whether or not the
+//   mid-build flush fires. VERIFIED: replacing the condition with `false` left the full suite green.
+//   No correctness mutation can be killed by it.
+//   L312 abort `if (this.fh)` false arm (fh undefined): without the guard, `undefined.close()`
+//   throws into the surrounding `try { ... } catch {}` → swallowed → identical outcome. VERIFIED:
+//   replacing with `await this.fh!.close()` left the suite green. Masked by the abort try/catch.
+//
+// Comparator TIE arms (the `0` return):
+//   L401 per-key ranking: a tie needs two SAME-key files with the SAME gen token. The gen token is
+//   the filename suffix (`albumSnapshot.v3.<keyHash>.<gen>.dat`), so two such files have the SAME
+//   path and cannot coexist. Within a key the tie arm is UNREACHABLE. (Across keys the keyHash
+//   differs, so they are never compared by L401, which sorts within one byKey bucket.)
+//   L417 / L429 tie arm: cross-key same-gen IS constructible on disk (two keys, same ts → same gen),
+//   but the generator embeds 5 random bytes (10 hex chars), making tokens globally unique in
+//   production. The L417 tie is also moot because the loop evicts ALL of beyondCap regardless of
+//   order; the L429 tie only affects which of two equal-generation files is reclaimed first, and both
+//   are reclaimable, so no survival assertion can distinguish them. Not mutation-killing.
+//
+// Comparator DIRECTION arm L401 `a.gen < b.gen ? 1` (arm 51,0): UNCOVERABLE in this environment but
+//   NOT dead. L401 sorts WITHIN one byKey bucket (one keyHash), and readdir returns same-key files in
+//   ascending-gen order (the filename suffix is a zero-padded token). V8's binary insertion sort then
+//   inserts each NEWER element into an older prefix, so the comparator's first argument is always the
+//   NEWER file → `a.gen < b.gen` is never true (only `>` fires, arm 52,0). The comparator's DIRECTION
+//   is still mutation-killed: inverting it (the test above + the existing "evicts by GENERATION token"
+//   suite) evicts the wrong generation. Cross-key inputs cannot reach L401 (it sorts within one key).
+//   On Linux (arbitrary readdir order) this arm would be reachable; on Windows (sorted readdir) it is not.
+//
+// readByteRange / decodeJsonlRecords (module-private, not exported):
+//   L451 `if (len <= 0) return Buffer.alloc(0)`: the only callers are readAlbumIndexPage and
+//   readAlbumIndexAll. Both compute `end > start` before calling (page: n ≥ 1 since `skip < r.count`;
+//   flat: guarded by `if (end <= start) return []` at L535). Each written record is at least
+//   `"0"\n` (2 bytes), so offsets strictly increase and end-start is always > 0. Unreachable.
+//   L470 `if (text.length === 0) return []`: decodeJsonlRecords is only reached with a buffer from
+//   readByteRange, which (per L451 above) is always non-empty, so `buf.toString("utf8")` is non-empty.
+//   Unreachable.
