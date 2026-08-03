@@ -1,5 +1,5 @@
 import dayjs from "dayjs";
-import { FixedClock } from "../src/clock";
+import { FixedClock, SystemClock } from "../src/clock";
 import { xmlTidy } from "../src/utils";
 
 import {
@@ -835,6 +835,39 @@ describe("festivals", () => {
       expect(result.features.backgroundColor).not.toEqual(
         result.features.foregroundColor
       );
+    });
+  });
+
+  // festivals() defaults `clock` to SystemClock; calling it with no argument is the only way to
+  // exercise that default. Patching SystemClock.now pins the result to that clock specifically,
+  // so dropping the default (or pointing it elsewhere) turns this red.
+  describe("default clock (SystemClock)", () => {
+    let realNow: () => dayjs.Dayjs;
+    beforeEach(() => {
+      realNow = SystemClock.now;
+    });
+    afterEach(() => {
+      SystemClock.now = realNow;
+    });
+
+    it("festivals() with no clock reads SystemClock.now() and applies the christmas theme", () => {
+      SystemClock.now = () => dayjs("2022/12/25");
+      const result = original
+        .apply(
+          features({
+            viewPortIncreasePercent: 25,
+            backgroundColor: "shouldNotBeUsed",
+            foregroundColor: "shouldNotBeUsed",
+          })
+        )
+        .apply(festivals()) as DummyIcon;
+
+      expect(result.svg).toEqual(ICONS.christmas.svg);
+      expect(result.features).toEqual({
+        backgroundColor: "green",
+        foregroundColor: "red",
+        viewPortIncreasePercent: 25,
+      });
     });
   });
 });
