@@ -262,4 +262,22 @@ describe("URLBuilder", () => {
       );
     });
   });
+
+  describe("no-arg calls (default bits)", () => {
+    // append()/with() default `bits` to an all-undefined object; calling them with no argument is
+    // the only way to exercise that default. Drop it and `bits.pathname` throws on undefined.
+    it("append() with no bits returns a new builder with the same URL", () => {
+      const original = url("https://example.com/path?a=b");
+      const result = original.append();
+      expect(result).not.toBe(original);
+      expect(result.href()).toEqual(original.href());
+    });
+
+    it("with() with no bits returns a new builder with the same URL", () => {
+      const original = url("https://example.com/path?a=b");
+      const result = original.with();
+      expect(result).not.toBe(original);
+      expect(result.href()).toEqual(original.href());
+    });
+  });
 });
