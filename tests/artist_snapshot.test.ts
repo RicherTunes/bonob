@@ -126,7 +126,7 @@ describe("artist_snapshot: totalAlbumCount round-trips through finalize -> load"
     expect(fs.existsSync(built.snapshotFile)).toBe(true);
   });
 
-  it("refuses a trailer whose totalAlbumCount is malformed (corruption)", async () => {
+  it("DOWNGRADES a malformed totalAlbumCount instead of discarding the whole index", async () => {
     const built = await buildDiskArtistIndex(
       dir,
       "artists:v2:user",
@@ -148,7 +148,12 @@ describe("artist_snapshot: totalAlbumCount round-trips through finalize -> load"
       built.snapshotFile,
       Buffer.concat([raw.subarray(0, trailerStart), newTrailerBuf, footer])
     );
-    expect(albumIndexStore(dir).load()).toEqual([]);
+    // Refusing the file over one unusable number would throw away a perfectly good artist index -
+    // the failure mode the numeric-years outage taught us to avoid. The index still loads; only the
+    // total is absent.
+    const loaded = albumIndexStore(dir).load();
+    expect(loaded).toHaveLength(1);
+    expect((loaded[0]!.value as { totalAlbumCount?: number }).totalAlbumCount).toBeUndefined();
   });
 });
 

@@ -431,7 +431,7 @@ describe("album_snapshot: disk bounding — generation token, not mtime; global 
     expect(fs.existsSync(newest)).toBe(true); // active newest, never evicted
   });
 
-  it("also sweeps stale .tmp files left by a build that crashed before its rename", async () => {
+  it("sweeps a stale .tmp at STARTUP, and never from enforceSnapshotBounds", async () => {
     const key = "albumIndex:v3:tmp";
     const good = writeNamedSnapshot(dir, key, 1_000, 100);
     const staleTmp = path.join(
@@ -440,8 +440,15 @@ describe("album_snapshot: disk bounding — generation token, not mtime; global 
     );
     fs.writeFileSync(staleTmp, Buffer.alloc(50));
 
+    // enforceSnapshotBounds runs from finalize(), where another build may legitimately hold a
+    // .tmp open. Sweeping there deleted an in-flight build's temp file and made its rename fail
+    // ENOENT ~15 minutes later. It must leave temp files strictly alone.
     await enforceSnapshotBounds(dir, {});
+    expect(fs.existsSync(good)).toBe(true);
+    expect(fs.existsSync(staleTmp)).toBe(true);
 
+    // Startup is the one moment no build can be running, so that is where the sweep belongs.
+    albumIndexStore(dir).load();
     expect(fs.existsSync(good)).toBe(true);
     expect(fs.existsSync(staleTmp)).toBe(false);
   });
@@ -893,14 +900,18 @@ describe("album_snapshot: Loop 2 residual mutation-killers", () => {
   // `= {}` default. Removing the default makes `opts.maxBytes` throw TypeError on a no-arg call.
   it("enforceSnapshotBounds() applies defaults when opts is omitted entirely (L349)", async () => {
     await expect(enforceSnapshotBounds(dir)).resolves.toBeUndefined();
-    // And it really ran (didn't just no-op): a stray .tmp would be swept.
-    const staleTmp = path.join(
-      dir,
-      `albumSnapshot.v3.${keyHashOf("albumIndex:v3:user")}.${gen(500)}.tmp`
-    );
-    fs.writeFileSync(staleTmp, Buffer.alloc(10));
+    // Proof that it really RAN (rather than no-opping) is now retention, not the .tmp sweep: the
+    // sweep moved to startup because deleting another build's in-flight temp file made its rename
+    // fail ENOENT a quarter of an hour later. Default keepPerKey is 2, so a third generation of
+    // one key must evict the oldest.
+    const key = "albumIndex:v3:defaults";
+    const oldest = writeNamedSnapshot(dir, key, 1_000, 100);
+    const middle = writeNamedSnapshot(dir, key, 2_000, 100);
+    const newest = writeNamedSnapshot(dir, key, 3_000, 100);
     await enforceSnapshotBounds(dir); // no opts
-    expect(fs.existsSync(staleTmp)).toBe(false);
+    expect(fs.existsSync(newest)).toBe(true);
+    expect(fs.existsSync(middle)).toBe(true);
+    expect(fs.existsSync(oldest)).toBe(false);
   });
 
   // L528/L529 in-memory deferral in readAlbumIndexAll. The analogous readAlbumIndexPage deferral
@@ -1059,3 +1070,48 @@ describe("album_snapshot: Loop 2 residual mutation-killers", () => {
 //   L470 `if (text.length === 0) return []`: decodeJsonlRecords is only reached with a buffer from
 //   readByteRange, which (per L451 above) is always non-empty, so `buf.toString("utf8")` is non-empty.
 //   Unreachable.
+
+describe("album_snapshot: a finalizing writer must not destroy ANOTHER build in flight", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-concurrent-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("leaves an in-flight build's .tmp alone when a second writer finalizes", async () => {
+    // Deploy blocker found by adversarial review, reproduced end-to-end against the real classes.
+    //
+    // enforceSnapshotBounds swept EVERY .tmp matching ANY kind prefix, and finalize() calls it.
+    // With one writer that was harmless - nothing else ever had a .tmp open. Adding a SECOND,
+    // much faster writer to the SAME directory made it lethal: the artist build (seconds) finalizes
+    // in the middle of the album build (~15 min at 113k albums) and unlinks the album build's temp
+    // file. Fifteen minutes and ~230 Navidrome requests later the album rename fails ENOENT, the
+    // index is discarded, and the Albums browse falls back to a placeholder - then repeats the
+    // doomed scan on every retry.
+    //
+    // The sweep is only safe where it began: at startup, when no build is running.
+    const albumWriter = new AlbumSnapshotWriter(dir, "albumIndex:v3:alex");
+    await albumWriter.open();
+    await albumWriter.write(catalog(1, "a")[0]!);
+
+    const albumTmp = fs
+      .readdirSync(dir)
+      .filter((n) => n.startsWith("albumSnapshot.v3.") && n.endsWith(".tmp"));
+    expect(albumTmp).toHaveLength(1); // the album build is genuinely in flight
+
+    // A second, faster build for a DIFFERENT kind finishes while the album build is still open.
+    const other = new AlbumSnapshotWriter(dir, "albumIndex:v3:someone-else");
+    await other.open();
+    await other.write(catalog(1, "b")[0]!);
+    await other.finalize([{ key: "B", label: "B", offset: 0, count: 1 }]);
+
+    // The in-flight build's temp file must still exist...
+    expect(fs.existsSync(path.join(dir, albumTmp[0]!))).toBe(true);
+    // ...and its own finalize must still succeed rather than throwing ENOENT.
+    await expect(
+      albumWriter.finalize([{ key: "A", label: "A", offset: 0, count: 1 }])
+    ).resolves.toBeDefined();
+  });
+});

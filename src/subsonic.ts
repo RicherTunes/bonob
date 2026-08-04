@@ -72,7 +72,12 @@ export const t_and_s = (password: string) => {
   };
 };
 
-export const ALBUM_INDEX_CACHE_MAX_ENTRIES = 2;
+// The index cache now holds TWO entries per user - an album index AND an artist index - so a cap of
+// 2 fitted exactly one user and silently evicted a real index at user #2. An evicted ALBUM index
+// costs a ~15-minute full rescan and ~230 Navidrome requests, repeatedly. Sized for two users of
+// both kinds; the entries are small (buckets + a Uint32Array of offsets), so headroom is cheap and
+// eviction is not.
+export const ALBUM_INDEX_CACHE_MAX_ENTRIES = 4;
 
 export const DODGY_IMAGE_NAME = "2a96cbd8b46e442fc41c2b86b821562f.png";
 
@@ -1723,7 +1728,10 @@ export class Subsonic {
           for (const artist of g.artist) {
             await writer.write(artist);
             total++;
-            totalAlbumCount += artist.albumCount;
+            // Navidrome may omit albumCount; NaN serializes as null and would make the ENTIRE
+            // artist snapshot permanently unloadable - the same shape as the years outage. A bad
+            // count must cost the count, not the index.
+            totalAlbumCount += Number(artist.albumCount) || 0;
           }
         }
         const { snapshotFile, offsets } = await writer.finalize(buckets, totalAlbumCount);

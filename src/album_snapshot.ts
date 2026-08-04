@@ -75,6 +75,11 @@ export type SnapshotKind = {
   validatePayload: (raw: unknown) => unknown | null;
   // Apply the validated payload to the reconstructed resident index (set idx.years / idx.totalAlbumCount).
   applyPayload: (index: AlbumIndex<any>, payload: unknown) => void;
+  // Normalize the payload on the way OUT. The reader coerces too, and BOTH are wanted: the reader
+  // must cope with files this process did not write (every existing file has NUMERIC years), and
+  // the writer must stop producing them so a rollback to an older reader is not re-armed. Keeping
+  // only one side is what re-introduced the outage during a merge.
+  normalizePayload?: (payload: unknown) => unknown;
 };
 
 export const ALBUM_KIND: SnapshotKind = {
@@ -104,6 +109,8 @@ export const ALBUM_KIND: SnapshotKind = {
   applyPayload: (index, payload) => {
     index.years = payload as string[] | undefined;
   },
+  normalizePayload: (payload) =>
+    payload === undefined ? undefined : (payload as unknown[]).map((y) => String(y)),
 };
 
 export const ARTIST_KIND: SnapshotKind = {
@@ -114,7 +121,9 @@ export const ARTIST_KIND: SnapshotKind = {
     // OPTIONAL: a resident (no-directory) artist index never writes a snapshot, so there is no
     // back-compat concern, but the field is still optional on the trailer for symmetry with years.
     if (raw === undefined) return undefined;
-    if (typeof raw !== "number" || !Number.isInteger(raw) || (raw as number) < 0) return null;
+    // A bad total DOWNGRADES to absent rather than refusing the file. Refusing would discard a
+    // perfectly good artist index over one unusable number.
+    if (typeof raw !== "number" || !Number.isInteger(raw) || (raw as number) < 0) return undefined;
     return raw;
   },
   applyPayload: (index, payload) => {
@@ -383,7 +392,8 @@ export class SnapshotWriter {
     // must cope with files this process did not write - including every file already on disk, whose
     // years ARE numbers. Normalizing only on write would leave those unreadable, which is the exact
     // outage this fixes.
-    if (payload !== undefined) trailer[this.kind.payloadField] = payload;
+    const outgoing = this.kind.normalizePayload ? this.kind.normalizePayload(payload) : payload;
+    if (outgoing !== undefined) trailer[this.kind.payloadField] = outgoing;
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
     const footer = Buffer.alloc(8);
     footer.writeUInt32LE(trailerBuf.length, 0);
@@ -503,14 +513,17 @@ export async function enforceSnapshotBounds(
   } catch {
     return;
   }
-  // Sweep stale .tmp (a build that crashed before its atomic rename) whenever the directory is touched.
-  for (const n of names.filter((n) => kinds.some((k) => n.startsWith(k.prefix)) && n.endsWith(".tmp"))) {
-    try {
-      await fs.promises.rm(path.join(dir, n), { force: true });
-    } catch {
-      /* best-effort */
-    }
-  }
+  // NOTE: stale .tmp files are swept ONLY at startup (albumIndexStore.load()), never from here.
+  //
+  // finalize() calls this function, and it used to delete every .tmp matching any kind prefix. With
+  // a single writer that was harmless - nothing else ever held a .tmp open. Adding a second, much
+  // faster writer to the SAME directory made it destructive: the artist build (seconds) finalizes
+  // in the middle of the album build (~15 min at 113k albums) and unlinked the album build's temp
+  // file, so the album rename failed ENOENT a quarter of an hour and ~230 Navidrome requests later,
+  // and the Albums browse decayed to a placeholder that re-ran the same doomed scan on every retry.
+  //
+  // A running build's temp file is indistinguishable from a crashed build's by name alone, so the
+  // only safe place to sweep is where no build can be running: startup.
 
   // Parse + stat every snapshot file. A file we cannot stat is left alone (not blindly evicted).
   type SF = { full: string; keyHash: string; gen: string; size: number };
@@ -724,7 +737,12 @@ export function albumIndexStore(dir: string): SwrCacheStore {
         if (!kind) continue;
         const full = path.join(dir, n);
         const trailer = readTrailerSync(full, kind);
-        if (!trailer) continue;
+        if (!trailer) {
+          // Never skip silently: a refused snapshot is indistinguishable from no snapshot, which is
+          // exactly why the numeric-years outage survived a full day of restarts undetected.
+          logger.warn(`Snapshot ${n} failed trailer validation and was skipped; its index will cold-rebuild.`);
+          continue;
+        }
         const existing = newestByKey.get(trailer.key);
         if (!existing || trailer.at > existing.at) {
           newestByKey.set(trailer.key, {

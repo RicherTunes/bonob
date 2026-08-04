@@ -1528,10 +1528,13 @@ describe("Subsonic", () => {
         expect(indexCacheStore.save).not.toHaveBeenCalled();
       });
 
-      it("evicts album indexes beyond the dedicated album-index cache cap", async () => {
+      it("evicts index entries beyond the dedicated index cache cap (album AND artist kinds)", async () => {
         const { ALBUM_INDEX_CACHE_MAX_ENTRIES } = jest.requireActual("../src/subsonic");
         expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeGreaterThan(0);
-        expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeLessThanOrEqual(2);
+        // The cache holds an album index AND an artist index per user, so a cap of 2 fitted exactly
+                // one user and silently evicted a real index at user #2 - an evicted ALBUM index costs a
+                // ~15-minute rescan. Sized for two users of both kinds.
+                expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeGreaterThanOrEqual(4);
 
         const indexCache = new SwrCache(clock, 60_000, {
           maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
