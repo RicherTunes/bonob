@@ -1288,7 +1288,7 @@ describe("Subsonic", () => {
         try {
           const onDisk = new Subsonic(
             url,
-            customPlayers,
+            NO_CUSTOM_PLAYERS,
             axiosImageFetcher,
             SwrCache.disabled(),
             new SwrCache(clock, 60_000),
@@ -3045,7 +3045,7 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       try {
         const onDisk = new Subsonic(
           url,
-          customPlayers,
+          NO_CUSTOM_PLAYERS,
           axiosImageFetcher,
           SwrCache.disabled(),
           new SwrCache(clock, 60_000),

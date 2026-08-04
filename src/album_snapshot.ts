@@ -377,11 +377,12 @@ export class SnapshotWriter {
       total,
       buckets,
       offsets: this.offsets,
-      // Normalize at the WRITE side too, so new files are homogeneous rather than relying on the
-      // reader's coercion. album.year is typed string but Navidrome sends a JSON number, and
-      // writing that raw is what made the validator reject its own output.
-      years: years && years.map((y) => String(y)),
     };
+    // The payload is written as the kind supplies it. Normalization lives on the READ side
+    // (ALBUM_KIND.validatePayload coerces numeric years to strings) because that is the layer that
+    // must cope with files this process did not write - including every file already on disk, whose
+    // years ARE numbers. Normalizing only on write would leave those unreadable, which is the exact
+    // outage this fixes.
     if (payload !== undefined) trailer[this.kind.payloadField] = payload;
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
     const footer = Buffer.alloc(8);
