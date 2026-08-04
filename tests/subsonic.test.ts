@@ -3036,6 +3036,65 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       await expect(peeked!.then((i) => i.total)).resolves.toBe(1);
     });
 
+    it("streams a disk-backed ARTIST index when a snapshot dir is configured (goal c)", async () => {
+      // NEGATIVE for the residency change: this fails on the current code, which maps EVERY artist,
+      // deep-freezes each, and holds them all resident in idx.items (snapshotFile / offsets /
+      // totalAlbumCount all undefined, and the snapshot dir is ignored). Reverting src/ and re-running
+      // must turn the disk-backed assertions below red.
+      const snap = mkdtempSync(path.join(os.tmpdir(), "bonob-artist-snap-"));
+      try {
+        const onDisk = new Subsonic(
+          url,
+          customPlayers,
+          axiosImageFetcher,
+          SwrCache.disabled(),
+          new SwrCache(clock, 60_000),
+          false,
+          {},
+          undefined,
+          snap
+        );
+        const a1 = anArtist({ name: "Aphex", albums: [anAlbum()] });
+        const b1 = anArtist({ name: "Boards", albums: [anAlbum(), anAlbum()] });
+        mockGET.mockImplementation((_u: string) =>
+          Promise.resolve(ok(asArtistsJson([a1, b1])))
+        );
+
+        const idx = await onDisk.getArtistIndex(credentials);
+
+        // DISK-BACKED: the snapshot is NOT resident. items is empty; a snapshot file + a Uint32Array
+        // of byte offsets are what is held instead. (Current code: items holds the 2 records, no
+        // offsets, no snapshotFile — every one of these four lines goes red on a revert.)
+        expect(idx.items).toEqual([]);
+        expect(idx.offsets).toBeInstanceOf(Uint32Array);
+        expect(idx.offsets!.length).toBe(2 + 1);
+        expect(idx.snapshotFile).toBeDefined();
+        expect(existsSync(idx.snapshotFile!)).toBe(true);
+        // The snapshot carries the ARTIST prefix in the shared index dir (distinct from albums).
+        expect(path.basename(idx.snapshotFile!).startsWith("artistSnapshot.v2.")).toBe(true);
+
+        // The whole-catalog album total (sum of albumCount) is persisted on the index, so it is O(1)
+        // from a disk-backed index whose items are empty. (Current code: totalAlbumCount undefined.)
+        expect(idx.totalAlbumCount).toBe(1 + 2);
+
+        // Resident bytes: ONLY the Uint32Array of offsets — 4 bytes × (total + 1) — not the records.
+        expect(idx.offsets!.byteLength).toBe(4 * (2 + 1));
+
+        // A letter page is read from disk and matches the scan (Navidrome letters verbatim — "Aphex"
+        // stays under Navidrome's "A", NOT re-derived).
+        const aPage = await readAlbumIndexPage(idx, "A", 0, 10);
+        expect(aPage.total).toBe(1);
+        expect(aPage.items.map((a) => a.name)).toEqual(["Aphex"]);
+        const bPage = await readAlbumIndexPage(idx, "B", 0, 10);
+        expect(bPage.items.map((a) => a.name)).toEqual(["Boards"]);
+
+        // albumCount reads the persisted total O(1) — no items to sum on a disk-backed index.
+        await expect(onDisk.albumCount(credentials)).resolves.toBe(1 + 2);
+      } finally {
+        rmSync(snap, { recursive: true, force: true });
+      }
+    });
+
     it("warmAlbumIndex kicks the (heavy) index scan in the background", async () => {
       const indexCache = new SwrCache(clock, 60_000);
       const indexedSubsonic = new Subsonic(

@@ -74,13 +74,13 @@ const deepFreeze = (v: unknown): unknown => {
 const browseCacheTTLms = Number(ms(config.subsonic.cacheTTL)) || 0;
 const browseCacheStore = config.subsonic.cacheDir
   ? fileStore(config.subsonic.cacheDir, {
-      // The ARTIST INDEX lives in this cache, and it is by far the largest entry: ~150-300 bytes
-      // per artist, so it crosses the 16MiB default somewhere around 60-90k artists (this library
-      // is at 24,797 - roughly 2-3x headroom). Past the cap the file is skipped on every restart,
-      // so the Artists browse is permanently cold. The album index escaped this by getting its own
-      // store (albumIndexStore); the artist index is still here, so raise the cap for it instead of
-      // shipping a cliff. The skip is now also logged, so hitting any future cap is diagnosable
-      // rather than silent.
+      // The ARTIST INDEX used to live in this cache as one large JSON blob (~150-300 bytes/artist),
+      // which is why this cap was raised from the 16MiB default to 256MiB — past the cap the file was
+      // skipped on every restart, leaving the Artists browse permanently cold. Goal (c) moved the
+      // artist index into the index cache's disk-backed snapshot store (records streamed, not one
+      // blob), so it no longer lives here; the largest remaining entries are album-list pages (~240
+      // KiB). The cap is retained as generous headroom rather than reverted, to avoid touching
+      // working config; the skip stays logged so any future large entry is diagnosable, not silent.
       maxFileBytes: 256 * 1024 * 1024,
     })
   : undefined;
@@ -89,14 +89,17 @@ const browseCache = new SwrCache(clock, browseCacheTTLms, {
   revive: deepFreeze,
 });
 
-// The album index is a heavy full-catalog scan (~N/500 requests) that changes only on a library
-// scan, so cache it far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on
-// every stale browse. Persisted in its own subdir so it survives restarts.
+// The index cache holds the heavy full-catalog INDEXES — the album index (~N/500-request scan) AND
+// the artist index (one getArtists) — both of which change only on a library scan, so they are cached
+// far longer than browse pages (6h TTL, ~24h stale cap) to avoid re-scanning on every stale browse.
+// Persisted in their own subdir so they survive restarts.
 //
-// Slice 1: the index snapshot is disk-backed (records streamed to an immutable per-build file,
-// only buckets + a Uint32Array of byte offsets resident), so it is persisted by albumIndexStore
-// (one self-describing snapshot file per build), NOT by the generic fileStore. The same directory
-// is passed to Subsonic so the scan writes its snapshot where the store will look for it.
+// Slice 1: each index snapshot is disk-backed (records streamed to an immutable per-build file, only
+// buckets + a Uint32Array of byte offsets resident), so each is persisted by albumIndexStore (one
+// self-describing snapshot file per build, recognised by its filename prefix — albumSnapshot.v3 /
+// artistSnapshot.v2), NOT by the generic fileStore. albumIndexStore loads EVERY index kind from the
+// shared dir; the same directory is passed to Subsonic so each scan writes its snapshot where the
+// store will look for it, and the bound enforcer caps both kinds together.
 const indexCacheDir = config.subsonic.cacheDir
   ? path.join(config.subsonic.cacheDir, "index")
   : undefined;
