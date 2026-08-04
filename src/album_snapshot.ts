@@ -85,9 +85,21 @@ export const ALBUM_KIND: SnapshotKind = {
     // OPTIONAL: a v3 file written before this field existed has none (and validates fine), so no
     // version bump is needed. A present-but-malformed value means corruption → refused.
     if (raw === undefined) return undefined;
-    if (!Array.isArray(raw) || !(raw as unknown[]).every((y) => typeof y === "string"))
+    // Each entry must be a string OR a finite number, and numbers are COERCED rather than
+    // refused. Requiring string[] here was an outage-grade bug: Navidrome returns `year` as a JSON
+    // number while album.year is typed string, so the writer emitted numeric years and this
+    // validator rejected the trailer it had just written - load() returned zero entries and every
+    // restart discarded a valid 30MB index for a ~17-minute rescan, silently. Verified against the
+    // live file: all 113 years were numbers. Generalizing this validator re-introduced the bug by
+    // branching before the fix, so it is pinned by a test that writes NUMERIC years.
+    if (
+      !Array.isArray(raw) ||
+      !(raw as unknown[]).every(
+        (y) => typeof y === "string" || (typeof y === "number" && Number.isFinite(y))
+      )
+    )
       return null;
-    return raw;
+    return (raw as unknown[]).map((y) => String(y));
   },
   applyPayload: (index, payload) => {
     index.years = payload as string[] | undefined;
@@ -365,6 +377,10 @@ export class SnapshotWriter {
       total,
       buckets,
       offsets: this.offsets,
+      // Normalize at the WRITE side too, so new files are homogeneous rather than relying on the
+      // reader's coercion. album.year is typed string but Navidrome sends a JSON number, and
+      // writing that raw is what made the validator reject its own output.
+      years: years && years.map((y) => String(y)),
     };
     if (payload !== undefined) trailer[this.kind.payloadField] = payload;
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");

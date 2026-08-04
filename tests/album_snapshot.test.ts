@@ -485,6 +485,35 @@ describe("album_snapshot: years persist in the trailer and survive a restart", (
     expect(built.snapshotFile).toBeDefined();
   });
 
+  it("loads a snapshot whose years are NUMBERS, which is what the writer actually produces", async () => {
+    // Found by deploying and reading the real 30.8MB snapshot off the VPS: all 113 years were
+    // stored as NUMBERS, and validateTrailer required `every(y => typeof y === "string")`. So the
+    // writer emitted a trailer its own validator rejected, load() returned zero entries, and EVERY
+    // restart silently discarded a valid index and paid a full ~17-minute catalog rescan.
+    //
+    // Navidrome returns `year` as a JSON number while the `album.year` type says string - the same
+    // "the type asserts what the server does not send" defect as TrackStream.headers. Existing
+    // files must keep loading, so numbers are accepted and coerced rather than rejected.
+    const records = catalog(6, "yrnum");
+    const builder = new BucketBuilder<AlbumSummary>();
+    const writer = new AlbumSnapshotWriter(dir, "albumIndex:v3:yrnum");
+    await writer.open();
+    for (const album of records) {
+      builder.append(album);
+      await writer.write(album);
+    }
+    // Exactly what the live file contained: numeric years.
+    await writer.finalize(builder.buckets, [1970, 1971, 1972] as unknown as string[]);
+
+    const loaded = albumIndexStore(dir).load();
+    expect(loaded).toHaveLength(1);
+    expect((loaded[0]!.value as { years?: string[] }).years).toEqual([
+      "1970",
+      "1971",
+      "1972",
+    ]);
+  });
+
   it("refuses a trailer whose years field is malformed (corruption, not back-compat)", async () => {
     const records = catalog(5, "bad");
     const built = await buildDiskIndex(dir, "albumIndex:v3:badyears", records);
