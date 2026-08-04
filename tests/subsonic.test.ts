@@ -2112,6 +2112,29 @@ describe("Subsonic", () => {
           );
         });
   
+        it("does not throw when the album carries NO song array", async () => {
+          // Caught in production by the degradation logging, on a real Sonos interaction:
+          //   getExtendedMetadata:track:<id> degraded to its fallback after a backend failure:
+          //   TypeError: Cannot read properties of undefined (reading 'map')
+          //
+          // GetAlbumResponse types `song: song[]` as REQUIRED, but Navidrome omits it for an album
+          // with no tracks - and getTrack reaches getAlbum via `song.albumId!`, a non-null
+          // assertion on a field we already know can be missing (it is why searchTracks has orphan
+          // recovery). Tapping such a track threw, and the whole extended-metadata response
+          // collapsed to the fallback.
+          //
+          // Fourth instance this session of a type asserting what the server does not send
+          // (TrackStream.headers, the Navidrome letter group, album.year, now album.song).
+          mockGET.mockReset();
+          const noSongs: any = getAlbumJson(album);
+          delete noSongs["subsonic-response"].album.song;
+          mockGET.mockImplementationOnce(() => Promise.resolve(ok(noSongs)));
+
+          const result = await subsonic.getAlbum(credentials, album.id);
+          expect(result.tracks).toEqual([]);
+          expect(result.id).toEqual(album.id);
+        });
+
         it("should return the album", async () => {
           const result = await subsonic.getAlbum(credentials, album.id);
   

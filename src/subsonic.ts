@@ -1958,7 +1958,12 @@ export class Subsonic {
         return { summary: x, songs: album.song }
       }).then(({ summary, songs }) => {
         const x: AlbumSummary = summary
-        const y: Track[] = songs.map((it) => asTrack(summary, it, this.customPlayers))
+        // `song` is OPTIONAL in practice: GetAlbumResponse types it as required, but Navidrome
+        // omits it for an album with no tracks. getTrack reaches here via `song.albumId!` - a
+        // non-null assertion on a field we already know can be missing (it is why searchTracks
+        // carries orphan recovery) - so tapping such a track in Sonos threw here and collapsed the
+        // whole getExtendedMetadata response to its fallback. Observed live.
+        const y: Track[] = (songs || []).map((it) => asTrack(summary, it, this.customPlayers))
         return {
           ...x,
           tracks: y
