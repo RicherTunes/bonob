@@ -47,6 +47,7 @@ import {
   ToSmapiFault,
 } from "./smapi_auth";
 import { IncomingHttpHeaders } from "http";
+import { sanitizeLogValue } from "./utils";
 
 export const LOGIN_ROUTE = "/login";
 export const SOAP_PATH = "/ws/sonos";
@@ -722,8 +723,18 @@ function bindSmapiSoapServiceToExpress(
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
-          ) =>
-            withTimeout(login(findLoginToken(soapyHeaders, headers))
+          ) => {
+            // A SUCCESSFUL search logged nothing, which made the one user-visible bug left in this
+            // service undiagnosable: when artist results do not appear in the Sonos app, "the app
+            // never issued an artists search" and "the app issued it, got results, and dropped
+            // them" are indistinguishable from the outside - and they have OPPOSITE fixes
+            // (re-register the service vs. fix the tile shape). One line settles it. Searches are
+            // user-initiated and rare, so this is not chatty. The term is length-only: it is the
+            // category and the count that discriminate, and a search term is the user's own data.
+            logger.info(
+              `SMAPI search: category=${sanitizeLogValue(id)} termLength=${(term ?? "").length}`
+            );
+            return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey }) => {
                 switch (id) {
@@ -787,7 +798,8 @@ function bindSmapiSoapServiceToExpress(
                 searchResult({ count: 0, mediaCollection: [] }),
                 `search:${id}`
               )
-            ),
+            );
+          },
           getExtendedMetadata: async (
             { id }: { id: string },
             _,
