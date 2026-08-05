@@ -845,7 +845,14 @@ function bindSmapiSoapServiceToExpress(
               `getMediaMetadata:${id}`
             ),
           search: async (
-            { id, term }: { id: string; term: string },
+            // index/count are read for LOGGING ONLY here. Honouring them is a separate change
+            // (wip/search-paging) whose safety case is an observation from the real app.
+            { id, term, index, count }: {
+              id: string;
+              term: string;
+              index?: number;
+              count?: number;
+            },
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
@@ -857,8 +864,12 @@ function bindSmapiSoapServiceToExpress(
             // (re-register the service vs. fix the tile shape). One line settles it. Searches are
             // user-initiated and rare, so this is not chatty. The term is length-only: it is the
             // category and the count that discriminate, and a search term is the user's own data.
+            // index/count are logged because they are the ONLY way to answer whether the app
+            // re-requests with a larger count when the user expands a category, or renders the
+            // expanded view from items we over-returned. That distinction decides whether honouring
+            // the paging contract is a fix or a regression, and no test can answer it.
             logger.info(
-              `SMAPI search: category=${sanitizeLogValue(id)} termLength=${(term ?? "").length}`
+              `SMAPI search: category=${sanitizeLogValue(id)} termLength=${(term ?? "").length} index=${index ?? "-"} count=${count ?? "-"}`
             );
             return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
