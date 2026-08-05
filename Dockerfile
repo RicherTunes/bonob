@@ -32,6 +32,14 @@ RUN npm run gitinfo && \
 
 FROM node:22-bookworm-slim
 
+# Express's default error handler renders a FULL STACK TRACE into the HTTP response when NODE_ENV
+# is not "production". Routes without their own catch (/stream, /report/timePlayed) would ship
+# internal paths and error internals to the caller on any backend failure.
+#
+# RUNTIME stage only: setting it in the build stage makes `npm ci` skip devDependencies, which
+# removes TypeScript and breaks `npm run build`.
+ENV NODE_ENV=production
+
 # This image is built from a MODIFIED fork. maintainer/image.source must name the fork so the
 # image is not attributed to, or linked against, the upstream maintainer's repository; the
 # description carries the GPLv3 s5(a) notice of modification. Upstream authorship is preserved in

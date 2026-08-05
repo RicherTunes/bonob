@@ -53,6 +53,7 @@ import {
   SmapiAuthTokens,
 } from "./smapi_auth";
 import { isValidMimeType, sanitizeLogValue } from "./utils";
+import { describeReason } from "./timeout";
 
 export const BONOB_ACCESS_TOKEN_HEADER = "bat";
 
@@ -577,8 +578,22 @@ function server(
                 .forEach(([header, value]) => {
                   res.setHeader(header, value!);
                 });
-              if (sendStream) stream.stream.pipe(filter).pipe(res)
-              else res.send()
+              if (sendStream) {
+                // pipe() does NOT forward errors. Without this listener, a mid-song ECONNRESET
+                // from Navidrome (a restart, a library scan, a network blip) emits 'error' on a
+                // stream nobody is listening to, which in Node is an UNCAUGHT EXCEPTION and kills
+                // the process - taking the whole household's music down until Docker restarts it,
+                // and losing every in-memory link code and API token with it. The existing
+                // res.on("close") handler covers the CLIENT going away, not the upstream failing.
+                stream.stream.on("error", (e: Error) => {
+                  logger.warn(
+                    `Upstream audio stream failed mid-response: ${describeReason(e)}`
+                  );
+                  res.destroy();
+                });
+                filter.on("error", () => res.destroy());
+                stream.stream.pipe(filter).pipe(res);
+              } else res.send()
             });
           };
 

@@ -239,12 +239,47 @@ if (config.sonos.autoRegister) {
   });
 };
 
+// LAST RESORT. This is a single-instance bridge: a crash silences the whole household until Docker
+// restarts it, and takes every in-memory link code and API token with it, so Sonos then 401s on art
+// and streams until the next SOAP call re-mints them. The one thing worse than that is it happening
+// with no diagnosable line in the log - which is the default, because Node prints an uncaught
+// exception to stderr and exits.
+//
+// These handlers do NOT keep the process alive: continuing after an unknown failure risks serving
+// corrupt state. They exist so the restart has a cause attached to it.
+process.on("uncaughtException", (e) => {
+  logger.error(
+    `FATAL uncaughtException, exiting for a clean restart: ${e && e.stack ? e.stack : String(e)}`
+  );
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason) => {
+  // Node 20+ terminates on an unhandled rejection by default, so this is a crash path too, and the
+  // fire-and-forget SMAPI mutations are exactly the code that produces them.
+  logger.error(
+    `FATAL unhandledRejection, exiting for a clean restart: ${
+      reason instanceof Error && reason.stack ? reason.stack : String(reason)
+    }`
+  );
+  process.exit(1);
+});
+
 process.on('SIGTERM', () => {
   logger.info('SIGTERM signal received: closing HTTP server');
+  // Exit INSIDE the close callback. Calling process.exit(0) synchronously after close() killed
+  // in-flight streams instantly and made the "HTTP server closed" line unreachable - a graceful
+  // shutdown that was neither graceful nor observable. The timeout bounds a hung connection so a
+  // stuck stream cannot block the restart forever.
+  const forced = setTimeout(() => {
+    logger.warn('Shutdown timed out with connections still open; exiting anyway');
+    process.exit(0);
+  }, 10_000);
+  forced.unref();
   expressServer.close(() => {
     logger.info('HTTP server closed');
+    process.exit(0);
   });
-  process.exit(0);
 });
 
 

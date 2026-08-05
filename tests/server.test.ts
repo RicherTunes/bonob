@@ -988,9 +988,20 @@ describe("server", () => {
         const serviceToken = `serviceToken-${uuid()}`;
         const trackId = `t-${uuid()}`;
 
+        // A REAL upstream stream is an EventEmitter. This fake had only pipe() and destroy(), so
+        // nothing here could ever exercise - or notice the absence of - an 'error' listener, which
+        // is exactly how a missing one survived: pipe() does not forward errors, and an unhandled
+        // 'error' on the upstream stream is an uncaught exception that kills the process.
+        // `on` records handlers so a test can fire them; `emitError` drives that path.
         const streamContent = (content: string) => {
+          const handlers: Record<string, ((...a: any[]) => void)[]> = {};
           const self = {
             destroyed: false,
+            on: (event: string, handler: (...a: any[]) => void) => {
+              (handlers[event] ||= []).push(handler);
+              return self;
+            },
+            emitError: (e: Error) => (handlers["error"] || []).forEach((h) => h(e)),
             pipe: (_: Transform) => {
               return {
                 pipe: (res: Response) => {

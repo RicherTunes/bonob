@@ -270,7 +270,16 @@ export class SubsonicMusicLibrary implements MusicLibrary {
         return Promise.all(thingsToUpdate);
       })
       .then(() => true)
-      .catch(() => false);
+      .catch((e) => {
+        // The user taps a heart or sets stars and Sonos reports success regardless (rateItem
+        // discards this boolean), so a dropped rating is invisible at BOTH ends. This is the
+        // surface a user touches most often, and it was the one degradation in the codebase with
+        // no log line at all.
+        logger.warn(
+          `Rating ${trackId} failed and was silently dropped: ${describeReason(e)}`
+        );
+        return false;
+      });
 
   stream = async ({
     trackId,
