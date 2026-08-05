@@ -35,8 +35,12 @@ import axios, { AxiosRequestConfig } from "axios";
 import { b64Encode, b64Decode } from "./b64";
 import { BUrn } from "./burn";
 import { SwrCache } from "./swr_cache";
-import { AlbumIndex, BucketBuilder } from "./album_index";
-import { AlbumSnapshotWriter } from "./album_snapshot";
+import { AlbumIndex, AlbumIndexBucket, BucketBuilder } from "./album_index";
+import {
+  AlbumSnapshotWriter,
+  ArtistSnapshotWriter,
+  readAlbumIndexAll,
+} from "./album_snapshot";
 import { buildArtistIndex } from "./artist_index";
 import { album, artist } from "./smapi";
 import { URLBuilder } from "./url_builder";
@@ -90,12 +94,13 @@ export const t_and_s = (password: string) => {
   };
 };
 
-// Index entries are keyed per user (`albumIndex:v3:<user>`), and evicting one costs a full
-// catalog rescan (~227 requests / ~15 minutes on a 113k-album library) which `warmAlbumIndex`
-// re-triggers on the very next SOAP call - so an under-sized cap turns a multi-user household
-// into a permanent load generator against Navidrome. Holding an entry is cheap because the index
-// is disk-backed: only the ~4 bytes/album offset table is resident (~450KB at 113k albums).
-// Sized for a household rather than the 2 it used to be.
+// Index entries are keyed per user AND per kind (`albumIndex:v3:<user>` + `artists:v2:<user>`), so
+// each active user occupies TWO entries: a cap of 2 fitted exactly one user and silently evicted a
+// real index at user #2. Evicting an ALBUM index costs a full catalog rescan (~230 requests, ~15
+// minutes on a 113k-album library) which warmAlbumIndex re-triggers on the very next SOAP call, so
+// an under-sized cap turns a multi-user household into a permanent load generator against Navidrome.
+// Holding an entry is cheap because the index is disk-backed: only the ~4 bytes/album offset table
+// is resident (~450KB at 113k albums). Headroom is cheap; eviction is not.
 export const ALBUM_INDEX_CACHE_MAX_ENTRIES = Number(
   process.env["BNB_INDEX_CACHE_MAX_ENTRIES"] || 8
 );
@@ -1534,10 +1539,12 @@ export class Subsonic {
 
   private readonly maxIndexScanAlbums: number;
 
-  // Directory for the disk-backed album snapshot (Slice 1). When set, buildAlbumIndex streams each
-  // scanned record to an immutable snapshot file and keeps only buckets + a Uint32Array of byte
-  // offsets resident (O(buckets + offsets), not O(albums)). Undefined → in-memory build (no cache
-  // volume configured: nothing is persisted and the resident snapshot is acceptable).
+  // Directory for the disk-backed INDEX snapshots (Slice 1), shared by the album and artist indexes
+  // (each writes its own uniquely-prefixed, per-build file; the bound enforcer caps them together).
+  // When set, buildAlbumIndex / fetchArtistIndex stream each scanned record to an immutable snapshot
+  // file and keep only buckets + a Uint32Array of byte offsets resident (O(buckets + offsets), not
+  // O(records)). Undefined → in-memory build (no cache volume configured: nothing is persisted and the
+  // resident snapshot is acceptable). (The field name predates the artist index joining it.)
   private readonly albumSnapshotDir: string | undefined;
   // Global disk-bound options forwarded to each snapshot writer (see enforceSnapshotBounds).
   private readonly albumSnapshotOpts: {
@@ -1713,6 +1720,15 @@ export class Subsonic {
   // records carry albumCount so the album total (albumCount / the alphabetical getAlbumList2 total)
   // is still summed from this one cached source. Deep-frozen: the index + its records are shared
   // across every cache hit and user, so a caller mutating in place would corrupt the cache.
+  //
+  // Slice 1 for artists: when a snapshot directory is configured the scan STREAMS each record to an
+  // immutable on-disk snapshot file (one append per artist, buffered) and keeps only the bucket table
+  // + a Uint32Array of per-record byte offsets resident — the same treatment the album index already
+  // has — so a multi-million-artist catalog no longer holds its whole ~400-600 B/artist snapshot in
+  // memory. The whole-catalog album total is persisted in the trailer as `totalAlbumCount`, because
+  // the records are no longer resident to sum (albumCount/peekAlbumCount/getAlbumList2 read it O(1)).
+  // Without a directory it falls back to the resident build (nowhere to persist; used by tests and
+  // cache-disabled setups), and the album total is then summed from `items` as before.
   private fetchArtistIndex = async (
     credentials: Credentials
   ): Promise<AlbumIndex<ArtistRecord>> => {
@@ -1738,6 +1754,57 @@ export class Subsonic {
         })
       ),
     }));
+
+    const writer = this.albumSnapshotDir
+      ? new ArtistSnapshotWriter(
+          this.albumSnapshotDir,
+          this.artistsKey(credentials),
+          this.albumSnapshotOpts
+        )
+      : undefined;
+
+    if (writer) {
+      // Stream records to the snapshot while bucketing with a running record offset, mirroring the
+      // pure buildArtistIndex layout (one contiguous bucket per non-empty Navidrome letter group).
+      const buckets: AlbumIndexBucket[] = [];
+      let total = 0;
+      let totalAlbumCount = 0;
+      try {
+        await writer.open();
+        for (const g of groups) {
+          if (g.artist.length === 0) continue; // an empty letter group: no bucket, no items
+          buckets.push({ key: g.name, label: g.name, offset: total, count: g.artist.length });
+          for (const artist of g.artist) {
+            await writer.write(artist);
+            total++;
+            // Navidrome may omit albumCount; NaN serializes as null and would make the ENTIRE
+            // artist snapshot permanently unloadable - the same shape as the years outage. A bad
+            // count must cost the count, not the index.
+            totalAlbumCount += Number(artist.albumCount) || 0;
+          }
+        }
+        const { snapshotFile, offsets } = await writer.finalize(buckets, totalAlbumCount);
+        const idx: AlbumIndex<ArtistRecord> = {
+          total,
+          buckets,
+          items: [],
+          snapshotFile,
+          offsets,
+          totalAlbumCount,
+        };
+        for (const b of buckets) Object.freeze(b);
+        Object.freeze(buckets);
+        Object.freeze(idx);
+        return idx;
+      } catch (e) {
+        // A failed/aborted build drops the temp file so a half-written snapshot is never read as
+        // complete (the trailer guard would refuse it anyway, but this keeps the dir clean).
+        await writer.abort();
+        throw e;
+      }
+    }
+
+    // Resident build (no snapshot dir). Exactly as before — the album total stays summed from items.
     const idx = buildArtistIndex(groups);
     Object.freeze(idx.items);
     for (const b of idx.buckets) Object.freeze(b);
@@ -1745,24 +1812,35 @@ export class Subsonic {
     return idx;
   };
 
-  // The full artist list is large (~10MB / multi-second on big libraries) and bonob re-fetches it
-  // on every Sonos browse page (the album total is summed from it too). SwrCache serves it
-  // stale-while-revalidate, so once warm EVERY browse is instant, concurrent pages coalesce onto one
-  // fetch, and it is bounded/hardened. The cached value is the letter index.
+  // The full artist list is large (~10MB / multi-second on big libraries) and the album total is
+  // summed from it. It lives in the INDEX cache (the long-TTL, snapshot-backed cache shared with the
+  // album index): SwrCache serves it stale-while-revalidate, so once warm every browse is instant,
+  // concurrent pages coalesce onto one fetch, and it is bounded/hardened. The cached value is the
+  // letter index, disk-backed (records streamed to a snapshot file; only buckets + a Uint32Array of
+  // byte offsets resident) plus a persisted `totalAlbumCount` so the album total stays O(1).
   //
   // The key is versioned v2 because the cached value changed shape (flat array -> letter index): a
   // persisted v1 (flat-array) entry from a prior bonob must never be misread as an index, so on the
   // first run after upgrade the v1 file is orphaned and the v2 key starts cold (one placeholder
   // browse, then warm — the same bump the album index did for albumIndex:v3).
+  //
+  // UPGRADE NOTE: this index USED to live in the browse cache (a generic JSON file under the browse
+  // cache dir). Moving it to the index cache's snapshot store orphans that old browse-cache JSON
+  // entry — it is simply never read again (the index cache's store scans only for snapshot files).
+  // It is harmless dead bytes until the browse cache's own maxFiles pruning reclaims it; no key bump
+  // is needed because the snapshot store cannot misread a JSON blob it never looks for.
   private artistsKey = (credentials: Credentials): string =>
     `artists:v2:${credentials.username}`;
 
   // The cached artist index (letters + items): the single source for the Artists browse AND the
-  // album total. Keyed per user (Navidrome has per-user library ACLs).
+  // album total. Keyed per user (Navidrome has per-user library ACLs). Lives in the INDEX cache
+  // (the long-TTL, snapshot-backed cache it shares with the album index), not the browse cache: the
+  // artist list changes only on a library scan and its snapshot is disk-backed, so the browse cache's
+  // generic JSON store is the wrong home for it.
   getArtistIndex = (
     credentials: Credentials
   ): Promise<AlbumIndex<ArtistRecord>> =>
-    this.cache.get(this.artistsKey(credentials), () =>
+    this.indexCache.get(this.artistsKey(credentials), () =>
       this.fetchArtistIndex(credentials)
     );
 
@@ -1771,41 +1849,55 @@ export class Subsonic {
   peekArtistIndex = (
     credentials: Credentials
   ): Promise<AlbumIndex<ArtistRecord>> | undefined =>
-    this.cache.peek<AlbumIndex<ArtistRecord>>(this.artistsKey(credentials));
+    this.indexCache.peek<AlbumIndex<ArtistRecord>>(this.artistsKey(credentials));
 
-  // The flat artist list, derived from the index items. Kept for callers that sum albumCount or
-  // slice a flat page; the index is the source of truth and this is a cheap view over idx.items.
-  getArtists = (credentials: Credentials): Promise<ArtistRecord[]> =>
-    this.getArtistIndex(credentials).then((idx) => idx.items);
+  // The flat artist list. For a RESIDENT index this is a cheap view over idx.items; for a DISK-BACKED
+  // index (items empty) it materialises the whole list from the snapshot. Only the legacy flat-list
+  // caller (MusicLibrary.artists) reaches the disk path — the Artists browse pages via
+  // readAlbumIndexPage/readAlbumIndexAll directly and never calls this — so the materialisation stays
+  // off the hot path. albumCount/getAlbumList2 use the persisted totalAlbumCount, not this list.
+  getArtists = async (credentials: Credentials): Promise<ArtistRecord[]> => {
+    const idx = await this.getArtistIndex(credentials);
+    return idx.items.length > 0 || !idx.snapshotFile
+      ? idx.items
+      : readAlbumIndexAll(idx, 0, idx.total);
+  };
 
   // Pre-warm the artist index (the multi-second cold fetch behind the Artists browse AND the album
   // total) in the background, so the first browse of a session isn't cold. Called on login. Safe to
   // call often: the cache coalesces and only re-fetches when stale.
   warmArtists = (credentials: Credentials): void =>
-    this.cache.warm(this.artistsKey(credentials), () =>
+    this.indexCache.warm(this.artistsKey(credentials), () =>
       this.fetchArtistIndex(credentials)
     );
 
-  // Total album count, summed from the (cached) artist list - the same source getAlbumList2 uses
+  // Total album count, summed from the (cached) artist index — the same source getAlbumList2 uses
   // for its total. Cheap once the artist index is warm (no extra network). Used to decide whether
   // the catalog is large enough to need the bucketed album A-Z index; small libraries skip it.
+  // A DISK-BACKED index carries the total in `totalAlbumCount` (items is empty); a resident index
+  // sums its items. Both read the single cached artist index.
   albumCount = (credentials: Credentials): Promise<number> =>
-    this.getArtists(credentials).then((artists) =>
-      _.inject(artists, (total, artist) => total + artist.albumCount, 0)
+    this.getArtistIndex(credentials).then((idx) =>
+      idx.totalAlbumCount !== undefined
+        ? idx.totalAlbumCount
+        : _.inject(idx.items, (total, artist) => total + artist.albumCount, 0)
     );
 
   // Non-blocking peek at the album count: undefined when the artist index is not warm yet, so a live
   // Albums browse can avoid a multi-second cold getArtists; otherwise the already-resolved count.
+  // A DISK-BACKED index serves the persisted `totalAlbumCount` O(1); a resident index sums items.
   peekAlbumCount = (credentials: Credentials): Promise<number> | undefined =>
     this.peekArtistIndex(credentials)?.then((idx) =>
-      _.inject(idx.items, (total, artist) => total + artist.albumCount, 0)
+      idx.totalAlbumCount !== undefined
+        ? idx.totalAlbumCount
+        : _.inject(idx.items, (total, artist) => total + artist.albumCount, 0)
     );
 
   // Non-blocking peek at the artist list itself: the settled cached value, or undefined when it is
   // in-flight or cold. Lets a cold Artists browse fall back to a placeholder rather than block on the
   // multi-second full-artist fetch (which would blow Sonos's ~5s timeout). Value unused (warmth only).
   peekArtists = (credentials: Credentials): Promise<unknown> | undefined =>
-    this.cache.peek(this.artistsKey(credentials));
+    this.indexCache.peek(this.artistsKey(credentials));
 
   // Raw, un-cached page of album summaries in alphabeticalByName order (used only by the index
   // scan). The scan captures the summaries themselves - not just names/offsets - so the index is a
@@ -2248,9 +2340,10 @@ export class Subsonic {
     // container - so they advertise a bounded "there may be one more page" total from the page.
     if (q.type === "alphabeticalByName" || q.type === "alphabeticalByArtist") {
       const [total, albums] = await Promise.all([
-        this.getArtists(credentials).then((it) =>
-          _.inject(it, (total, artist) => total + artist.albumCount, 0)
-        ),
+        // The true whole-catalog total from the cached artist index. albumCount() reads the single
+        // artist index (the same one the browse path peeks) and serves the persisted totalAlbumCount
+        // for a disk-backed index O(1) — no materialisation of the artist list on this browse path.
+        this.albumCount(credentials),
         cachedPage(),
       ]);
       const results = albums.slice(0, q._count);

@@ -1079,3 +1079,48 @@ describe("album_snapshot: Loop 2 residual mutation-killers", () => {
 //   L470 `if (text.length === 0) return []`: decodeJsonlRecords is only reached with a buffer from
 //   readByteRange, which (per L451 above) is always non-empty, so `buf.toString("utf8")` is non-empty.
 //   Unreachable.
+
+describe("album_snapshot: a finalizing writer must not destroy ANOTHER build in flight", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-snap-concurrent-"));
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("leaves an in-flight build's .tmp alone when a second writer finalizes", async () => {
+    // Deploy blocker found by adversarial review, reproduced end-to-end against the real classes.
+    //
+    // enforceSnapshotBounds swept EVERY .tmp matching ANY kind prefix, and finalize() calls it.
+    // With one writer that was harmless - nothing else ever had a .tmp open. Adding a SECOND,
+    // much faster writer to the SAME directory made it lethal: the artist build (seconds) finalizes
+    // in the middle of the album build (~15 min at 113k albums) and unlinks the album build's temp
+    // file. Fifteen minutes and ~230 Navidrome requests later the album rename fails ENOENT, the
+    // index is discarded, and the Albums browse falls back to a placeholder - then repeats the
+    // doomed scan on every retry.
+    //
+    // The sweep is only safe where it began: at startup, when no build is running.
+    const albumWriter = new AlbumSnapshotWriter(dir, "albumIndex:v3:alex");
+    await albumWriter.open();
+    await albumWriter.write(catalog(1, "a")[0]!);
+
+    const albumTmp = fs
+      .readdirSync(dir)
+      .filter((n) => n.startsWith("albumSnapshot.v3.") && n.endsWith(".tmp"));
+    expect(albumTmp).toHaveLength(1); // the album build is genuinely in flight
+
+    // A second, faster build for a DIFFERENT kind finishes while the album build is still open.
+    const other = new AlbumSnapshotWriter(dir, "albumIndex:v3:someone-else");
+    await other.open();
+    await other.write(catalog(1, "b")[0]!);
+    await other.finalize([{ key: "B", label: "B", offset: 0, count: 1 }]);
+
+    // The in-flight build's temp file must still exist...
+    expect(fs.existsSync(path.join(dir, albumTmp[0]!))).toBe(true);
+    // ...and its own finalize must still succeed rather than throwing ENOENT.
+    await expect(
+      albumWriter.finalize([{ key: "A", label: "A", offset: 0, count: 1 }])
+    ).resolves.toBeDefined();
+  });
+});

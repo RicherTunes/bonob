@@ -39,6 +39,13 @@ export type AlbumIndex<T = { name: string }> = {
   // silently-truncated first page. Absent on a pre-change index or a small catalog that never built
   // one (years() then falls back to a paged collection).
   years?: string[];
+  // The sum of every record's albumCount, collected during the ARTIST index scan. The artist index
+  // is the single cached view of getArtists, and the whole-catalog album total (albumCount /
+  // peekAlbumCount / getAlbumList2's alphabetical total) is summed from it. A resident artist index
+  // leaves this undefined and the total is summed from `items`; a DISK-BACKED index has `items: []`,
+  // so the total must be carried here (persisted in the snapshot trailer) to stay O(1). Absent on an
+  // album index (which has no albumCount) and on a resident artist index.
+  totalAlbumCount?: number;
 };
 
 // A flat "Albums" list up to this size is browsed as-is (simple, and safe on older S1 hardware),
