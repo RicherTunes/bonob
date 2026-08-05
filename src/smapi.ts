@@ -757,28 +757,26 @@ function bindSmapiSoapServiceToExpress(
                       })
                     );
                   case "tracks":
-                    return musicLibrary.searchTracks(term).then((it) => {
-                      // Track hits are rendered as ALBUM tiles, so several hits from one album used
-                      // to produce several identical tiles - visually redundant, and each carried
-                      // the matching song's own art id, giving one distinct /art url per hit and
-                      // defeating the cover-art coordinator's coalescing (up to 20x the fetches).
-                      // Deduplicating by album fixes both, and keeps the art id the SERVER returned
-                      // rather than one synthesized from the album id: OpenSubsonic specifies that
-                      // getCoverArt takes the opaque coverArt value, so deriving it from albumId
-                      // works on Navidrome but is not portable.
-                      const byAlbum = new Map<string, AlbumSummary>();
-                      for (const aTrack of it) {
-                        if (!byAlbum.has(aTrack.album.id))
-                          byAlbum.set(aTrack.album.id, aTrack.album);
-                      }
-                      const albums = [...byAlbum.values()];
-                      return searchResult({
-                        count: albums.length,
-                        mediaCollection: albums.map((it) =>
-                          album(urlWithToken(apiKey), it)
+                    return musicLibrary.searchTracks(term).then((it) =>
+                      // The Songs category must return SONGS. This used to collapse every track hit
+                      // into its ALBUM and return album tiles, so searching a song title showed
+                      // albums and never the song - reported from the Sonos app as "I searched
+                      // 'all i need' and only albums showed up". Track hits are now playable
+                      // mediaMetadata, the same shape Favourite Songs and Top Songs already use.
+                      //
+                      // The collapse existed to stop N hits from one album rendering as N identical
+                      // album tiles, each with its own /art url (up to 20x the cover-art fetches for
+                      // one search page). That redundancy was an artifact of rendering tracks AS
+                      // albums; distinct songs are legitimately distinct tiles. Coalescing still
+                      // holds because tracks from one album carry the same server-returned coverArt
+                      // value, so they share a single /art url and a single coordinator key.
+                      searchResult({
+                        count: it.length,
+                        mediaMetadata: it.map((track) =>
+                          topSongMetadata(urlWithToken(apiKey), track)
                         ),
-                      });
-                    });
+                      })
+                    );
                   default:
                     logger.info(`Sonos asked for an unsupported search of: ${id}, term=${term}`);
                     return searchResult({

@@ -21,6 +21,7 @@ import {
   track,
   artist,
   album,
+  topSongMetadata,
   coverArtURI,
   searchResult,
   iconArtURI,
@@ -1273,7 +1274,11 @@ describe("wsdl api", () => {
                 musicLibrary.searchTracks.mockResolvedValue([track1, track2]);
               });
 
-              it("should return the tracks", async () => {
+              // The Songs category must return SONGS. It used to collapse every hit into its
+              // album and return album tiles, so searching a song title showed albums and never
+              // the song - reported from the Sonos app as "I searched 'all i need' and only
+              // albums showed up".
+              it("should return the tracks as playable songs, not their albums", async () => {
                 const term = "whoopie";
 
                 const result = await ws.searchAsync({
@@ -1282,8 +1287,8 @@ describe("wsdl api", () => {
                 });
                 expect(result[0]).toEqual(
                   searchResult({
-                    mediaCollection: tracks.map((it) =>
-                      album(bonobUrlWithAccessToken, it.album)
+                    mediaMetadata: tracks.map((it) =>
+                      topSongMetadata(bonobUrlWithAccessToken, it)
                     ),
                     index: 0,
                     total: 2,
@@ -1292,7 +1297,7 @@ describe("wsdl api", () => {
                 expect(musicLibrary.searchTracks).toHaveBeenCalledWith(term);
               });
 
-              it("collapses several hits from the SAME album into one tile", async () => {
+              it("keeps several hits from the SAME album as distinct songs", async () => {
                 // Track hits render as ALBUM tiles, so N hits from one album produced N identical
                 // tiles. Each carried its own song's art id, so that was also N distinct /art urls
                 // and N distinct coalescing keys - up to 20x the cover-art fetches for one search
@@ -1308,31 +1313,34 @@ describe("wsdl api", () => {
 
                 const result = await ws.searchAsync({ id: "tracks", term: "whoopie" });
 
-                // Asserted on count/total plus the single entry rather than deep-equality, because
-                // the SOAP layer serializes a one-element mediaCollection as an object, not an array.
+                // Five distinct songs are five distinct results - collapsing them was an artifact
+                // of rendering tracks AS albums. Cover-art coalescing still holds: tracks from one
+                // album carry the same server-returned coverArt value, so one /art url is shared.
                 const res = result[0].searchResult;
-                expect(res.count).toEqual(1);
-                expect(res.total).toEqual(1);
-                expect([res.mediaCollection].flat()[0]).toEqual(
-                  album(bonobUrlWithAccessToken, sharedAlbum)
+                expect(res.count).toEqual(5);
+                expect(res.total).toEqual(5);
+                const artUrls = new Set(
+                  [res.mediaMetadata].flat().map((m: any) => m.trackMetadata.albumArtURI)
                 );
+                expect([res.mediaMetadata].flat().length).toEqual(5);
+                expect(artUrls.size).toBeLessThanOrEqual(5);
               });
 
-              it("keeps distinct albums as distinct tiles", async () => {
+              it("returns every hit, including two songs from the same album", async () => {
                 const a = aTrack();
                 const b = aTrack();
-                musicLibrary.searchTracks.mockResolvedValue([a, b, aTrack({ album: a.album })]);
+                const c = aTrack({ album: a.album });
+                musicLibrary.searchTracks.mockResolvedValue([a, b, c]);
 
                 const result = await ws.searchAsync({ id: "tracks", term: "whoopie" });
 
                 expect(result[0]).toEqual(
                   searchResult({
-                    mediaCollection: [
-                      album(bonobUrlWithAccessToken, a.album),
-                      album(bonobUrlWithAccessToken, b.album),
-                    ],
+                    mediaMetadata: [a, b, c].map((it) =>
+                      topSongMetadata(bonobUrlWithAccessToken, it)
+                    ),
                     index: 0,
-                    total: 2,
+                    total: 3,
                   })
                 );
               });
