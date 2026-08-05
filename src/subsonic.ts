@@ -2724,7 +2724,16 @@ export class Subsonic {
         (it.similarSongs2.song || []).map(it => asTrackSummary(it, this.customPlayers))
       );
 
+    // Last.fm-backed and slow (measured 770ms), and it runs AFTER a getArtist that exists only to
+    // turn an id into a name - together they blew the 3500ms Top Songs budget on the live library
+    // and the section opened empty. Cached per artist name; top songs change about as often as
+    // Last.fm's charts, which is to say not within a browse session.
     getTopSongs = (credentials: Credentials, artist: string) =>
+      this.cache.get(`topSongs:v1:${credentials.username}:${artist}`, () =>
+        this.fetchTopSongs(credentials, artist)
+      );
+
+    private fetchTopSongs = (credentials: Credentials, artist: string) =>
       this.getJSONWithRetry<GetTopSongsResponse>(
         credentials,
         "/rest/getTopSongs",

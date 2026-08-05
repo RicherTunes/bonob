@@ -1010,6 +1010,19 @@ function bindSmapiSoapServiceToExpress(
                             { getExtendedMetadataResult: {} }
                       );
 
+                  case "topSongs":
+                    // Sonos asks for extended metadata on the Top Songs container before opening
+                    // it. Returning the "unsupported" empty result meant the tile rendered as
+                    // nothing. It is a plain track list, so describe it as one.
+                    return {
+                      getExtendedMetadataResult: {
+                        mediaCollection: {
+                          id,
+                          itemType: "trackList",
+                          title: "Top Songs",
+                        },
+                      },
+                    };
                   default:
                     logger.info(`Sonos requested extended meta data for currently unsupported type=${type}, typeId=${typeId}`)
                     return {

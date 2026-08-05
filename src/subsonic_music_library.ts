@@ -40,7 +40,7 @@ import _ from "underscore";
 import logger from "./logger";
 import { assertSystem, BUrn } from "./burn";
 import { AlbumIndex, MAX_ALBUMS_FLAT } from "./album_index";
-import { withTimeout } from "./timeout";
+import { withTimeout, describeReason } from "./timeout";
 
 // Cap the Last.fm-backed artist enrichment so a slow-but-succeeding getArtistInfo can't stall the
 // artist browse past Sonos's ~5s timeout.
@@ -426,13 +426,25 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   topSongs = async (artistId: string): Promise<TrackSummary[]> =>
     // Top Songs is Last.fm-backed (getTopSongs) and optional: a slow or failing lookup must not
     // stall or reject the browse - degrade to no songs (an empty, valid Top Songs list).
+    //
+    // But degrading SILENTLY is how this section sat empty on the live library while upstream was
+    // healthy (36 songs, 770ms): the chain is getArtist - which exists only to turn the id into a
+    // NAME, and measured 1821ms for that artist - then getTopSongs, both inside one 3500ms budget.
+    // An empty Top Songs and a Top Songs that timed out look identical to the user, so both ends
+    // are now named in the log.
     withTimeout(
       this.subsonic
         .getArtist(this.credentials, artistId)
         .then(({ name }) => this.subsonic.getTopSongs(this.credentials, name)),
       TOP_SONGS_TIMEOUT_MS,
-      [] as TrackSummary[]
-    ).catch(() => [] as TrackSummary[]);
+      [] as TrackSummary[],
+      `topSongs:${artistId}`
+    ).catch((e) => {
+      logger.warn(
+        `Top Songs for ${artistId} failed and degraded to an empty list: ${describeReason(e)}`
+      );
+      return [] as TrackSummary[];
+    });
 
   starredSongs = async () =>
     this.subsonic.starredSongs(this.credentials);

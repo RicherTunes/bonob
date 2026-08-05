@@ -3218,6 +3218,46 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("top songs caching", () => {
+    // Top Songs opened empty on the live library. Upstream was healthy (36 songs, 770ms); the
+    // failure was bonob's own chain: getArtist (1821ms for that artist, run first only to turn the
+    // id into a NAME) then getTopSongs (770ms), both inside one 3500ms budget. It tipped over and
+    // degraded to [] - and silently, because the withTimeout had no context to log with.
+    it("fetches top songs once per artist", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ topSongs: { song: [] } })))
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getTopSongs(credentials, "An Artist");
+      await subsonic.getTopSongs(credentials, "An Artist");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getTopSongs")).length
+      ).toEqual(1);
+    });
+
+    it("caches per artist name", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ topSongs: { song: [] } })))
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getTopSongs(credentials, "An Artist");
+      await subsonic.getTopSongs(credentials, "Another Artist");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getTopSongs")).length
+      ).toEqual(2);
+    });
+  });
+
   describe("genre caching", () => {
     // 1443 genres on the live library, measured at 587ms, and re-fetched for every page of the
     // Genres browse. Genres only change when the library is rescanned.
