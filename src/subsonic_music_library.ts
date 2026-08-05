@@ -50,6 +50,17 @@ import { withTimeout, describeReason } from "./timeout";
 // (2026-08-05 09:15) and degrading to an empty result Sonos could not render. Trimmed so the worst
 // case still fits under the deadline; the lookup is also cached now, so this cap is only ever paid
 // on a cold artist rather than on every open.
+// How many results to ask Subsonic for per search category.
+//
+// Measured from the real Sonos app: it requests count=20 for the search SUMMARY screen and
+// count=50 when a category is EXPANDED (it never pages - index is always 0). At the old cap of 20
+// the expanded view could only ever show 20 of the 50 it asked for, on a 113k-album library where
+// far more matched. 50 matches what the client actually wants.
+//
+// Not larger: the app never asks for more, search3 latency grows with the count (tracks is the
+// slowest category over 831k tracks), and every returned row costs a tile plus an art fetch.
+export const SEARCH_RESULT_COUNT = 50;
+
 export const ARTIST_INFO_TIMEOUT_MS = 2500;
 
 // Cap the optional Last.fm-backed top-songs lookup: a slow/rejecting getTopSongs must not stall or
@@ -346,7 +357,7 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   searchArtists = async (query: string) =>
     this.subsonic
-      .search3(this.credentials, { query, artistCount: 20 })
+      .search3(this.credentials, { query, artistCount: SEARCH_RESULT_COUNT })
       .then(({ artists }) =>
         artists.map((artist) => ({
           id: artist.id,
@@ -364,13 +375,13 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   searchAlbums = async (query: string) =>
     this.subsonic
-      .search3(this.credentials, { query, albumCount: 20 })
+      .search3(this.credentials, { query, albumCount: SEARCH_RESULT_COUNT })
       .then(({ albums }) => this.subsonic.toAlbumSummary(albums));
 
   searchTracks = async (query: string) => {
     const { songs } = await this.subsonic.search3(this.credentials, {
       query,
-      songCount: 20,
+      songCount: SEARCH_RESULT_COUNT,
     });
     // search3 returns complete song records, so a hit carrying an albumId resolves its album from
     // the song itself — one upstream call total, independent of how many match. This used to run

@@ -34,6 +34,7 @@ import {
   SubsonicMusicService,
   SubsonicMusicLibrary,
   ARTIST_INFO_TIMEOUT_MS,
+  SEARCH_RESULT_COUNT,
   TOP_SONGS_TIMEOUT_MS,
 } from "../src/subsonic_music_library";
 
@@ -2859,7 +2860,7 @@ describe("SubsonicMusicLibrary", () => {
           {
             params: asURLSearchParams({
               ...authParamsPlusJson,
-              artistCount: 20,
+              artistCount: SEARCH_RESULT_COUNT,
               albumCount: 0,
               songCount: 0,
               query: "foo",
@@ -2893,7 +2894,7 @@ describe("SubsonicMusicLibrary", () => {
           {
             params: asURLSearchParams({
               ...authParamsPlusJson,
-              artistCount: 20,
+              artistCount: SEARCH_RESULT_COUNT,
               albumCount: 0,
               songCount: 0,
               query: "foo",
@@ -2919,7 +2920,7 @@ describe("SubsonicMusicLibrary", () => {
           {
             params: asURLSearchParams({
               ...authParamsPlusJson,
-              artistCount: 20,
+              artistCount: SEARCH_RESULT_COUNT,
               albumCount: 0,
               songCount: 0,
               query: "foo",
@@ -2958,7 +2959,7 @@ describe("SubsonicMusicLibrary", () => {
             params: asURLSearchParams({
               ...authParamsPlusJson,
               artistCount: 0,
-              albumCount: 20,
+              albumCount: SEARCH_RESULT_COUNT,
               songCount: 0,
               query: "foo",
             }),
@@ -3008,7 +3009,7 @@ describe("SubsonicMusicLibrary", () => {
             params: asURLSearchParams({
               ...authParamsPlusJson,
               artistCount: 0,
-              albumCount: 20,
+              albumCount: SEARCH_RESULT_COUNT,
               songCount: 0,
               query: "moo",
             }),
@@ -3034,7 +3035,7 @@ describe("SubsonicMusicLibrary", () => {
             params: asURLSearchParams({
               ...authParamsPlusJson,
               artistCount: 0,
-              albumCount: 20,
+              albumCount: SEARCH_RESULT_COUNT,
               songCount: 0,
               query: "foo",
             }),
@@ -3181,7 +3182,7 @@ describe("SubsonicMusicLibrary", () => {
               ...authParamsPlusJson,
               artistCount: 0,
               albumCount: 0,
-              songCount: 20,
+              songCount: SEARCH_RESULT_COUNT,
               query: "foo",
             }),
             headers,
@@ -3246,7 +3247,7 @@ describe("SubsonicMusicLibrary", () => {
               ...authParamsPlusJson,
               artistCount: 0,
               albumCount: 0,
-              songCount: 20,
+              songCount: SEARCH_RESULT_COUNT,
               query: "moo",
             }),
             headers,
@@ -3412,7 +3413,7 @@ describe("SubsonicMusicLibrary", () => {
               ...authParamsPlusJson,
               artistCount: 0,
               albumCount: 0,
-              songCount: 20,
+              songCount: SEARCH_RESULT_COUNT,
               query: "foo",
             }),
             headers,
