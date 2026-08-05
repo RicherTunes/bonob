@@ -14,3 +14,13 @@ node_modules
 .pnp.*
 # glm-delegate hands back a copy of each lane diff; it is a delegation artifact, not source.
 .glm-delegate-diff/
+
+# Secrets must never be committable by accident. Nothing has ever been committed here (verified
+# across all history: .env never tracked, no LASTFM/SPOTIFY strings, no key-shaped literals), but
+# .env was not ignored either - so one `git add -A` in this directory was all it would have taken.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
