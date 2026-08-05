@@ -39,6 +39,7 @@ import {
 import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
 import { MAX_ARTISTS_FLAT } from "./artist_index";
 import { withTimeout, withDeadline, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
+import { randomInt } from "./random";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -1485,11 +1486,55 @@ function bindSmapiSoapServiceToExpress(
                       ...paging,
                     });
                   }
-                  case "randomAlbums":
+                  case "randomAlbums": {
+                    // Navidrome randomises with an ORDER BY RANDOM scan across the whole catalog:
+                    // measured 2381ms on the live 113k-album library, and once 5874ms, which blew
+                    // the 4500ms deadline and degraded the section. Asking for fewer rows did NOT
+                    // help, which proved the cost is the scan rather than the row count.
+                    //
+                    // When the album index is warm every album is already addressable by offset, so
+                    // "random" is N independent single-record reads and no upstream query at all.
+                    const peekedForRandom = musicLibrary.peekAlbumIndex();
+                    if (peekedForRandom) {
+                      return peekedForRandom.then(async (idx) => {
+                        if (idx.total > 0) {
+                          const wanted = Math.max(1, Math.min(paging._count, idx.total));
+                          // Sample WITHOUT replacement so a page never shows the same album twice.
+                          const offsets = new Set<number>();
+                          // Bounded attempts: with wanted << total this converges immediately, and
+                          // the cap stops a pathological small catalog from spinning.
+                          for (
+                            let attempts = 0;
+                            offsets.size < wanted && attempts < wanted * 10;
+                            attempts++
+                          ) {
+                            offsets.add(randomInt(idx.total));
+                          }
+                          const picked = (
+                            await Promise.all(
+                              [...offsets].map((offset) =>
+                                readAlbumIndexAll<AlbumSummary>(idx, offset, 1)
+                              )
+                            )
+                          ).flat();
+                          return getMetadataResult({
+                            mediaCollection: picked.map((it) =>
+                              album(urlWithToken(apiKey), it)
+                            ),
+                            index: 0,
+                            total: picked.length,
+                          });
+                        }
+                        return albums({ type: "random", ...paging });
+                      });
+                    }
+                    // Cold index (small library, or still building): fall back to the upstream
+                    // query rather than serving nothing.
                     return albums({
                       type: "random",
                       ...paging,
                     });
+                  }
                   case "favouriteAlbums":
                     return albums({
                       type: "favourited",

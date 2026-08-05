@@ -3941,6 +3941,53 @@ describe("wsdl api", () => {
                 });
               });
 
+            describe("asking for random albums", () => {
+              // An in-memory (resident) index: readAlbumIndexAll falls back to slicing items,
+              // which is exactly what a small library or a not-yet-offloaded index looks like.
+              const anAlbumIndexOf = (n: number) => ({
+                total: n,
+                items: Array.from({ length: n }, (_, i) =>
+                  anAlbum({ id: `album-${i}`, name: `Album ${i}` })
+                ),
+                buckets: [{ key: "A", label: "A", offset: 0, count: n }],
+              });
+
+              // Navidrome's random ordering is an ORDER BY RANDOM scan over the whole catalog:
+              // measured 2381ms on the live 113k-album library and once 5874ms, which blew the
+              // 4500ms deadline. Reducing the requested page size did NOT help, proving the cost is
+              // the scan and not the row count. When the disk-backed album index is warm we already
+              // have every album addressable by offset, so random albums are N cheap byte-range
+              // reads and no upstream query at all.
+              it("serves from the warm album index without asking Navidrome to randomise", async () => {
+                musicLibrary.peekAlbumIndex.mockReturnValue(
+                  Promise.resolve(anAlbumIndexOf(50))
+                );
+
+                const result = await ws.getMetadataAsync({
+                  id: "randomAlbums",
+                  index: 0,
+                  count: 10,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(([] as any[]).concat(md.mediaCollection).length).toEqual(10);
+                expect(musicLibrary.albums).not.toHaveBeenCalled();
+              });
+
+              // Cold index (small library, or still building): fall back to the upstream query
+              // rather than serving nothing.
+              it("falls back to the upstream random query when the index is cold", async () => {
+                musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
+                musicLibrary.albums.mockResolvedValue({ results: [], total: 0 });
+
+                await ws.getMetadataAsync({ id: "randomAlbums", index: 0, count: 10 });
+
+                expect(musicLibrary.albums).toHaveBeenCalledWith(
+                  expect.objectContaining({ type: "random" })
+                );
+              });
+            });
+
             describe("asking for a playlist tile", () => {
               // Rendering ONE playlist tile needs only id/name/coverArt, but this fetched the whole
               // playlist - every entry, mapped to a Track - to read three fields off it. A
