@@ -854,7 +854,7 @@ describe("SubsonicMusicLibrary", () => {
                 ...authParamsPlusJson,
                 type: "byGenre",
                 genre: "Pop",
-                size: 500,
+                size: 100,
                 offset: 0,
               }),
               headers,
@@ -898,7 +898,7 @@ describe("SubsonicMusicLibrary", () => {
               params: asURLSearchParams({
                 ...authParamsPlusJson,
                 type: "newest",
-                size: 500,
+                size: 100,
                 offset: 0,
               }),
               headers,
@@ -942,7 +942,7 @@ describe("SubsonicMusicLibrary", () => {
               params: asURLSearchParams({
                 ...authParamsPlusJson,
                 type: "recent",
-                size: 500,
+                size: 100,
                 offset: 0,
               }),
               headers,
@@ -977,7 +977,7 @@ describe("SubsonicMusicLibrary", () => {
               params: asURLSearchParams({
                 ...authParamsPlusJson,
                 type: "frequent",
-                size: 500,
+                size: 100,
                 offset: 0,
               }),
               headers,
@@ -1012,7 +1012,7 @@ describe("SubsonicMusicLibrary", () => {
               params: asURLSearchParams({
                 ...authParamsPlusJson,
                 type: "highest",
-                size: 500,
+                size: 100,
                 offset: 0,
               }),
               headers,

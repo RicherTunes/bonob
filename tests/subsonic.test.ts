@@ -52,6 +52,7 @@ import {
   albumSummaryFromSong,
   CoverArtBusyError,
   DEFAULT_MAX_INDEX_SCAN_ALBUMS,
+  ALBUM_LIST_MAX_PAGE_SIZE,
 } from "../src/subsonic";
 
 import { promises as dnsPromises } from "dns";
@@ -3026,6 +3027,47 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         );
         expect(starredCalls.length).toEqual(2);
       });
+    });
+  });
+
+  describe("album list page sizing", () => {
+    // getAlbumList2 always asked Navidrome for 500 albums no matter how few Sonos wanted, and the
+    // volatile sections (random/recentlyPlayed/mostPlayed/favourited/starred) are never cached, so
+    // every browse paid a 500-row query. Measured in production: randomAlbums 2381ms, and once
+    // 5874ms - past the 4500ms deadline, degrading the section to a placeholder.
+    it("asks upstream for only as many albums as Sonos requested", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ albumList2: { album: [] } })))
+      );
+      const subsonic = new Subsonic(url, NO_CUSTOM_PLAYERS);
+      await subsonic.getAlbumList2(credentials, {
+        type: "random",
+        _index: 0,
+        _count: 20,
+      } as any);
+      const call = mockGET.mock.calls.find((c) =>
+        String(c[0]).includes("getAlbumList2")
+      );
+      expect(call).toBeDefined();
+      expect(String(call![1].params.get("size"))).toEqual("20");
+    });
+
+    it("never asks for more than the upstream page cap", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ albumList2: { album: [] } })))
+      );
+      const subsonic = new Subsonic(url, NO_CUSTOM_PLAYERS);
+      await subsonic.getAlbumList2(credentials, {
+        type: "random",
+        _index: 0,
+        _count: 100_000,
+      } as any);
+      const call = mockGET.mock.calls.find((c) =>
+        String(c[0]).includes("getAlbumList2")
+      );
+      expect(Number(call![1].params.get("size"))).toEqual(
+        ALBUM_LIST_MAX_PAGE_SIZE
+      );
     });
   });
 

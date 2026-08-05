@@ -329,6 +329,29 @@ export const DEFAULT_COVER_ART_QUEUE_TIMEOUT_MS = 5_000;
 // depends on it: a short page means the catalog ended.
 export const ALBUM_SCAN_PAGE_SIZE = 500;
 
+// Upper bound on a single getAlbumList2 browse page. Sonos never asks for more than a few hundred;
+// this only stops a malformed/hostile count from turning one browse into a whole-catalog query.
+export const ALBUM_LIST_MAX_PAGE_SIZE = 500;
+
+// How many albums to actually request for a browse page.
+//
+// Sized to the caller's count so a browse never over-fetches - EXCEPT for the unfiltered
+// alphabetical lists, which deliberately keep the full page. Those reconcile a stale getArtists
+// album-count sum against reality, and a short page is what tells them they reached the true end
+// of the catalog; sizing them to the caller's count would destroy that signal (a full page would
+// no longer distinguish "more to come" from "exactly filled"). They are also cached per page, so
+// the surplus is amortised rather than paid per browse.
+//
+// The measured cost was in the volatile, never-cached sections: randomAlbums 2381ms, and once
+// 5874ms - past the 4500ms deadline. Those are exactly the ones sized down here.
+export const albumListPageSize = (q: {
+  _count: number;
+  type: AlbumQueryType;
+}): number =>
+  q.type === "alphabeticalByName" || q.type === "alphabeticalByArtist"
+    ? ALBUM_LIST_MAX_PAGE_SIZE
+    : Math.min(ALBUM_LIST_MAX_PAGE_SIZE, Math.max(1, q._count || 1));
+
 // Safety cap on the index scan, to stop a runaway or pathological server walking forever. Raised
 // from a hardcoded 2,000,000 - a catalog of millions is the target, and at 2M the old cap silently
 // truncated the index rather than refusing. Override with BNB_MAX_INDEX_SCAN_ALBUMS.
@@ -2150,7 +2173,13 @@ export class Subsonic {
       ...(q.genre ? { genre: b64Decode(q.genre) } : {}),
       ...(q.fromYear ? { fromYear: q.fromYear } : {}),
       ...(q.toYear ? { toYear: q.toYear } : {}),
-      size: 500,
+      // Ask for what Sonos actually wants, not a flat 500. The volatile sections (random /
+      // recentlyPlayed / mostPlayed / favourited / starred) are deliberately never cached, so a
+      // fixed 500 meant every browse paid a 5-50x over-fetch against a 113k-album catalog:
+      // randomAlbums measured 2381ms, and once 5874ms, which blew the 4500ms deadline and
+      // degraded the section. Cached pages are keyed per _index, so the surplus rows were never
+      // reused there either.
+      size: albumListPageSize(q),
       offset: q._index,
     })
       .then((response) => response.albumList2.album || [])
@@ -2187,7 +2216,14 @@ export class Subsonic {
       const results = albums.slice(0, q._count);
       return {
         results,
-        total: albums.length == 500 ? total : q._index + albums.length,
+        // A FULL page means there is probably more behind it, so advertise the true catalog
+        // total; a short page means we reached the end and the exact total is known. This used to
+        // compare against a hardcoded 500, which silently stopped meaning "full page" the moment
+        // the request size became the caller's count.
+        total:
+          albums.length >= albumListPageSize(q)
+            ? total
+            : q._index + albums.length,
       };
     }
     const albums = await (VOLATILE_ALBUM_TYPES.has(q.type)
