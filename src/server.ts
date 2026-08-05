@@ -747,36 +747,36 @@ function server(
         }
       })
       .then((coverArt) => {
+        // Artist art resolves through the EXTERNAL pipeline (deezer / external), which for most
+        // non-mainstream artists either has no photo at all or hands back an error document rather
+        // than an image. Measured on the production library, 2 of 3 artist search hits failed here
+        // while 20 of 20 album hits served fine, because album art always resolves through
+        // Navidrome. A search result whose art fails to load is a tile the client may refuse to
+        // render, so BOTH artist failure modes end in the generic artist icon rather than an error.
+        //
+        // Album/track art (the subsonic system) deliberately keeps its 404/502: Navidrome supplies
+        // its own placeholder, so a failure there means something genuinely went wrong and should
+        // stay visible rather than being papered over.
+        const isArtistArt = urn.system == "deezer" || urn.system == "external";
+        const serveArtistPlaceholder = () =>
+          Promise.resolve(
+            ICONS["artists"]!
+              .apply(features({ ...serverOpts.iconColors }))
+              .apply(no_festivals)
+              .toString()
+          )
+            .then((svg) => sharp(Buffer.from(svg)).resize(size).png().toBuffer())
+            .then((data) => {
+              res.status(200);
+              res.setHeader("content-type", "image/png");
+              res.setHeader("X-Content-Type-Options", "nosniff");
+              // Short cache: the artist may gain a real photo upstream later.
+              res.setHeader("Cache-Control", "private, max-age=3600");
+              return res.send(data);
+            });
+
         if (coverArt == undefined) {
-          // Artist art resolves through the EXTERNAL pipeline (deezer / external), which simply
-          // has no photo for most non-mainstream artists - measured on the production library,
-          // 2 of 3 artist search hits 404'd here while 20 of 20 album hits served fine, because
-          // album art always resolves through Navidrome. A search result whose art 404s is a tile
-          // the client may refuse to render, so serve the generic artist icon instead of nothing.
-          // Album/track art (the subsonic system) keeps the 404: Navidrome already supplies its
-          // own placeholder, so a miss there means something genuinely went wrong.
-          if (urn.system == "deezer" || urn.system == "external") {
-            return Promise.resolve(
-              ICONS["artists"]!
-                .apply(features({ ...serverOpts.iconColors }))
-                .apply(no_festivals)
-                .toString()
-            )
-              .then((svg) =>
-                sharp(Buffer.from(svg))
-                  .resize(size)
-                  .png()
-                  .toBuffer()
-              )
-              .then((data) => {
-                res.status(200);
-                res.setHeader("content-type", "image/png");
-                res.setHeader("X-Content-Type-Options", "nosniff");
-                // Short cache: the artist may gain a photo upstream later.
-                res.setHeader("Cache-Control", "private, max-age=3600");
-                return res.send(data);
-              });
-          }
+          if (isArtistArt) return serveArtistPlaceholder();
           res.setHeader("Cache-Control", "private, max-age=60");
           return res.status(404).send();
         } else if (
@@ -792,6 +792,11 @@ function server(
           return res.send(coverArt.data);
         } else {
           logger.warn(`Refusing to serve a 200 response with a non-image content type (${coverArt.contentType}) as art`);
+          // Observed live during a Sonos search: the external artist-art pipeline handed back
+          // application/xml (an upstream error document) with a 200, which became a 502 and a
+          // broken artist tile. Same user-visible outcome as the missing-photo case, so it takes
+          // the same placeholder rather than an error the client has to render around.
+          if (isArtistArt) return serveArtistPlaceholder();
           res.setHeader("Cache-Control", "no-store");
           return res.status(502).send();
         }

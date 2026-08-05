@@ -2605,6 +2605,37 @@ describe("server (coverage extensions)", () => {
       expect(deezerImageResolver).not.toHaveBeenCalled();
     });
 
+    // Observed live during a Sonos search: the external artist-art pipeline returned
+    // application/xml (an upstream error document) with a 200, which became a 502 and a broken
+    // artist tile. Same user-visible outcome as having no photo, so it takes the same placeholder.
+    it("a deezer burn whose image resolves to a non-image content type serves the artist icon", async () => {
+      const deezerArtistImage = jest.fn().mockResolvedValue("https://e-cdns-images.dzcdn.net/x.jpg");
+      const deezerImageResolver = jest.fn().mockResolvedValue({
+        contentType: "application/xml",
+        data: Buffer.from("<error/>"),
+      });
+      const apiTokens = new InMemoryAPITokens();
+      const apiToken = apiTokens.mint(uuid());
+
+      const app = artServer({
+        apiTokens: () => apiTokens,
+        deezerArtistImage,
+        deezerImageResolver,
+      });
+
+      const burn = formatForURL({ system: "deezer", resource: "artist:xml-error" });
+
+      const res = await request(app)
+        .get(
+          `/art/${encodeURIComponent(burn)}/size/180?${BONOB_ACCESS_TOKEN_HEADER}=${apiToken}`
+        )
+        .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
+
+      expect(res.status).toEqual(200);
+      expect(res.headers["content-type"]).toContain("image/png");
+      expect(res.body.length).toBeGreaterThan(0);
+    });
+
     it("a signed external burn with a safe host is fetched via externalImageResolver (the external arm)", async () => {
       // Mutating `urn.system == "external"` (or routing external through coverArt) changes which
       // resolver runs and what status/body the client gets.
