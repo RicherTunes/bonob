@@ -165,12 +165,19 @@ export function getMetadataResult(
   const count =
     (result?.mediaCollection?.length || 0) +
     (result?.mediaMetadata?.length || 0);
+  // WSDL order matters: mediaList is an xs:sequence of index, then count, then total, and the
+  // soap library serializes object keys in insertion order. Building {count, index, total} made
+  // every browse and search response bonob sent schema-invalid. Sonos S2 tolerates it, which is
+  // why it survived unnoticed until 14 captured production responses were validated against the
+  // schema. Destructure the caller's overrides out of the spread so they cannot reintroduce the
+  // wrong order by appearing after these three.
+  const { index: overrideIndex, count: _ignoredCount, total: overrideTotal, ...rest } = result;
   return {
     getMetadataResult: {
+      index: overrideIndex ?? 0,
       count,
-      index: 0,
-      total: count,
-      ...result,
+      total: overrideTotal ?? count,
+      ...rest,
       ...(result.mediaCollection && {
         mediaCollection: sanitizeXml(result.mediaCollection),
       }),
@@ -191,12 +198,19 @@ export function searchResult(
   const count =
     (result?.mediaCollection?.length || 0) +
     (result?.mediaMetadata?.length || 0);
+  // WSDL order matters: mediaList is an xs:sequence of index, then count, then total, and the
+  // soap library serializes object keys in insertion order. Building {count, index, total} made
+  // every browse and search response bonob sent schema-invalid. Sonos S2 tolerates it, which is
+  // why it survived unnoticed until 14 captured production responses were validated against the
+  // schema. Destructure the caller's overrides out of the spread so they cannot reintroduce the
+  // wrong order by appearing after these three.
+  const { index: overrideIndex, count: _ignoredCount, total: overrideTotal, ...rest } = result;
   return {
     searchResult: {
+      index: overrideIndex ?? 0,
       count,
-      index: 0,
-      total: count,
-      ...result,
+      total: overrideTotal ?? count,
+      ...rest,
       ...(result.mediaCollection && {
         mediaCollection: sanitizeXml(result.mediaCollection),
       }),

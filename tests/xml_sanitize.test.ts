@@ -1,4 +1,4 @@
-import { sanitizeXml } from "../src/smapi";
+import { sanitizeXml, getMetadataResult, searchResult } from "../src/smapi";
 
 // Build control characters at runtime; never place a literal control char in source.
 const ch = (n: number) => String.fromCharCode(n);
@@ -69,5 +69,32 @@ describe("sanitizeXml", () => {
     expect(result.mediaCollection[0].artist).toEqual("Childish Gambino");
     expect(result.mediaCollection[1]).toEqual(clean);
     expect(result.count).toEqual(2);
+  });
+});
+
+describe("SMAPI element order (xs:sequence is mandatory)", () => {
+  // The WSDL declares mediaList as an xs:sequence: index, then count, then total. We emitted
+  // count first, because getMetadataResult built {count, index, total, ...} and the soap library
+  // serializes object keys in insertion order. Every browse and search response bonob has ever
+  // sent was therefore schema-invalid. Sonos S2 tolerates it, which is precisely why it went
+  // unnoticed - and precisely why it is worth fixing before a firmware or a stricter client does
+  // not. Found by validating 14 captured PRODUCTION responses against the WSDL schema.
+  it("getMetadataResult emits index, count, total in WSDL order", () => {
+    const keys = Object.keys(getMetadataResult({ mediaCollection: [] }).getMetadataResult);
+    expect(keys.slice(0, 3)).toEqual(["index", "count", "total"]);
+  });
+
+  it("searchResult emits index, count, total in WSDL order", () => {
+    const keys = Object.keys(searchResult({ mediaCollection: [] }).searchResult);
+    expect(keys.slice(0, 3)).toEqual(["index", "count", "total"]);
+  });
+
+  it("still lets an explicit index/total override the defaults", () => {
+    const r = getMetadataResult({ mediaCollection: [1, 2] as any[], index: 40, total: 900 })
+      .getMetadataResult;
+    expect(r.index).toEqual(40);
+    expect(r.count).toEqual(2);
+    expect(r.total).toEqual(900);
+    expect(Object.keys(r).slice(0, 3)).toEqual(["index", "count", "total"]);
   });
 });
