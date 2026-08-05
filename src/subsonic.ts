@@ -2382,7 +2382,25 @@ export class Subsonic {
       }))
     );
 
+  // getPlaylist is unpaginated: it returns EVERY entry of the playlist. Sonos then browses that
+  // container page by page, and each page re-ran the whole fetch - so an N-track playlist cost
+  // N records x (N/100) pages of upstream JSON. Same shape as the Favourite Songs bug that took
+  // 8615ms against a 4500ms deadline at 11.5k rows; a big enough playlist reaches it too.
+  //
+  // Cached per user + playlist id, and invalidated by every playlist mutation below, so bonob's
+  // own edits are never masked by its own cache.
+  private playlistKey = (credentials: Credentials, id: string) =>
+    `playlist:v1:${credentials.username}:${id}`;
+
+  private invalidatePlaylist = (credentials: Credentials, id: string): void =>
+    this.cache.invalidate(this.playlistKey(credentials, id));
+
   playlist = (credentials: Credentials, id: string) =>
+    this.cache.get(this.playlistKey(credentials, id), () =>
+      this.fetchPlaylist(credentials, id)
+    );
+
+  private fetchPlaylist = (credentials: Credentials, id: string) =>
     this.getJSONWithRetry<GetPlaylistResponse>(credentials, "/rest/getPlaylist", {
       id,
     })
@@ -2427,7 +2445,11 @@ export class Subsonic {
       this.getJSON<SubsonicResponse>(credentials, "/rest/deletePlaylist", {
         id,
       })
-      .then(it => it.status == "ok");
+      .then(it => {
+        // Drop the cached contents so a deleted playlist cannot be served from cache.
+        this.invalidatePlaylist(credentials, id);
+        return it.status == "ok";
+      });
 
     updatePlaylist = (
       credentials: Credentials, 
@@ -2438,7 +2460,12 @@ export class Subsonic {
         playlistId,
         ...changes
       })
-      .then(it => it.status == "ok");
+      .then(it => {
+        // A track was added or removed: our cached copy is now wrong. Without this the user edits
+        // a playlist from Sonos and their own change is invisible until the TTL expires.
+        this.invalidatePlaylist(credentials, playlistId);
+        return it.status == "ok";
+      });
 
     getSimilarSongs2 = (credentials: Credentials, id: string) =>
       this.getJSONWithRetry<GetSimilarSongsResponse>(

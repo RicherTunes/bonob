@@ -3030,6 +3030,82 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("playlist caching (getPlaylist is unpaginated, re-fetched per page)", () => {
+    // Same hazard as favouriteSongs: getPlaylist returns EVERY entry, and Sonos browses the
+    // container page by page, so an uncached playlist costs one full fetch per page.
+    const playlistResponse = () =>
+      ok(
+        subsonicOK({
+          playlist: { id: "pl-1", name: "Road trip", entry: [] },
+        })
+      );
+
+    it("fetches a playlist once across repeated page reads", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(playlistResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.playlist(credentials, "pl-1");
+      await subsonic.playlist(credentials, "pl-1");
+      await subsonic.playlist(credentials, "pl-1");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getPlaylist")).length
+      ).toEqual(1);
+    });
+
+    it("caches per playlist id, not globally", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(playlistResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.playlist(credentials, "pl-1");
+      await subsonic.playlist(credentials, "pl-2");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getPlaylist")).length
+      ).toEqual(2);
+    });
+
+    // bonob edits playlists itself. Without invalidation the user adds a track from Sonos, reopens
+    // the playlist, and their own change is missing until the TTL expires.
+    it("re-fetches after updatePlaylist adds or removes a track", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(playlistResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.playlist(credentials, "pl-1");
+      await subsonic.updatePlaylist(credentials, "pl-1", { songIdToAdd: "t-9" });
+      await subsonic.playlist(credentials, "pl-1");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getPlaylist")).length
+      ).toEqual(2);
+    });
+
+    it("re-fetches after deletePlayList so a deleted playlist is never served from cache", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(playlistResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.playlist(credentials, "pl-1");
+      await subsonic.deletePlayList(credentials, "pl-1");
+      await subsonic.playlist(credentials, "pl-1");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getPlaylist")).length
+      ).toEqual(2);
+    });
+  });
+
   describe("album list page sizing", () => {
     // getAlbumList2 always asked Navidrome for 500 albums no matter how few Sonos wanted, and the
     // volatile sections (random/recentlyPlayed/mostPlayed/favourited/starred) are never cached, so
