@@ -33,6 +33,7 @@ import _ from "underscore";
 import { BUrn, formatForURL } from "./burn";
 import {
   albumIndexLetters,
+  scrollIndicesFrom,
   albumIndexLetterTotal,
   MAX_ALBUMS_FLAT,
 } from "./album_index";
@@ -1031,6 +1032,32 @@ function bindSmapiSoapServiceToExpress(
                 `getExtendedMetadataText:${textType}`
               )
             ),
+          // The alphabet scrubber for a container that advertised canScroll. Answered from the
+          // index bucket table, so it is O(26) rather than a scan of 24,797 artists, and it never
+          // triggers a build: a cold index degrades to no scroll rather than blocking the browse.
+          getScrollIndices: async (
+            { id }: { id: string },
+            _,
+            soapyHeaders: SoapyHeaders,
+            { headers }: Pick<Request, "headers">
+          ) =>
+            withTimeout(
+              login(findLoginToken(soapyHeaders, headers)).then(
+                async ({ musicLibrary }) => {
+                  if (id !== "artists")
+                    return { getScrollIndicesResult: "" };
+                  const peeked = musicLibrary.peekArtistIndex();
+                  if (!peeked) return { getScrollIndicesResult: "" };
+                  const idx = await peeked;
+                  return { getScrollIndicesResult: scrollIndicesFrom(idx) };
+                }
+              ),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              { getScrollIndicesResult: "" },
+              `getScrollIndices:${id}`
+            ).catch(
+              faultOrFallback({ getScrollIndicesResult: "" }, `getScrollIndices:${id}`)
+            ),
           getMetadata: async (
             {
               id,
@@ -1081,6 +1108,13 @@ function bindSmapiSoapServiceToExpress(
                           title: lang("artists"),
                           albumArtURI: albumArtURI(iconArtURI(bonobUrl, "artists").href()),
                           itemType: "container",
+                          // Advertise the native alphabet scrubber. When the catalog is small
+                          // enough to serve Artists FLAT (BNB_SONOS_MAX_CONTAINER_TOTAL), Sonos
+                          // draws an A-Z rail and jumps by letter, which is the idiomatic way to
+                          // navigate a long list and removes the extra per-letter container tap.
+                          // Harmless when the catalog is bucketed instead: Sonos simply asks for
+                          // the indices and gets the bucket boundaries.
+                          canScroll: true,
                         },
                         {
                           id: "albums",

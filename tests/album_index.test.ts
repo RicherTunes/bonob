@@ -1,5 +1,6 @@
 import {
   albumBucketKey,
+  scrollIndicesFrom,
   buildAlbumIndexFromPages,
   albumIndexLetters,
   albumIndexRangesFor,
@@ -226,5 +227,46 @@ describe("albumIndexPage", () => {
     const page = albumIndexPage(idx, "B", 1, 2);
     expect(page.items.map((a) => a.name)).toEqual(["Berry", "Bread"]);
     expect(page.total).toEqual(3);
+  });
+});
+
+describe("scrollIndicesFrom (SMAPI alphabet scrubber)", () => {
+  // Sonos's native way to navigate a long flat list: a container advertises canScroll, and
+  // getScrollIndices returns "A,0,B,120,C,340,..." so the app can jump straight to a letter. That
+  // removes the extra [X] tap that bucketing forces. Upstream builds this by scanning every item;
+  // we already have the bucket table, so it is O(26) rather than O(24797).
+  it("emits letter,offset pairs from the bucket table", () => {
+    const index = {
+      total: 300,
+      buckets: [
+        { key: "A", label: "A", offset: 0, count: 100 },
+        { key: "C", label: "C", offset: 100, count: 200 },
+      ],
+    } as any;
+    expect(scrollIndicesFrom(index)).toEqual(
+      // B has no artists, so it points at the offset where B WOULD start (the end of A) rather
+      // than being skipped: the scrubber must have an entry for every letter, or the app cannot
+      // map a touch position to a list offset. Letters past the last populated one point at the
+      // end of the catalog, not at the start of the last letter (which is upstream's behaviour and
+      // makes dragging to Z jump to C).
+      "A,0,B,100,C,100,D,300,E,300,F,300,G,300,H,300,I,300,J,300,K,300,L,300,M,300,N,300,O,300,P,300,Q,300,R,300,S,300,T,300,U,300,V,300,W,300,X,300,Y,300,Z,300"
+    );
+  });
+
+  it("handles a leading non-alphabetic bucket (#) without corrupting the letters", () => {
+    const index = {
+      total: 50,
+      buckets: [
+        { key: "#", label: "#", offset: 0, count: 10 },
+        { key: "B", label: "B", offset: 10, count: 40 },
+      ],
+    } as any;
+    const s = scrollIndicesFrom(index);
+    expect(s.startsWith("A,0,B,10,")).toBe(true);
+    expect(s.split(",").length).toEqual(52);
+  });
+
+  it("returns an entry for all 26 letters even when the catalog is empty", () => {
+    expect(scrollIndicesFrom({ total: 0, buckets: [] } as any).split(",").length).toEqual(52);
   });
 });

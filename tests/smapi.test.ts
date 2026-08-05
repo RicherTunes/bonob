@@ -1557,6 +1557,9 @@ describe("wsdl api", () => {
                       title: "Artists",
                       albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                       itemType: "container",
+                      // Advertises the native A-Z scrubber (getScrollIndices), so a flat Artists
+                      // list is navigable without the extra per-letter container tap.
+                      canScroll: true,
                     },
                     {
                       id: "albums",
@@ -1661,6 +1664,7 @@ describe("wsdl api", () => {
                       title: "Artiesten",
                       albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                       itemType: "container",
+                      canScroll: true,
                     },
                     {
                       id: "albums",

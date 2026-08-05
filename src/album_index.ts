@@ -243,3 +243,45 @@ export function albumIndexAll<T>(
     ? index.items.slice(pageIndex, pageIndex + pageCount)
     : [];
 }
+
+// The SMAPI alphabet scrubber. A container that advertises canScroll gets asked for
+// getScrollIndices, and answers with "A,0,B,120,C,340,..." mapping each letter to the item offset
+// where it starts, so the Sonos app can jump straight there. That is the native way to navigate a
+// long list, and it removes the extra per-letter container tap that bucketing forces on the user.
+//
+// Built from the bucket table rather than by scanning the records: the buckets already carry each
+// letter's starting offset, so this is O(26) instead of O(total). At 24,797 artists that matters.
+//
+// Every one of A-Z must appear, even letters the catalog has nothing under: the scrubber maps a
+// touch position to a list offset, so a missing letter would leave a dead zone. A letter with no
+// items points at the position where it WOULD start, which is where the previous letter ended.
+export function scrollIndicesFrom(index: AlbumIndex<any>): string {
+  // First offset and last end per bucket key. A key can span several chunk buckets, so the letter
+  // starts at the lowest offset and ends after the highest.
+  const start = new Map<string, number>();
+  const end = new Map<string, number>();
+  for (const b of index.buckets) {
+    start.set(b.key, Math.min(start.get(b.key) ?? b.offset, b.offset));
+    end.set(b.key, Math.max(end.get(b.key) ?? 0, b.offset + b.count));
+  }
+  const out: string[] = [];
+  // Running end-of-catalog-so-far. A letter with NO items points here: the offset where it would
+  // begin, which is where the previous populated letter ended.
+  //
+  // This deliberately differs from upstream's version, which carries the previous letter's START
+  // forward, so every letter after the last populated one points at the beginning of that letter.
+  // Dragging the scrubber to Z would then jump to C. Pointing past-the-end letters at the end of
+  // the catalog is what the scrubber is for.
+  let running = 0;
+  for (let c = 0; c < 26; c++) {
+    const letter = String.fromCharCode(65 + c);
+    const at = start.get(letter);
+    if (at !== undefined) {
+      out.push(letter, `${at}`);
+      running = end.get(letter) ?? at;
+    } else {
+      out.push(letter, `${running}`);
+    }
+  }
+  return out.join(",");
+}
