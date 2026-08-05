@@ -431,18 +431,37 @@ describe("album_snapshot: disk bounding — generation token, not mtime; global 
     expect(fs.existsSync(newest)).toBe(true); // active newest, never evicted
   });
 
-  it("also sweeps stale .tmp files left by a build that crashed before its rename", async () => {
+  // enforceSnapshotBounds runs from finalize(), i.e. WHILE other builds may still be streaming
+  // into their own .tmp files, and it cannot tell "stale, from a crashed build" apart from
+  // "in flight, owned by a build running right now". It used to sweep .tmp here, so the first
+  // build to finish deleted every other in-flight build's temp file and those builds died with
+  // ENOENT on their own rename. Sweeping is albumIndexStore().load()'s job, at startup, when no
+  // build can be in flight. See the concurrent-build property test.
+  it("must NOT sweep .tmp files: a concurrent build may own them", async () => {
     const key = "albumIndex:v3:tmp";
     const good = writeNamedSnapshot(dir, key, 1_000, 100);
+    const inFlightTmp = path.join(
+      dir,
+      `albumSnapshot.v3.${keyHashOf(key)}.${gen(500)}.tmp`
+    );
+    fs.writeFileSync(inFlightTmp, Buffer.alloc(50));
+
+    await enforceSnapshotBounds(dir, {});
+
+    expect(fs.existsSync(good)).toBe(true);
+    expect(fs.existsSync(inFlightTmp)).toBe(true);
+  });
+
+  it("albumIndexStore().load() is what sweeps stale .tmp, at startup", () => {
+    const key = "albumIndex:v3:tmp-startup";
     const staleTmp = path.join(
       dir,
       `albumSnapshot.v3.${keyHashOf(key)}.${gen(500)}.tmp`
     );
     fs.writeFileSync(staleTmp, Buffer.alloc(50));
 
-    await enforceSnapshotBounds(dir, {});
+    albumIndexStore(dir).load();
 
-    expect(fs.existsSync(good)).toBe(true);
     expect(fs.existsSync(staleTmp)).toBe(false);
   });
 });
@@ -892,15 +911,16 @@ describe("album_snapshot: Loop 2 residual mutation-killers", () => {
   // `??`, so an empty opts object is fine — but a MISSING opts (undefined) only works because of the
   // `= {}` default. Removing the default makes `opts.maxBytes` throw TypeError on a no-arg call.
   it("enforceSnapshotBounds() applies defaults when opts is omitted entirely (L349)", async () => {
+    // Removing the `= {}` default makes `opts.maxBytes` throw a TypeError on a no-arg call, so the
+    // promise would REJECT - resolving is itself what kills that mutation. (This used to also
+    // assert a stray .tmp was swept as proof it ran; enforceSnapshotBounds deliberately no longer
+    // sweeps .tmp, because a concurrent build may own it.)
     await expect(enforceSnapshotBounds(dir)).resolves.toBeUndefined();
-    // And it really ran (didn't just no-op): a stray .tmp would be swept.
-    const staleTmp = path.join(
-      dir,
-      `albumSnapshot.v3.${keyHashOf("albumIndex:v3:user")}.${gen(500)}.tmp`
-    );
-    fs.writeFileSync(staleTmp, Buffer.alloc(10));
-    await enforceSnapshotBounds(dir); // no opts
-    expect(fs.existsSync(staleTmp)).toBe(false);
+    // ...and a well-under-bounds directory is left completely intact.
+    const key = "albumIndex:v3:defaults";
+    const kept = writeNamedSnapshot(dir, key, 1_000, 100);
+    await expect(enforceSnapshotBounds(dir)).resolves.toBeUndefined(); // no opts
+    expect(fs.existsSync(kept)).toBe(true);
   });
 
   // L528/L529 in-memory deferral in readAlbumIndexAll. The analogous readAlbumIndexPage deferral

@@ -383,14 +383,17 @@ export async function enforceSnapshotBounds(
   } catch {
     return;
   }
-  // Sweep stale .tmp (a build that crashed before its atomic rename) whenever the directory is touched.
-  for (const n of names.filter((n) => n.startsWith(FILE_PREFIX) && n.endsWith(".tmp"))) {
-    try {
-      await fs.promises.rm(path.join(dir, n), { force: true });
-    } catch {
-      /* best-effort */
-    }
-  }
+  // NO .tmp sweep here. This function runs from finalize(), i.e. while OTHER builds may still be
+  // streaming records into their own .tmp files - and a sweep cannot tell "stale, from a crashed
+  // build" apart from "in flight, owned by a build running right now". Sweeping here meant the
+  // first build to finish deleted every other in-flight build's temp file, and those builds then
+  // died with ENOENT on their own rename, leaving the user on the "Loading..." placeholder and
+  // re-triggering a full catalog rescan on the next browse. Two users logging in close together is
+  // enough to hit it.
+  //
+  // Stale .tmp files are swept in albumIndexStore().load() instead, which runs at startup when no
+  // build can be in flight. Found by the concurrent-build property test in
+  // tests/album_snapshot_properties.test.ts - keep that test.
 
   // Parse + stat every snapshot file. A file we cannot stat is left alone (not blindly evicted).
   type SF = { full: string; keyHash: string; gen: string; size: number };
