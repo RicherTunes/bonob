@@ -747,7 +747,36 @@ function server(
         }
       })
       .then((coverArt) => {
-        if(coverArt == undefined) {
+        if (coverArt == undefined) {
+          // Artist art resolves through the EXTERNAL pipeline (deezer / external), which simply
+          // has no photo for most non-mainstream artists - measured on the production library,
+          // 2 of 3 artist search hits 404'd here while 20 of 20 album hits served fine, because
+          // album art always resolves through Navidrome. A search result whose art 404s is a tile
+          // the client may refuse to render, so serve the generic artist icon instead of nothing.
+          // Album/track art (the subsonic system) keeps the 404: Navidrome already supplies its
+          // own placeholder, so a miss there means something genuinely went wrong.
+          if (urn.system == "deezer" || urn.system == "external") {
+            return Promise.resolve(
+              ICONS["artists"]!
+                .apply(features({ ...serverOpts.iconColors }))
+                .apply(no_festivals)
+                .toString()
+            )
+              .then((svg) =>
+                sharp(Buffer.from(svg))
+                  .resize(size)
+                  .png()
+                  .toBuffer()
+              )
+              .then((data) => {
+                res.status(200);
+                res.setHeader("content-type", "image/png");
+                res.setHeader("X-Content-Type-Options", "nosniff");
+                // Short cache: the artist may gain a photo upstream later.
+                res.setHeader("Cache-Control", "private, max-age=3600");
+                return res.send(data);
+              });
+          }
           res.setHeader("Cache-Control", "private, max-age=60");
           return res.status(404).send();
         } else if (

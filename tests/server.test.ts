@@ -2574,9 +2574,12 @@ describe("server (coverage extensions)", () => {
       expect(deezerImageResolver).toHaveBeenCalledWith(resolved);
     });
 
-    it("a signed deezer burn whose artist image resolves to nothing returns 404 (the ternary's undefined arm)", async () => {
-      // Mutating `url ? resolver(url) : undefined` to drop the undefined arm would call the resolver
-      // with undefined and either crash or serve a wrong 200.
+    it("a signed deezer burn whose artist image resolves to nothing serves the generic artist icon", async () => {
+      // Measured on the production library: 2 of 3 artist search hits 404'd here (no Deezer photo)
+      // while 20 of 20 album hits served fine, because album art resolves through Navidrome. A
+      // search result whose art 404s is a tile the client may refuse to render, so a miss must
+      // still produce a real image. Mutating `url ? resolver(url) : undefined` to drop the
+      // undefined arm would call the resolver with undefined and either crash or serve wrong art.
       const deezerArtistImage = jest.fn().mockResolvedValue(undefined);
       const deezerImageResolver = jest.fn();
       const apiTokens = new InMemoryAPITokens();
@@ -2596,7 +2599,9 @@ describe("server (coverage extensions)", () => {
         )
         .set(BONOB_ACCESS_TOKEN_HEADER, apiToken);
 
-      expect(res.status).toEqual(404);
+      expect(res.status).toEqual(200);
+      expect(res.headers["content-type"]).toContain("image/png");
+      expect(res.body.length).toBeGreaterThan(0);
       expect(deezerImageResolver).not.toHaveBeenCalled();
     });
 
