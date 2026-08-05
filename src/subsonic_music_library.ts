@@ -44,7 +44,13 @@ import { withTimeout } from "./timeout";
 
 // Cap the Last.fm-backed artist enrichment so a slow-but-succeeding getArtistInfo can't stall the
 // artist browse past Sonos's ~5s timeout.
-export const ARTIST_INFO_TIMEOUT_MS = 3500;
+// Budget for the external (Last.fm) artist enrichment. This runs INSIDE Sonos's 4500ms browse
+// deadline, so at the old 3500ms it left only ~1000ms for login + getArtist + serialization, and
+// getExtendedMetadata:artist was measured breaching the deadline on the live library
+// (2026-08-05 09:15) and degrading to an empty result Sonos could not render. Trimmed so the worst
+// case still fits under the deadline; the lookup is also cached now, so this cap is only ever paid
+// on a cold artist rather than on every open.
+export const ARTIST_INFO_TIMEOUT_MS = 2500;
 
 // Cap the optional Last.fm-backed top-songs lookup: a slow/rejecting getTopSongs must not stall or
 // break browsing an artist's Top Songs - degrade to no songs.

@@ -3941,6 +3941,29 @@ describe("wsdl api", () => {
                 });
               });
 
+            describe("asking for a playlist tile", () => {
+              // Rendering ONE playlist tile needs only id/name/coverArt, but this fetched the whole
+              // playlist - every entry, mapped to a Track - to read three fields off it. A
+              // full-library playlist is hundreds of thousands of entries. playlists() already
+              // returns exactly the summary a tile needs.
+              it("uses the playlist SUMMARY and never fetches the playlist contents", async () => {
+                const summary = { id: "pl-1", name: "Road trip", coverArt: undefined };
+                musicLibrary.playlists.mockResolvedValue([summary]);
+                musicLibrary.playlist.mockResolvedValue({
+                  ...summary,
+                  entries: [],
+                });
+
+                const result = await ws.getExtendedMetadataAsync({ id: "playlist:pl-1" });
+
+                expect(result[0].getExtendedMetadataResult.mediaCollection).toEqual(
+                  expect.objectContaining({ id: "playlist:pl-1", title: "Road trip" })
+                );
+                expect(musicLibrary.playlists).toHaveBeenCalled();
+                expect(musicLibrary.playlist).not.toHaveBeenCalled();
+              });
+            });
+
               describe("artist biography", () => {
                 const artist = anArtist({
                   biography: "an influential dance-punk band",
@@ -4200,6 +4223,9 @@ describe("wsdl api", () => {
             describe("asking for a playlist", () => {
               it("returns the playlist as a single mediaCollection", async () => {
                 const pl = aPlaylist();
+                // The tile is built from the SUMMARY list now: rendering it used to fetch every
+                // entry of the playlist to read three fields.
+                musicLibrary.playlists.mockResolvedValue([pl]);
                 musicLibrary.playlist.mockResolvedValue(pl);
 
                 const root = await ws.getExtendedMetadataAsync({
@@ -4220,7 +4246,9 @@ describe("wsdl api", () => {
                     },
                   },
                 });
-                expect(musicLibrary.playlist).toHaveBeenCalledWith(pl.id);
+                // Built from the summary list, NOT from a full playlist fetch.
+                expect(musicLibrary.playlists).toHaveBeenCalled();
+                expect(musicLibrary.playlist).not.toHaveBeenCalled();
               });
             });
 

@@ -38,7 +38,7 @@ import {
 } from "./album_index";
 import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
 import { MAX_ARTISTS_FLAT } from "./artist_index";
-import { withTimeout, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
+import { withTimeout, withDeadline, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
 import {
   isExpiredTokenError,
   MissingLoginTokenError,
@@ -660,6 +660,10 @@ function bindSmapiSoapServiceToExpress(
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) => 
+            // PLAYBACK path: bounded, but it fails rather than substituting a placeholder - there
+            // is no safe stand-in for "the URI of this track", and handing Sonos one would make it
+            // try to play something that is not the track. See withDeadline.
+            withDeadline(
             login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(({ musicLibrary, apiKey, type, typeId }) => {
@@ -691,12 +695,19 @@ function bindSmapiSoapServiceToExpress(
                     }
                   }
               }),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              `getMediaURI:${id}`
+            ),
           getMediaMetadata: async (
             { id }: { id: string },
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
           ) =>
+            // PLAYBACK path: bounded, failing rather than serving a placeholder. getMediaMetadata
+            // for a track costs getSong + getAlbum (the whole album track list), so it is not the
+            // trivial call it looks like. See withDeadline.
+            withDeadline(
             login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey, type, typeId }) => {
@@ -718,6 +729,9 @@ function bindSmapiSoapServiceToExpress(
               })
               // strip XML-invalid control chars from tag text so one bad tag can't break the page
               .then(sanitizeXml),
+              SMAPI_BROWSE_TIMEOUT_MS,
+              `getMediaMetadata:${id}`
+            ),
           search: async (
             { id, term }: { id: string; term: string },
             _,
@@ -850,13 +864,29 @@ function bindSmapiSoapServiceToExpress(
                       },
                     }));
                   case "playlist":
+                    // Rendering ONE tile needs only id/name/coverArt. This used to fetch the whole
+                    // playlist - every entry, mapped to a Track - to read three fields off it, and
+                    // getPlaylist is unpaginated, so a big playlist meant hundreds of thousands of
+                    // records for a single tile. playlists() already returns exactly that summary.
                     return musicLibrary
-                      .playlist(typeId!)
-                      .then(it => ({
-                        getExtendedMetadataResult: {
-                          mediaCollection: playlist(urlWithToken(apiKey), it),
-                        },
-                      }));                    
+                      .playlists()
+                      .then((all) => all.find((it) => it.id == typeId))
+                      .then((summary) =>
+                        summary
+                          ? {
+                              getExtendedMetadataResult: {
+                                mediaCollection: playlist(
+                                  urlWithToken(apiKey),
+                                  summary
+                                ),
+                              },
+                            }
+                          : // Unknown id (deleted between browse and tap): return an empty result
+                            // rather than falling back to the expensive full fetch for something
+                            // that no longer exists.
+                            { getExtendedMetadataResult: {} }
+                      );
+
                   default:
                     logger.info(`Sonos requested extended meta data for currently unsupported type=${type}, typeId=${typeId}`)
                     return {

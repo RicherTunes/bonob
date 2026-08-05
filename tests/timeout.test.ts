@@ -1,4 +1,4 @@
-import { withTimeout, faultOrFallback, describeReason, SMAPI_BROWSE_TIMEOUT_MS } from "../src/timeout";
+import { withTimeout, withDeadline, faultOrFallback, describeReason, SMAPI_BROWSE_TIMEOUT_MS } from "../src/timeout";
 import logger from "../src/logger";
 
 describe("withTimeout", () => {
@@ -282,5 +282,51 @@ describe("faultOrFallback observability", () => {
     const message = String(warn.mock.calls[0]![0]);
     expect(message).not.toContain("deadbeefsalted");
     expect(message).toContain("search:tracks");
+  });
+});
+
+describe("withDeadline (playback paths)", () => {
+  // getMediaURI and getMediaMetadata are the PLAYBACK paths and were the only SMAPI handlers with
+  // no time bound at all. A browse fallback is wrong here: substituting a placeholder URI would
+  // hand Sonos something that is not the track. Sonos gives up around 5s regardless, so the right
+  // degradation is to fail deterministically just under that, with a logged reason.
+  it("rejects once the deadline passes instead of hanging", async () => {
+    jest.useFakeTimers();
+    const never = new Promise<string>(() => {});
+    const guarded = withDeadline(never, 4500, "getMediaURI:track:t1");
+    const assertion = expect(guarded).rejects.toBeDefined();
+    jest.advanceTimersByTime(4501);
+    await assertion;
+    jest.useRealTimers();
+  });
+
+  it("resolves normally when the work finishes in time", async () => {
+    await expect(
+      withDeadline(Promise.resolve("ok"), 4500, "getMediaURI:track:t1")
+    ).resolves.toEqual("ok");
+  });
+
+  it("logs the breach so a slow playback path is visible", async () => {
+    jest.useFakeTimers();
+    const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+    const never = new Promise<string>(() => {});
+    const guarded = withDeadline(never, 100, "getMediaURI:track:t1");
+    const assertion = expect(guarded).rejects.toBeDefined();
+    jest.advanceTimersByTime(101);
+    await assertion;
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("getMediaURI:track")
+    );
+    warn.mockRestore();
+    jest.useRealTimers();
+  });
+
+  // A SMAPI fault must reach Sonos unchanged (the token-refresh fault carries a fresh credential),
+  // exactly as faultOrFallback already guarantees.
+  it("passes a rejection straight through when it beats the deadline", async () => {
+    const boom = Promise.reject(new Error("upstream down"));
+    await expect(withDeadline(boom, 4500, "getMediaURI:track:t1")).rejects.toThrow(
+      "upstream down"
+    );
   });
 });

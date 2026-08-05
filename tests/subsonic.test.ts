@@ -3030,6 +3030,100 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("genre caching", () => {
+    // 1443 genres on the live library, measured at 587ms, and re-fetched for every page of the
+    // Genres browse. Genres only change when the library is rescanned.
+    it("fetches the genre list once across repeated browses", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(
+          ok(subsonicOK({ genres: { genre: [{ value: "Rock", albumCount: 3, songCount: 9 }] } }))
+        )
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getGenres(credentials);
+      await subsonic.getGenres(credentials);
+      await subsonic.getGenres(credentials);
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getGenres")).length
+      ).toEqual(1);
+    });
+  });
+
+  describe("artist info caching (external, slow, rate-limited)", () => {
+    // Caught live on 2026-08-05 09:15: getExtendedMetadata:artist for two artists exceeded the
+    // 4500ms browse deadline and degraded to an EMPTY result, so Sonos had nothing to render for
+    // those artists. getArtistInfo2 is an external Last.fm lookup with a 3500ms budget sitting
+    // INSIDE the 4500ms deadline, it was uncached, and opening one artist fires artist() up to
+    // three times (browse, extended metadata, bio text) - three separate external round trips for
+    // one user action.
+    const artistInfoResponse = () =>
+      ok(
+        subsonicOK({
+          artistInfo2: {
+            biography: "a bio",
+            smallImageUrl: "http://example.com/s.jpg",
+            mediumImageUrl: "http://example.com/m.jpg",
+            largeImageUrl: "http://example.com/l.jpg",
+            similarArtist: [],
+          },
+        })
+      );
+
+    it("fetches artist info once no matter how many times an artist is opened", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(artistInfoResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getArtistInfo(credentials, "artist-1");
+      await subsonic.getArtistInfo(credentials, "artist-1");
+      await subsonic.getArtistInfo(credentials, "artist-1");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getArtistInfo2")).length
+      ).toEqual(1);
+    });
+
+    it("caches per artist id", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(artistInfoResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getArtistInfo(credentials, "artist-1");
+      await subsonic.getArtistInfo(credentials, "artist-2");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getArtistInfo2")).length
+      ).toEqual(2);
+    });
+
+    it("caches per user so one household member's enrichment is not served to another", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(artistInfoResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getArtistInfo(credentials, "artist-1");
+      await subsonic.getArtistInfo(
+        { ...credentials, username: "someone-else" },
+        "artist-1"
+      );
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("getArtistInfo2")).length
+      ).toEqual(2);
+    });
+  });
+
   describe("playlist caching (getPlaylist is unpaginated, re-fetched per page)", () => {
     // Same hazard as favouriteSongs: getPlaylist returns EVERY entry, and Sonos browses the
     // container page by page, so an uncached playlist costs one full fetch per page.

@@ -101,6 +101,55 @@ export const withTimeout = <T>(
   ]).finally(() => clearTimeout(timer));
 };
 
+// The PLAYBACK counterpart to withTimeout: bound the work, but REJECT on expiry instead of
+// substituting a fallback.
+//
+// getMediaURI and getMediaMetadata were the only SMAPI handlers with no time bound at all. A browse
+// style fallback is wrong for them: there is no safe stand-in for "the URI of this track", and
+// handing Sonos a placeholder would make it try to play something that is not the track. Sonos
+// gives up around 5s regardless, so failing deterministically just under that is the same outcome
+// for the user, plus a logged reason and a bounded socket instead of a silent hang.
+export const withDeadline = <T>(
+  p: Promise<T>,
+  ms: number,
+  context?: string
+): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const startedAt = Date.now();
+
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => {
+        if (context) {
+          logger.warn(
+            `${describeContext(context)} exceeded its ${ms}ms deadline and failed rather than serving a placeholder`
+          );
+          // Same reasoning as withTimeout: keep following the abandoned work so the log records BY
+          // HOW MUCH it missed, and so a late rejection cannot become an unhandled rejection.
+          p.then(
+            () =>
+              logger.warn(
+                `${describeContext(context)} finally succeeded after ${Date.now() - startedAt}ms, too late to be used (deadline ${ms}ms)`
+              ),
+            (e) => {
+              if (isSmapiFault(e)) return;
+              logger.warn(
+                `${describeContext(context)} finally failed after ${Date.now() - startedAt}ms, too late to be used (deadline ${ms}ms): ${describeReason(e)}`
+              );
+            }
+          );
+        }
+        reject(
+          new Error(
+            `${context ? describeContext(context) : "operation"} exceeded its ${ms}ms deadline`
+          )
+        );
+      }, ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
+
 // Every SMAPI browse handler must return a VALID response within Sonos's ~5s SMAPI timeout. This
 // deadline (safely below 5s) is the catch-all safety net: any handler that hangs OR rejects past it
 // degrades to a graceful fallback instead of surfacing "something went wrong" in the Sonos app.

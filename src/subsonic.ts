@@ -1956,7 +1956,32 @@ export class Subsonic {
     );
 
       // todo: should be getArtistInfo2?
+  // External enrichment (Last.fm: bio, similar artists, images). Slow, flaky and rate-limited, and
+  // it changes about as often as an artist's biography does - which is to say almost never.
+  //
+  // Caught live on 2026-08-05 09:15: getExtendedMetadata:artist exceeded the 4500ms browse deadline
+  // for two artists and degraded to an EMPTY result, so Sonos had nothing to render for them. This
+  // lookup's own budget (ARTIST_INFO_TIMEOUT_MS) sits INSIDE that deadline, and opening a single
+  // artist fires artist() up to three times - browse, extended metadata, and bio text - so one user
+  // action meant three separate external round trips, each able to blow the deadline on its own.
+  // Caching collapses that fan-out to one fetch per artist per TTL.
   getArtistInfo = (
+    credentials: Credentials,
+    id: string
+  ): Promise<{
+    biography: string | undefined;
+    similarArtist: (ArtistSummary & { inLibrary: boolean })[];
+    images: {
+      s: string | undefined;
+      m: string | undefined;
+      l: string | undefined;
+    };
+  }> =>
+    this.cache.get(`artistInfo:v1:${credentials.username}:${id}`, () =>
+      this.fetchArtistInfo(credentials, id)
+    );
+
+  private fetchArtistInfo = (
     credentials: Credentials,
     id: string
   ): Promise<{
@@ -2239,7 +2264,15 @@ export class Subsonic {
     };
   };
 
+  // getGenres is a whole-library aggregate (1443 genres on the production library, measured at
+  // 587ms) and it was re-fetched for every page of the Genres browse. Genres only change when the
+  // library is rescanned, so this is the cheapest possible thing to cache.
   getGenres = (credentials: Credentials) =>
+    this.cache.get(`genres:v1:${credentials.username}`, () =>
+      this.fetchGenres(credentials)
+    );
+
+  private fetchGenres = (credentials: Credentials) =>
     this.getJSONWithRetry<GetGenresResponse>(credentials, "/rest/getGenres").then((it) =>
       pipe(
         it.genres.genre || [],
