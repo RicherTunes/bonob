@@ -147,6 +147,82 @@ const XML_INVALID_CHARS = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/
 const LONE_SURROGATES =
   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 
+// ---------------------------------------------------------------------------------------------
+// WSDL element ORDER.
+//
+// Every SMAPI media type is an xs:sequence, so element order is part of the contract, not a style
+// choice - and the soap library serializes a JS object in KEY INSERTION ORDER. Our tile builders
+// emitted `itemType` before `id` (and albumArtURI before canPlay, and so on), so every tile bonob
+// has ever sent was schema-invalid. Sonos S2 tolerates it, which is exactly why it went unnoticed
+// until 14 captured PRODUCTION responses were validated against the WSDL schema.
+//
+// Ordering is applied centrally, on the way out, rather than by hand-reordering each builder: a
+// builder is easy to get right once and easy to let drift later, and new ones would repeat the
+// mistake. Keys the schema does not name (notably `attributes`, which is an XML attribute group
+// rather than an element) are preserved after the ordered ones.
+//
+// Order is transcribed from Sonoswsdl-1.19.6: AbstractMedia + the mediaCollection extension, and
+// mediaMetadata + trackMetadata. Both orderings live in ONE list because an emitted object is
+// only ever one of those shapes, and a key never appears in both with a different position.
+const SMAPI_ELEMENT_ORDER: string[] = [
+  // AbstractMedia
+  "id", "itemType", "semanticType", "displayType", "title", "summary", "isFavorite", "tags",
+  "isExplicit", "isEphemeral", "positionInformation", "releaseDate",
+  // mediaCollection extension
+  "artist", "artistId", "authorId", "author", "narratorId", "narrator", "producerId", "producer",
+  "podcastId", "podcast", "canScroll", "canPlay", "canEnumerate", "canAddToFavorites",
+  "containsFavorite", "canSkip", "albumArtURI", "canResume", "total",
+  // mediaMetadata
+  "mimeType", "trackMetadata", "streamMetadata", "dynamic", "behaviors",
+];
+
+// trackMetadata has its OWN sequence, and it reuses names (artist, album, albumArtURI, canPlay)
+// at different positions, so it cannot share the list above.
+const TRACK_METADATA_ORDER: string[] = [
+  "artistId", "artist", "composerId", "composer", "albumArtistId", "albumArtist", "albumId",
+  "album", "authorId", "author", "narratorId", "narrator", "bookId", "book", "producerId",
+  "producer", "podcastId", "podcast", "hostId", "host", "genreId", "genre", "duration", "rating",
+  "albumArtURI", "trackNumber", "canPlay", "canSkip", "canAddToFavorites", "canResume", "canSeek",
+];
+
+const reorderBy = (order: string[], value: any): any => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const rank = (k: string) => {
+    const i = order.indexOf(k);
+    return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+  };
+  const out: Record<string, any> = {};
+  for (const k of Object.keys(value).sort((a, b) => rank(a) - rank(b))) out[k] = value[k];
+  return out;
+};
+
+// Reorder one emitted media item (and its nested trackMetadata / streamMetadata) into WSDL order.
+// Order the media items inside a whole response envelope (getExtendedMetadataResult /
+// getMediaMetadataResult), which do not go through getMetadataResult/searchResult.
+export const orderEmittedMedia = (response: any): any => {
+  if (!response || typeof response !== "object") return response;
+  const out: Record<string, any> = { ...response };
+  for (const envelope of Object.keys(out)) {
+    const body = out[envelope];
+    if (!body || typeof body !== "object") continue;
+    const copy: Record<string, any> = { ...body };
+    for (const field of ["mediaCollection", "mediaMetadata"]) {
+      if (copy[field]) copy[field] = inSmapiOrder(copy[field]);
+    }
+    out[envelope] = copy;
+  }
+  return out;
+};
+
+export const inSmapiOrder = (value: any): any => {
+  if (Array.isArray(value)) return value.map(inSmapiOrder);
+  if (!value || typeof value !== "object") return value;
+  const ordered = reorderBy(SMAPI_ELEMENT_ORDER, value);
+  if (ordered["trackMetadata"])
+    ordered["trackMetadata"] = reorderBy(TRACK_METADATA_ORDER, ordered["trackMetadata"]);
+  return ordered;
+};
+
 export const sanitizeXml = (value: any): any => {
   if (typeof value === "string")
     return value.replace(XML_INVALID_CHARS, "").replace(LONE_SURROGATES, "");
@@ -178,11 +254,13 @@ export function getMetadataResult(
       count,
       total: overrideTotal ?? count,
       ...rest,
+      // sanitizeXml strips XML-illegal characters; inSmapiOrder puts the keys into the WSDL's
+      // xs:sequence order, which the soap library then serializes verbatim.
       ...(result.mediaCollection && {
-        mediaCollection: sanitizeXml(result.mediaCollection),
+        mediaCollection: inSmapiOrder(sanitizeXml(result.mediaCollection)),
       }),
       ...(result.mediaMetadata && {
-        mediaMetadata: sanitizeXml(result.mediaMetadata),
+        mediaMetadata: inSmapiOrder(sanitizeXml(result.mediaMetadata)),
       }),
     },
   };
@@ -211,11 +289,13 @@ export function searchResult(
       count,
       total: overrideTotal ?? count,
       ...rest,
+      // sanitizeXml strips XML-illegal characters; inSmapiOrder puts the keys into the WSDL's
+      // xs:sequence order, which the soap library then serializes verbatim.
       ...(result.mediaCollection && {
-        mediaCollection: sanitizeXml(result.mediaCollection),
+        mediaCollection: inSmapiOrder(sanitizeXml(result.mediaCollection)),
       }),
       ...(result.mediaMetadata && {
-        mediaMetadata: sanitizeXml(result.mediaMetadata),
+        mediaMetadata: inSmapiOrder(sanitizeXml(result.mediaMetadata)),
       }),
     },
   };
@@ -743,7 +823,8 @@ function bindSmapiSoapServiceToExpress(
                 }
               })
               // strip XML-invalid control chars from tag text so one bad tag can't break the page
-              .then(sanitizeXml),
+              .then(sanitizeXml)
+              .then(orderEmittedMedia),
               SMAPI_BROWSE_TIMEOUT_MS,
               `getMediaMetadata:${id}`
             ),
@@ -909,7 +990,8 @@ function bindSmapiSoapServiceToExpress(
                     };
                 }
               })
-              .then(sanitizeXml),
+              .then(sanitizeXml)
+              .then(orderEmittedMedia),
               SMAPI_BROWSE_TIMEOUT_MS,
               { getExtendedMetadataResult: {} },
               `getExtendedMetadata:${id}`
@@ -938,7 +1020,8 @@ function bindSmapiSoapServiceToExpress(
                   );
                   return { getExtendedMetadataTextResult: "" };
                 })
-                .then(sanitizeXml),
+                .then(sanitizeXml)
+              .then(orderEmittedMedia),
               SMAPI_BROWSE_TIMEOUT_MS,
               { getExtendedMetadataTextResult: "" },
               `getExtendedMetadataText:${textType}`

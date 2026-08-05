@@ -1,4 +1,4 @@
-import { sanitizeXml, getMetadataResult, searchResult } from "../src/smapi";
+import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder } from "../src/smapi";
 
 // Build control characters at runtime; never place a literal control char in source.
 const ch = (n: number) => String.fromCharCode(n);
@@ -96,5 +96,91 @@ describe("SMAPI element order (xs:sequence is mandatory)", () => {
     expect(r.count).toEqual(2);
     expect(r.total).toEqual(900);
     expect(Object.keys(r).slice(0, 3)).toEqual(["index", "count", "total"]);
+  });
+});
+
+describe("media element ordering against the WSDL", () => {
+  // AbstractMedia is an xs:sequence: id, itemType, ... title ... and mediaCollection extends it
+  // with artist/artistId ... canPlay ... albumArtURI. Every tile builder emitted itemType BEFORE
+  // id, so every tile bonob ever sent was schema-invalid. Rather than hand-reorder each builder
+  // (and have the next one drift again), ordering is applied centrally to every emitted item.
+  it("puts id before itemType and title after both", () => {
+    const ordered = inSmapiOrder({
+      itemType: "album",
+      albumArtURI: "http://art",
+      title: "In Rainbows",
+      id: "album:1",
+      artistId: "artist:1",
+      artist: "Radiohead",
+      canPlay: true,
+    });
+    expect(Object.keys(ordered)).toEqual([
+      "id",
+      "itemType",
+      "title",
+      "artist",
+      "artistId",
+      "canPlay",
+      "albumArtURI",
+    ]);
+  });
+
+  // trackMetadata has its OWN sequence and reuses names (artist, album, albumArtURI) at different
+  // positions than mediaCollection, so it must be ordered by its own list. These fields only ever
+  // appear NESTED - an earlier version of this test ordered them at the top level, which is a
+  // shape bonob never emits.
+  it("keeps nested trackMetadata fields in trackMetadata order", () => {
+    const ordered: any = inSmapiOrder({
+      itemType: "track",
+      id: "track:1",
+      title: "A Song",
+      trackMetadata: {
+        trackNumber: 3,
+        albumArtURI: "http://art",
+        duration: 240,
+        artist: "An Artist",
+        artistId: "artist:1",
+        album: "An Album",
+        albumId: "album:1",
+      },
+    });
+    expect(Object.keys(ordered.trackMetadata)).toEqual([
+      "artistId",
+      "artist",
+      "albumId",
+      "album",
+      "duration",
+      "albumArtURI",
+      "trackNumber",
+    ]);
+  });
+
+  it("preserves unknown keys (attributes, nested objects) rather than dropping them", () => {
+    const ordered = inSmapiOrder({
+      itemType: "playlist",
+      attributes: { readOnly: false },
+      id: "playlist:1",
+      title: "Road trip",
+    });
+    expect(Object.keys(ordered)).toContain("attributes");
+    expect((ordered as any).attributes).toEqual({ readOnly: false });
+    expect(Object.keys(ordered).indexOf("id")).toBeLessThan(
+      Object.keys(ordered).indexOf("itemType")
+    );
+  });
+
+  it("orders nested trackMetadata too", () => {
+    const ordered: any = inSmapiOrder({
+      itemType: "track",
+      id: "track:1",
+      title: "All I Need",
+      mimeType: "audio/flac",
+      trackMetadata: { trackNumber: 5, artistId: "artist:1", album: "X" },
+    });
+    expect(Object.keys(ordered.trackMetadata)).toEqual([
+      "artistId",
+      "album",
+      "trackNumber",
+    ]);
   });
 });
