@@ -84,9 +84,22 @@ const browseCacheStore = config.subsonic.cacheDir
       maxFileBytes: 256 * 1024 * 1024,
     })
   : undefined;
+// The browse cache holds EVERY per-browse key, and this session multiplied that key space by an
+// order of magnitude: artist:v1:<user>:<id> and artistInfo:v1:<user>:<id> are minted PER ARTIST
+// OPENED, alongside albumPage:* per user/type/page/genre/year, playlist:* per playlist,
+// artistTracks:*, genres:* and starredSongs:*.
+//
+// At the old default of 50 slots that is a lottery: scrolling ~25 artists mints 50 entries and
+// evicts everything else, including starredSongs:<user> - which Favourite Songs is served from
+// EXCLUSIVELY via peek(), so eviction drops the user back to the placeholder and re-triggers the
+// 8.6s getStarred2. peek()-touches-LRU helps, but cannot survive 2 new keys per artist.
+//
+// Entries are small (a page of summaries, a bio, a track list), so headroom is cheap and eviction
+// is expensive. Env-tunable for a household with unusual browsing habits.
 const browseCache = new SwrCache(clock, browseCacheTTLms, {
   store: browseCacheStore,
   revive: deepFreeze,
+  maxEntries: Number(process.env["BNB_BROWSE_CACHE_MAX_ENTRIES"] || 2000),
 });
 
 // The index cache holds the heavy full-catalog INDEXES — the album index (~N/500-request scan) AND

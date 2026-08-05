@@ -11,6 +11,8 @@ import {
 import { isIP } from "net";
 import { promises as dnsPromises } from "dns";
 import { generateRandomString } from "./random";
+import logger from "./logger";
+import { describeReason } from "./timeout";
 import {
   Credentials,
   Album,
@@ -2196,17 +2198,52 @@ export class Subsonic {
     const artist = await this.getArtist(credentials, id);
     const albums = artist.albums.slice(0, MAX_RECURSIVE_ALBUMS);
     const tracks: TrackSummary[] = [];
-    for (const album of albums) {
-      if (tracks.length >= MAX_RECURSIVE_TRACKS) break;
-      try {
-        const full = await this.getAlbum(credentials, album.id);
-        for (const t of full.tracks) {
-          if (tracks.length >= MAX_RECURSIVE_TRACKS) break;
-          tracks.push(t);
-        }
-      } catch {
-        // One unreadable album must not sink the whole queue: skip it and keep enumerating.
+    let failures = 0;
+    // Bounded CONCURRENCY rather than one album at a time. Sequentially, 100 albums at ~45ms is
+    // ~4.5s and blows the 4500ms deadline on a prolific artist's first play; the surrounding
+    // withTimeout would then answer a recursive PLAY request with a browse placeholder. Album
+    // order is preserved so the queue plays in a sensible order.
+    const CONCURRENCY = 8;
+    const pages: (Track[] | undefined)[] = new Array(albums.length);
+    for (let start = 0; start < albums.length; start += CONCURRENCY) {
+      // Stop launching more work once the cap is reachable from what has already landed.
+      const landed = pages.reduce((n, p) => n + (p ? p.length : 0), 0);
+      if (landed >= MAX_RECURSIVE_TRACKS) break;
+      const slice = albums.slice(start, start + CONCURRENCY);
+      await Promise.all(
+        slice.map(async (album, i) => {
+          try {
+            pages[start + i] = (await this.getAlbum(credentials, album.id)).tracks;
+          } catch (e) {
+            failures++;
+            // One unreadable album must not sink the whole queue, but a SILENT skip is how a
+            // half-empty play queue looks like "that is just my library".
+            logger.warn(
+              `Recursive enumeration of artist skipped one album: ${describeReason(e)}`
+            );
+          }
+        })
+      );
+    }
+    for (const page of pages) {
+      if (!page) continue;
+      for (const t of page) {
+        if (tracks.length >= MAX_RECURSIVE_TRACKS) break;
+        tracks.push(t);
       }
+    }
+    // Never CACHE a queue that upstream failures truncated: cache.get stores whatever this
+    // resolves to, so a transient Navidrome blip would pin a 3-track "play artist" for the whole
+    // TTL. Throwing means the caller degrades once and the next attempt refetches.
+    if (failures > 0 && tracks.length === 0) {
+      throw new Error(
+        `Recursive enumeration produced no tracks after ${failures} album failures`
+      );
+    }
+    if (tracks.length >= MAX_RECURSIVE_TRACKS) {
+      logger.info(
+        `Recursive enumeration capped at ${MAX_RECURSIVE_TRACKS} tracks; the rest of this artist's discography is not in the queue`
+      );
     }
     return tracks;
   };
@@ -2369,7 +2406,12 @@ export class Subsonic {
   getAlbumList2 = async (credentials: Credentials, q: AlbumQuery) => {
     const cachedPage = () =>
       this.cache.get(
-        `albumPage:${credentials.username}:${q.type}:${q._index}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
+        // _count is part of the key because it is part of the FETCH: albumListPageSize(q) asks
+        // upstream for exactly q._count rows for every non-alphabetical type. Without it, a small
+        // request (count 7) caches 7 rows, and a later full browse (count 100) is served those 7
+        // and computes total = index + 7, so the genre or year appears to end after 7 albums. The
+        // poisoned page is persisted and re-seeded on restart, so it does not even clear itself.
+        `albumPage:${credentials.username}:${q.type}:${q._index}:${albumListPageSize(q)}:${q.genre ?? ""}:${q.fromYear ?? ""}:${q.toYear ?? ""}`,
         () => this.fetchAlbumListPage(credentials, q)
       );
     // Only the unfiltered alphabetical list needs the true whole-catalog total (from the cached

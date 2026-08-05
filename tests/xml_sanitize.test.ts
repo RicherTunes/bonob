@@ -1,4 +1,4 @@
-import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder } from "../src/smapi";
+import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder, orderEmittedMedia } from "../src/smapi";
 
 // Build control characters at runtime; never place a literal control char in source.
 const ch = (n: number) => String.fromCharCode(n);
@@ -181,6 +181,51 @@ describe("media element ordering against the WSDL", () => {
       "artistId",
       "album",
       "trackNumber",
+    ]);
+  });
+});
+
+
+describe("orderEmittedMedia covers a bare media body", () => {
+  // getMediaMetadataResult's body IS the media item, not a wrapper containing mediaCollection or
+  // mediaMetadata. The first version only looked for those two key NAMES, so the PLAYBACK metadata
+  // path silently bypassed ordering entirely - the exact id-before-itemType violation the ordering
+  // work set out to remove, still live, while the comment claimed the path was covered.
+  it("orders a track envelope whose body is the item itself", () => {
+    const out: any = orderEmittedMedia({
+      getMediaMetadataResult: {
+        itemType: "track",
+        id: "track:1",
+        mimeType: "audio/flac",
+        title: "A Song",
+        trackMetadata: { albumArtURI: "x", artistId: "a", trackNumber: 2, albumId: "al" },
+      },
+    });
+    expect(Object.keys(out.getMediaMetadataResult).slice(0, 2)).toEqual(["id", "itemType"]);
+    expect(Object.keys(out.getMediaMetadataResult.trackMetadata)).toEqual([
+      "artistId",
+      "albumId",
+      "albumArtURI",
+      "trackNumber",
+    ]);
+  });
+
+  it("orders a radio station envelope body too", () => {
+    const out: any = orderEmittedMedia({
+      getMediaMetadataResult: { itemType: "stream", id: "radio:1", title: "A Station", mimeType: "audio/mpeg" },
+    });
+    expect(Object.keys(out.getMediaMetadataResult).slice(0, 2)).toEqual(["id", "itemType"]);
+  });
+
+  it("still orders a wrapper body (getExtendedMetadataResult)", () => {
+    const out: any = orderEmittedMedia({
+      getExtendedMetadataResult: {
+        mediaCollection: { itemType: "album", id: "album:1", title: "An Album" },
+      },
+    });
+    expect(Object.keys(out.getExtendedMetadataResult.mediaCollection).slice(0, 2)).toEqual([
+      "id",
+      "itemType",
     ]);
   });
 });

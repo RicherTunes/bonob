@@ -238,13 +238,18 @@ export class SubsonicMusicLibrary implements MusicLibrary {
       .then((track) => {
         const thingsToUpdate = [];
         if (track.rating.love != rating.love) {
+          // Invalidate AFTER the write settles, not before. Invalidating first leaves a window
+          // where a concurrent Favourite Songs browse (Sonos re-polls on getLastUpdate) finds a
+          // cold key, kicks a warm, and re-caches the PRE-star list if getStarred2 wins the race
+          // against the in-flight star - which is exactly the staleness the invalidation exists
+          // to prevent, just harder to reproduce.
           thingsToUpdate.push(
             (rating.love ? this.subsonic.star : this.subsonic.unstar)(this.credentials,{ id: trackId })
+              .then((ok) => {
+                this.subsonic.invalidateStarredSongs(this.credentials);
+                return ok;
+              })
           );
-          // Favourite Songs is served from a cache (getStarred2 cannot fit Sonos's browse
-          // deadline at scale), so drop it here: without this the user hearts a track on Sonos,
-          // opens Favourite Songs, and their own action is missing until the TTL expires.
-          this.subsonic.invalidateStarredSongs(this.credentials);
         }
         if (track.rating.stars != rating.stars) {
           thingsToUpdate.push(

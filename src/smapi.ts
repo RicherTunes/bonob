@@ -206,11 +206,22 @@ export const orderEmittedMedia = (response: any): any => {
   for (const envelope of Object.keys(out)) {
     const body = out[envelope];
     if (!body || typeof body !== "object") continue;
-    const copy: Record<string, any> = { ...body };
-    for (const field of ["mediaCollection", "mediaMetadata"]) {
-      if (copy[field]) copy[field] = inSmapiOrder(copy[field]);
+    // Two shapes reach here. getExtendedMetadataResult WRAPS the item in a mediaCollection /
+    // mediaMetadata field; getMediaMetadataResult IS the item. Only handling the wrapper meant the
+    // PLAYBACK metadata path silently bypassed ordering, leaving exactly the id-before-itemType
+    // violation this machinery exists to remove - while the comment claimed it was covered.
+    if (
+      Object.prototype.hasOwnProperty.call(body, "mediaCollection") ||
+      Object.prototype.hasOwnProperty.call(body, "mediaMetadata")
+    ) {
+      const copy: Record<string, any> = { ...body };
+      for (const field of ["mediaCollection", "mediaMetadata"]) {
+        if (copy[field]) copy[field] = inSmapiOrder(copy[field]);
+      }
+      out[envelope] = copy;
+    } else {
+      out[envelope] = inSmapiOrder(body);
     }
-    out[envelope] = copy;
   }
   return out;
 };
@@ -1080,13 +1091,20 @@ function bindSmapiSoapServiceToExpress(
           ) => {
             // Browse deadline (below Sonos's ~5s SMAPI timeout): if a handler hangs or rejects on a
             // slow/flaky backend, return a "please try again" placeholder rather than a Sonos error.
-            const browseTimeoutFallback = getMetadataResult({
-              mediaCollection: [
-                { itemType: "container", id, title: "Loading, please try again..." },
-              ],
-              index: 0,
-              total: 1,
-            });
+            // A recursive request is a PLAY intent, and its contract is a FLAT mediaMetadata list.
+            // Answering it with the browse placeholder container hands Sonos an unplayable tile
+            // where it asked for tracks, so "play artist" fails confusingly rather than emptily.
+            // The playback paths already got reject-don't-fake treatment (withDeadline); this is
+            // the same principle for the recursive path.
+            const browseTimeoutFallback = recursive
+              ? getMetadataResult({ mediaMetadata: [], index: 0, total: 0 })
+              : getMetadataResult({
+                  mediaCollection: [
+                    { itemType: "container", id, title: "Loading, please try again..." },
+                  ],
+                  index: 0,
+                  total: 1,
+                });
             return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey, type, typeId }) => {

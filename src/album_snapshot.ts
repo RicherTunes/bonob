@@ -387,11 +387,11 @@ export class SnapshotWriter {
       buckets,
       offsets: this.offsets,
     };
-    // The payload is written as the kind supplies it. Normalization lives on the READ side
-    // (ALBUM_KIND.validatePayload coerces numeric years to strings) because that is the layer that
-    // must cope with files this process did not write - including every file already on disk, whose
-    // years ARE numbers. Normalizing only on write would leave those unreadable, which is the exact
-    // outage this fixes.
+    // Normalization is applied on BOTH sides, deliberately - see SnapshotKind.normalizePayload.
+    // The READER must coerce because it has to cope with files this process did not write, whose
+    // years ARE numbers; the WRITER must normalize so it stops producing them, or a rollback to an
+    // older reader re-arms the original outage. Keeping only one side is exactly what re-introduced
+    // that outage during a merge, so do not "simplify" either half away.
     const outgoing = this.kind.normalizePayload ? this.kind.normalizePayload(payload) : payload;
     if (outgoing !== undefined) trailer[this.kind.payloadField] = outgoing;
     const trailerBuf = Buffer.from(JSON.stringify(trailer), "utf8");
@@ -754,7 +754,13 @@ export function albumIndexStore(dir: string): SwrCacheStore {
           });
         }
       }
-      return [...newestByKey.entries()].map(([key, { at, value }]) => ({ key, at, value }));
+      // NEWEST FIRST. SwrCache's seeding contract depends on it: it reverses what the store hands
+      // back so the OLDEST entry is inserted first and is therefore the first eviction candidate
+      // (swr_cache.ts). readdir order is arbitrary, so without this sort a restart could evict a
+      // live index and pay a full catalog rescan for it.
+      return [...newestByKey.entries()]
+        .map(([key, { at, value }]) => ({ key, at, value }))
+        .sort((a, b) => b.at - a.at);
     },
   };
 }
