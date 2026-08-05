@@ -1053,6 +1053,11 @@ function bindSmapiSoapServiceToExpress(
                   const peeked = musicLibrary.peekArtistIndex();
                   if (!peeked) return { getScrollIndicesResult: "" };
                   const idx = await peeked;
+                  // Offsets are only meaningful against the list the container actually shows.
+                  // Over the cap, Artists is BUCKETED into 26 letter tiles, so flat-list offsets
+                  // would point far past the end of what Sonos is displaying.
+                  if (idx.total > MAX_ARTISTS_FLAT)
+                    return { getScrollIndicesResult: "" };
                   return { getScrollIndicesResult: scrollIndicesFrom(idx) };
                 }
               ),
@@ -1084,7 +1089,7 @@ function bindSmapiSoapServiceToExpress(
             });
             return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
-              .then(({ musicLibrary, apiKey, type, typeId }) => {
+              .then(async ({ musicLibrary, apiKey, type, typeId }) => {
                 const paging = { _index: index, _count: count };
                 const acceptLanguage = headers["accept-language"];
                 logger.debug(
@@ -1104,7 +1109,13 @@ function bindSmapiSoapServiceToExpress(
                   });
 
                 switch (type) {
-                  case "root":
+                  case "root": {
+                    // Non-blocking: undefined while cold, which correctly omits canScroll rather
+                    // than blocking the root browse on a multi-second index build.
+                    const peekedForScroll = musicLibrary.peekArtistIndex();
+                    const artistsServedFlat = peekedForScroll
+                      ? (await peekedForScroll).total <= MAX_ARTISTS_FLAT
+                      : false;
                     return getMetadataResult({
                       mediaCollection: [
                         {
@@ -1112,13 +1123,14 @@ function bindSmapiSoapServiceToExpress(
                           title: lang("artists"),
                           albumArtURI: albumArtURI(iconArtURI(bonobUrl, "artists").href()),
                           itemType: "container",
-                          // Advertise the native alphabet scrubber. When the catalog is small
-                          // enough to serve Artists FLAT (BNB_SONOS_MAX_CONTAINER_TOTAL), Sonos
-                          // draws an A-Z rail and jumps by letter, which is the idiomatic way to
-                          // navigate a long list and removes the extra per-letter container tap.
-                          // Harmless when the catalog is bucketed instead: Sonos simply asks for
-                          // the indices and gets the bucket boundaries.
-                          canScroll: true,
+                          // The scrubber maps a touch to an OFFSET in the list this container
+                          // shows. Served FLAT, that is the artist list and scrolling is exactly
+                          // right. Served BUCKETED (catalog over MAX_ARTISTS_FLAT) the container
+                          // shows 26 letter tiles, so advertising canScroll would have Sonos
+                          // scroll to offset 10228 in a 26-item list. Verified on the live library:
+                          // the container reported total=26 while getScrollIndices returned
+                          // offsets up to ~24,797. So only claim it when the list is actually flat.
+                          ...(artistsServedFlat ? { canScroll: true } : {}),
                         },
                         {
                           id: "albums",
@@ -1206,6 +1218,7 @@ function bindSmapiSoapServiceToExpress(
                         },
                       ],
                     });
+                  }
                   case "search":
                     return getMetadataResult({
                       mediaCollection: [

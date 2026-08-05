@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { MAX_ARTISTS_FLAT } from "../src/artist_index";
 import request from "supertest";
 import { Client, createClientAsync } from "soap";
 import { randomUUID as uuid } from "crypto";
@@ -1558,9 +1559,9 @@ describe("wsdl api", () => {
                       title: "Artists",
                       albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                       itemType: "container",
-                      // Advertises the native A-Z scrubber (getScrollIndices), so a flat Artists
-                      // list is navigable without the extra per-letter container tap.
-                      canScroll: true,
+                      // No canScroll here: this fixture leaves the artist index COLD, and a
+                      // scrubber is only advertised once we know Artists is served flat. See
+                      // "canScroll only when Artists is actually flat".
                     },
                     {
                       id: "albums",
@@ -1665,7 +1666,6 @@ describe("wsdl api", () => {
                       title: "Artiesten",
                       albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                       itemType: "container",
-                      canScroll: true,
                     },
                     {
                       id: "albums",
@@ -2763,7 +2763,51 @@ describe("wsdl api", () => {
               const allAlbums = [pop1, pop2, pop3, pop4, rock1, rock2];
               const popAlbums = [pop1, pop2, pop3, pop4];
 
-              describe("playing an artist (recursive enumeration)", () => {
+              describe("canScroll only when Artists is actually flat", () => {
+              // The scrubber maps a touch to an OFFSET in the list the container is showing. When
+              // the catalog exceeds MAX_ARTISTS_FLAT the Artists container shows 26 LETTER BUCKETS,
+              // not 24,797 artists - so advertising canScroll there would have Sonos scroll to
+              // offset 10228 in a 26-item list. Caught on the live library: the container reported
+              // total=26 while getScrollIndices returned offsets up to ~24,797.
+              it("does NOT advertise canScroll when the catalog is bucketed", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve({ total: MAX_ARTISTS_FLAT + 1, buckets: [] })
+                );
+
+                const result = await ws.getMetadataAsync({ id: "root", index: 0, count: 20 });
+                const items = ([] as any[]).concat(
+                  (result[0] as any).getMetadataResult.mediaCollection
+                );
+                const artistsTile = items.find((it) => it.id === "artists");
+                expect(artistsTile.canScroll).toBeUndefined();
+              });
+
+              it("advertises canScroll when the catalog is small enough to serve flat", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve({ total: 10, buckets: [] })
+                );
+
+                const result = await ws.getMetadataAsync({ id: "root", index: 0, count: 20 });
+                const items = ([] as any[]).concat(
+                  (result[0] as any).getMetadataResult.mediaCollection
+                );
+                expect(items.find((it) => it.id === "artists").canScroll).toEqual(true);
+              });
+
+              it("getScrollIndices returns nothing while the catalog is bucketed", async () => {
+                musicLibrary.peekArtistIndex.mockReturnValue(
+                  Promise.resolve({
+                    total: MAX_ARTISTS_FLAT + 1,
+                    buckets: [{ key: "A", label: "A", offset: 0, count: 5 }],
+                  })
+                );
+
+                const result = await ws.getScrollIndicesAsync({ id: "artists" });
+                expect(result[0].getScrollIndicesResult).toEqual("");
+              });
+            });
+
+            describe("playing an artist (recursive enumeration)", () => {
               // SMAPI plays a container by re-requesting it with recursive=true and expecting a
               // FLAT list of mediaMetadata. bonob never read that flag, so advertising canPlay on
               // artist tiles would have handed Sonos containers where it expected tracks and

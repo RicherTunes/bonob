@@ -1,0 +1,10 @@
+import { orderEmittedMedia, inSmapiOrder } from "../src/smapi";
+const trackObj = { itemType: "track", id: "track:1", mimeType: "audio/flac", title: "T", trackMetadata: { albumArtURI: "x", artistId: "a", artist: "A", duration: 1, trackNumber: 2, albumId: "al", album: "Al" }, dynamic: {} };
+const resp: any = { getMediaMetadataResult: trackObj };
+console.log("orderEmittedMedia keys:", Object.keys(orderEmittedMedia(resp).getMediaMetadataResult));
+console.log("inSmapiOrder keys    :", Object.keys(inSmapiOrder(trackObj)));
+console.log("nested tm order      :", Object.keys(orderEmittedMedia(resp).getMediaMetadataResult.trackMetadata));
+const radio: any = { getMediaMetadataResult: { itemType: "stream", id: "internetRadioStation:1", title: "R", mimeType: "audio/mpeg" } };
+console.log("radio keys           :", Object.keys(orderEmittedMedia(radio).getMediaMetadataResult));
+const ext: any = { getExtendedMetadataResult: { mediaCollection: { itemType: "artist", id: "artist:1", title: "A" } } };
+console.log("ext mediaCollection  :", Object.keys(orderEmittedMedia(ext).getExtendedMetadataResult.mediaCollection));
