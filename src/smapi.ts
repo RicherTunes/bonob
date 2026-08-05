@@ -743,10 +743,14 @@ function bindSmapiSoapServiceToExpress(
                     );
                   case "tracks":
                     return musicLibrary.searchTracks(term).then((it) =>
+                      // The Songs category must return SONGS. Collapsing each track hit into its
+                      // ALBUM means a song-title search can only ever show albums and never the
+                      // song itself - reported from the Sonos app as "I searched for a song and
+                      // only albums showed up". Track hits are playable mediaMetadata, the same
+                      // shape Favourite Songs and Top Songs already use.
                       searchResult({
-                        count: it.length,
-                        mediaCollection: it.map((aTrack) =>
-                          album(urlWithToken(apiKey), aTrack.album)
+                        mediaMetadata: it.map((aTrack) =>
+                          track(urlWithToken(apiKey), aTrack)
                         ),
                       })
                     );
