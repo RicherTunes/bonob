@@ -86,6 +86,10 @@ export class SubsonicMusicService implements MusicService {
     // background so the first browse isn't cold. Fire-and-forget; the cache coalesces +
     // refreshes lazily, and the album-index scan (multi-minute) runs off the browse path.
     this.subsonic.warmArtists(credentials);
+    // Favourite Songs is unpaginated upstream and cannot be fetched inside Sonos's browse deadline
+    // at scale, so it is only ever served from cache. Warm it here or the first browse of every
+    // session shows the placeholder.
+    this.subsonic.warmStarredSongs(credentials);
     // Only build the (heavy) album index for large catalogs; small libraries serve the flat
     // Albums list live and never scan. Chain off the album count (cheap once artists warm).
     this.subsonic
@@ -231,6 +235,10 @@ export class SubsonicMusicLibrary implements MusicLibrary {
           thingsToUpdate.push(
             (rating.love ? this.subsonic.star : this.subsonic.unstar)(this.credentials,{ id: trackId })
           );
+          // Favourite Songs is served from a cache (getStarred2 cannot fit Sonos's browse
+          // deadline at scale), so drop it here: without this the user hearts a track on Sonos,
+          // opens Favourite Songs, and their own action is missing until the TTL expires.
+          this.subsonic.invalidateStarredSongs(this.credentials);
         }
         if (track.rating.stars != rating.stars) {
           thingsToUpdate.push(
@@ -417,6 +425,10 @@ export class SubsonicMusicLibrary implements MusicLibrary {
 
   starredSongs = async () =>
     this.subsonic.starredSongs(this.credentials);
+
+  // Settled starred songs, or undefined when cold/in-flight. The Favourite Songs browse uses this
+  // so it never blocks on the unpaginated getStarred2 (8.6s at 11.5k songs, vs a 4500ms deadline).
+  peekStarredSongs = () => this.subsonic.peekStarredSongs(this.credentials);
 
   radioStations = async () =>
     this.subsonic.getInternetRadioStations(this.credentials);

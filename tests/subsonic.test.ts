@@ -61,6 +61,7 @@ import { b64Encode } from "../src/b64";
 import dayjs from "dayjs";
 import { FixedClock } from "../src/clock";
 import { SwrCache } from "../src/swr_cache";
+import { SystemClock } from "../src/clock";
 
 import { Album, Artist, Track, AlbumSummary, AlbumQuery, AuthFailure } from "../src/music_library";
 import { anAlbum, aTrack, anAlbumSummary, anArtistSummary, anArtist, aSimilarArtist, POP, a404 } from "./builders";
@@ -1531,7 +1532,10 @@ describe("Subsonic", () => {
       it("evicts album indexes beyond the dedicated album-index cache cap", async () => {
         const { ALBUM_INDEX_CACHE_MAX_ENTRIES } = jest.requireActual("../src/subsonic");
         expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeGreaterThan(0);
-        expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeLessThanOrEqual(2);
+        // Sized for a household: evicting an index costs a full catalog rescan, which
+        // warmAlbumIndex immediately re-triggers, so an under-sized cap makes bonob a permanent
+        // load generator against Navidrome. Kept bounded so it cannot grow without limit.
+        expect(ALBUM_INDEX_CACHE_MAX_ENTRIES).toBeLessThanOrEqual(16);
 
         const indexCache = new SwrCache(clock, 60_000, {
           maxEntries: ALBUM_INDEX_CACHE_MAX_ENTRIES,
@@ -2649,6 +2653,9 @@ describe("Subsonic", () => {
             }),
             headers: { "User-Agent": "bonob" },
             responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
           }
         );
       });
@@ -2675,6 +2682,9 @@ describe("Subsonic", () => {
             }),
             headers: { "User-Agent": "bonob", Range: range },
             responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
           }
         );
       });
@@ -2926,6 +2936,96 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       );
       const result = await new Subsonic(url, NO_CUSTOM_PLAYERS).starredSongs(credentials);
       expect(result).toEqual([]);
+    });
+
+    // getStarred2 has no pagination: it returns EVERY starred song in one response. Measured in
+    // production at 11,505 starred songs: 2.6-3.1s in Navidrome, 8615ms end-to-end through bonob,
+    // against Sonos's 4500ms browse deadline. Sonos browses page by page, so an uncached list
+    // re-runs that whole fetch for every page. These tests pin the caching contract that makes
+    // the section serveable at all.
+    describe("caching (the fetch cannot fit Sonos's browse deadline)", () => {
+      const starredResponse = (t: ReturnType<typeof aTrack>) =>
+        ok(subsonicOK({ starred2: { song: [asSongJson(t)] } }));
+
+      it("fetches getStarred2 only once across repeated calls (Sonos pages the container)", async () => {
+        const trackA = aTrack();
+        mockGET.mockImplementation(() => Promise.resolve(starredResponse(trackA)));
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          new SwrCache(SystemClock, 60_000)
+        );
+        await subsonic.starredSongs(credentials);
+        await subsonic.starredSongs(credentials);
+        await subsonic.starredSongs(credentials);
+        const starredCalls = mockGET.mock.calls.filter((c) =>
+          String(c[0]).includes("getStarred2")
+        );
+        expect(starredCalls.length).toEqual(1);
+      });
+
+      it("peekStarredSongs returns undefined while cold so the browse never blocks on it", () => {
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          new SwrCache(SystemClock, 60_000)
+        );
+        expect(subsonic.peekStarredSongs(credentials)).toBeUndefined();
+      });
+
+      it("peekStarredSongs resolves once warmed", async () => {
+        const trackA = aTrack();
+        mockGET.mockImplementation(() => Promise.resolve(starredResponse(trackA)));
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          new SwrCache(SystemClock, 60_000)
+        );
+        await subsonic.starredSongs(credentials);
+        const peeked = subsonic.peekStarredSongs(credentials);
+        expect(peeked).toBeDefined();
+        expect((await peeked!).map((it) => it.id)).toEqual([trackA.id]);
+      });
+
+      // bonob writes stars itself: rate() -> star/unstar. Without invalidation the user hearts a
+      // track on Sonos, opens Favourite Songs, and their own action is missing for a full TTL.
+      it("invalidateStarredSongs forces the next call to re-fetch", async () => {
+        const trackA = aTrack();
+        mockGET.mockImplementation(() => Promise.resolve(starredResponse(trackA)));
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          new SwrCache(SystemClock, 60_000)
+        );
+        await subsonic.starredSongs(credentials);
+        subsonic.invalidateStarredSongs(credentials);
+        await subsonic.starredSongs(credentials);
+        const starredCalls = mockGET.mock.calls.filter((c) =>
+          String(c[0]).includes("getStarred2")
+        );
+        expect(starredCalls.length).toEqual(2);
+      });
+
+      it("caches per user so one household member's favourites never leak to another", async () => {
+        const trackA = aTrack();
+        mockGET.mockImplementation(() => Promise.resolve(starredResponse(trackA)));
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          new SwrCache(SystemClock, 60_000)
+        );
+        await subsonic.starredSongs(credentials);
+        await subsonic.starredSongs({ ...credentials, username: "someone-else" });
+        const starredCalls = mockGET.mock.calls.filter((c) =>
+          String(c[0]).includes("getStarred2")
+        );
+        expect(starredCalls.length).toEqual(2);
+      });
     });
   });
 

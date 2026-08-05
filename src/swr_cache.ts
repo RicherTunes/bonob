@@ -142,6 +142,12 @@ export class SwrCache {
     const entry = this.entries.get(key);
     if (!entry || !entry.settled) return undefined;
     if (this.clock.now().valueOf() - entry.at >= this.maxStaleMs) return undefined;
+    // A peek IS a use. The artists and albums browses are served ENTIRELY through peek, so
+    // without this they never refresh their LRU position and unrelated page-key churn can evict
+    // an index out from under an actively-browsing user - dropping them to the "Loading…"
+    // placeholder and forcing a multi-second (or multi-minute) rebuild of something they are
+    // using right now.
+    this.touch(key, entry);
     return entry.value as Promise<T>;
   }
 

@@ -51,11 +51,33 @@ export const BROWSER_HEADERS = {
 
 export const SUBSONIC_HTTP_TIMEOUT_MS = 30_000;
 
+// Ceiling on a single buffered JSON response from Subsonic. Generous next to the largest real
+// payloads (getArtists ~10MB at 24.8k artists; getStarred2 ~10-17MB at 11.5k starred songs) but
+// far below "one response OOMs the process". Env-overridable for pathological libraries.
+export const SUBSONIC_MAX_JSON_BYTES = Number(
+  process.env["BNB_MAX_JSON_BYTES"] || 128 * 1024 * 1024
+);
+
 // Bound hung upstreams process-wide: a Subsonic request that never responds is aborted by axios
 // after SUBSONIC_HTTP_TIMEOUT_MS instead of tying up a socket and stacking retries behind the
 // SwrCache backstop. Applied as a default (not per-call) so it stays out of the request config
 // the tests assert on; the image fetchers set their own shorter timeout which overrides this.
 if (axios.defaults) axios.defaults.timeout = SUBSONIC_HTTP_TIMEOUT_MS;
+// Several Subsonic reads are unpaginated (getStarred2, getArtists, getPlaylist), so their response
+// size is set by the user's library rather than by us: a big enough one is an unguarded OOM that
+// takes the whole bridge down instead of failing a single browse. Applied as a default for the same
+// reason as the timeout above (it stays out of the request config the tests assert on).
+//
+// IMPORTANT: axios enforces maxContentLength on STREAMED responses too (lib/adapters/http.js), so
+// the audio stream paths must opt out explicitly with STREAM_UNLIMITED_CONTENT_LENGTH below - a
+// single hi-res track can legitimately exceed any JSON-shaped ceiling.
+if (axios.defaults) {
+  axios.defaults.maxContentLength = SUBSONIC_MAX_JSON_BYTES;
+  axios.defaults.maxBodyLength = SUBSONIC_MAX_JSON_BYTES;
+}
+
+// axios treats -1 as "no limit"; used by the audio stream paths to opt out of the JSON ceiling.
+export const STREAM_UNLIMITED_CONTENT_LENGTH = -1;
 
 export const t = (password: string, s: string) =>
   createHash("md5").update(`${password}${s}`).digest("hex");
@@ -68,7 +90,15 @@ export const t_and_s = (password: string) => {
   };
 };
 
-export const ALBUM_INDEX_CACHE_MAX_ENTRIES = 2;
+// Index entries are keyed per user (`albumIndex:v3:<user>`), and evicting one costs a full
+// catalog rescan (~227 requests / ~15 minutes on a 113k-album library) which `warmAlbumIndex`
+// re-triggers on the very next SOAP call - so an under-sized cap turns a multi-user household
+// into a permanent load generator against Navidrome. Holding an entry is cheap because the index
+// is disk-backed: only the ~4 bytes/album offset table is resident (~450KB at 113k albums).
+// Sized for a household rather than the 2 it used to be.
+export const ALBUM_INDEX_CACHE_MAX_ENTRIES = Number(
+  process.env["BNB_INDEX_CACHE_MAX_ENTRIES"] || 8
+);
 
 export const DODGY_IMAGE_NAME = "2a96cbd8b46e442fc41c2b86b821562f.png";
 
@@ -2037,12 +2067,49 @@ export class Subsonic {
       (it) => new Set(it.starred2.song.map((it) => it.id))
     );
 
-  // The user's starred/favourite tracks as playable summaries (Favourite Songs section). getStarred2
-  // is per-user and volatile, so it is fetched live (never cached).
-  starredSongs = (credentials: Credentials) =>
+  // The user's starred/favourite tracks as playable summaries (Favourite Songs section).
+  //
+  // getStarred2 has NO pagination: it returns EVERY starred song in one response. Measured against
+  // the production library at 11,505 starred songs: 2.6-3.1s inside Navidrome, 8615ms end-to-end
+  // through bonob - well past Sonos's 4500ms browse deadline, so the section degraded to the retry
+  // placeholder and the user saw an empty Favourite Songs. Worse, Sonos browses a container page by
+  // page, so an uncached list re-runs that entire fetch for EVERY page.
+  //
+  // This is the one starred/favourited surface that must be cached, despite VOLATILE_ALBUM_TYPES
+  // declaring starred data too volatile to cache. The volatility rule is still honoured: bonob's own
+  // writes (rate() -> star/unstar) call invalidateStarredSongs, so a heart tapped on Sonos is never
+  // hidden by our own cache. Only stars made in OTHER clients lag, bounded by the browse TTL.
+  private starredSongsKey = (credentials: Credentials) =>
+    `starredSongs:v1:${credentials.username}`;
+
+  private fetchStarredSongs = (credentials: Credentials): Promise<TrackSummary[]> =>
     this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
-      (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
+      Object.freeze(
+        (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
+      ) as TrackSummary[]
     );
+
+  starredSongs = (credentials: Credentials): Promise<TrackSummary[]> =>
+    this.cache.get<TrackSummary[]>(this.starredSongsKey(credentials), () =>
+      this.fetchStarredSongs(credentials)
+    );
+
+  // Non-blocking peek, mirroring peekArtistIndex: the settled list, or undefined when cold/in-flight,
+  // so a cold Favourite Songs browse returns a placeholder instead of blocking on the multi-second
+  // getStarred2. Never call the blocking get() on the browse path - past maxStale it cold-fetches.
+  peekStarredSongs = (credentials: Credentials): Promise<TrackSummary[]> | undefined =>
+    this.cache.peek<TrackSummary[]>(this.starredSongsKey(credentials));
+
+  // Pre-warm in the background so the first browse of a session isn't cold. Safe to call often:
+  // the cache coalesces and only re-fetches when stale.
+  warmStarredSongs = (credentials: Credentials): void =>
+    this.cache.warm(this.starredSongsKey(credentials), () =>
+      this.fetchStarredSongs(credentials)
+    );
+
+  // Called whenever bonob itself stars/unstars, so our own write is never masked by our own cache.
+  invalidateStarredSongs = (credentials: Credentials): void =>
+    this.cache.invalidate(this.starredSongsKey(credentials));
 
   // Map complete song records straight to Tracks, resolving each album from the song itself. The
   // counterpart to toAlbumSummary, and the reason a song listing needs no per-song round trips.
@@ -2194,6 +2261,11 @@ export class Subsonic {
           }))
         ),
         responseType: "stream",
+        // Audio is legitimately larger than any JSON ceiling; opt out of the process-wide
+        // maxContentLength default (axios enforces it on streams too, which would truncate
+        // playback of a large hi-res track mid-song).
+        maxContentLength: STREAM_UNLIMITED_CONTENT_LENGTH,
+        maxBodyLength: STREAM_UNLIMITED_CONTENT_LENGTH,
       }
     )
     .then((stream) => ({
@@ -2247,6 +2319,11 @@ export class Subsonic {
           }))
         ),
         responseType: "stream",
+        // Audio is legitimately larger than any JSON ceiling; opt out of the process-wide
+        // maxContentLength default (axios enforces it on streams too, which would truncate
+        // playback of a large hi-res track mid-song).
+        maxContentLength: STREAM_UNLIMITED_CONTENT_LENGTH,
+        maxBodyLength: STREAM_UNLIMITED_CONTENT_LENGTH,
       }
     )
     .then((stream) => ({

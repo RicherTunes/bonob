@@ -255,8 +255,12 @@ export interface MusicLibrary {
   removeFromPlaylist(playlistId: string, indicies: number[]): Promise<boolean>
   similarSongs(id: string): Promise<TrackSummary[]>;
   topSongs(artistId: string): Promise<TrackSummary[]>;
-  // The user's starred/favourite tracks (getStarred2 songs), as playable summaries.
+  // The user's starred/favourite tracks (getStarred2 songs), as playable summaries. Warms the
+  // cache; NOT for the browse path, where the upstream fetch cannot fit Sonos's deadline at scale.
   starredSongs(): Promise<TrackSummary[]>;
+  // Settled starred songs, or undefined when cold/in-flight, so the browse can serve a placeholder
+  // instead of blocking. Mirrors peekArtistIndex.
+  peekStarredSongs(): Promise<TrackSummary[]> | undefined;
   radioStation(id: string): Promise<RadioStation>
   radioStations(): Promise<RadioStation[]>
 }

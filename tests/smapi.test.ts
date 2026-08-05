@@ -828,6 +828,7 @@ describe("wsdl api", () => {
     track: jest.fn(),
     topSongs: jest.fn(),
     starredSongs: jest.fn(),
+    peekStarredSongs: jest.fn(),
     searchArtists: jest.fn(),
     searchAlbums: jest.fn(),
     searchTracks: jest.fn(),
@@ -2154,8 +2155,45 @@ describe("wsdl api", () => {
               const s1 = aTrack();
               const s2 = aTrack();
 
+              // The browse path reads the WARM cache (peekStarredSongs), never the upstream fetch:
+              // getStarred2 is unpaginated and took 8615ms at 11,505 starred songs against a
+              // 4500ms deadline, and Sonos re-requests it for every page of the container.
+              it("serves from the warm cache without touching the upstream fetch", async () => {
+                musicLibrary.peekStarredSongs.mockReturnValue(
+                  Promise.resolve([s0, s1, s2])
+                );
+                await ws.getMetadataAsync({
+                  id: "favouriteSongs",
+                  index: 0,
+                  count: 100,
+                });
+                expect(musicLibrary.peekStarredSongs).toHaveBeenCalled();
+                expect(musicLibrary.starredSongs).not.toHaveBeenCalled();
+              });
+
+              // Cold must not block: it kicks the warm and shows a placeholder, exactly as the
+              // artists browse does, instead of spending the whole browse budget upstream.
+              it("returns a placeholder and kicks the warm when the cache is cold", async () => {
+                musicLibrary.peekStarredSongs.mockReturnValue(undefined);
+                musicLibrary.starredSongs.mockResolvedValue([s0]);
+                const result = await ws.getMetadataAsync({
+                  id: "favouriteSongs",
+                  index: 0,
+                  count: 100,
+                });
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.total).toEqual(1);
+                const items = ([] as any[]).concat(md.mediaCollection);
+                expect(items[0].id).toEqual("favouriteSongs");
+                expect(items[0].title).toContain("Loading your favourite songs");
+                // the warm was kicked off so the next open succeeds
+                expect(musicLibrary.starredSongs).toHaveBeenCalled();
+              });
+
               it("returns the user's starred songs as playable track metadata, paged", async () => {
-                musicLibrary.starredSongs.mockResolvedValue([s0, s1, s2]);
+                musicLibrary.peekStarredSongs.mockReturnValue(
+                  Promise.resolve([s0, s1, s2])
+                );
                 const result = await ws.getMetadataAsync({
                   id: "favouriteSongs",
                   index: 1,
@@ -2174,11 +2212,11 @@ describe("wsdl api", () => {
                 expect(items[0].trackMetadata.albumArtURI).toContain(
                   `bat=${apiToken}`
                 );
-                expect(musicLibrary.starredSongs).toHaveBeenCalled();
+                expect(musicLibrary.peekStarredSongs).toHaveBeenCalled();
               });
 
               it("handles a user with no favourite songs", async () => {
-                musicLibrary.starredSongs.mockResolvedValue([]);
+                musicLibrary.peekStarredSongs.mockReturnValue(Promise.resolve([]));
                 const result = await ws.getMetadataAsync({
                   id: "favouriteSongs",
                   index: 0,
@@ -2195,7 +2233,7 @@ describe("wsdl api", () => {
                 const noIdArtist = anArtistSummary();
                 noIdArtist.id = undefined;
                 const t = aTrack({ artist: noIdArtist });
-                musicLibrary.starredSongs.mockResolvedValue([t]);
+                musicLibrary.peekStarredSongs.mockReturnValue(Promise.resolve([t]));
 
                 const result = await ws.getMetadataAsync({
                   id: "favouriteSongs",

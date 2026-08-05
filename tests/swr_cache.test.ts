@@ -1,5 +1,5 @@
 import dayjs from "dayjs";
-import { FixedClock } from "../src/clock";
+import { FixedClock, SystemClock } from "../src/clock";
 import { SwrCache } from "../src/swr_cache";
 import logger from "../src/logger";
 
@@ -571,3 +571,19 @@ async function settle(
   f.resolve(f.calls - 1, v);
   return p;
 }
+
+describe("peek marks the entry as recently used", () => {
+  // The artists/albums browses are served ENTIRELY via peek(). When peek did not touch the LRU,
+  // unrelated page-key churn could evict an index out from under an actively-browsing user,
+  // dropping them to the "Loading…" placeholder and forcing an expensive rebuild.
+  it("does not evict an entry that is being actively peeked", async () => {
+    const cache = new SwrCache(SystemClock, 60_000, { maxEntries: 2 });
+    await cache.get("index", async () => "the-index");
+    await cache.get("page:1", async () => "one");
+    // keep using the index, then add a third key: the LRU victim must be page:1, not the index
+    expect(await cache.peek<string>("index")).toEqual("the-index");
+    await cache.get("page:2", async () => "two");
+    expect(cache.peek<string>("index")).toBeDefined();
+    expect(cache.peek<string>("page:1")).toBeUndefined();
+  });
+});

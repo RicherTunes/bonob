@@ -1589,19 +1589,44 @@ function bindSmapiSoapServiceToExpress(
                           total,
                         })
                       );
-                  case "favouriteSongs":
-                    return musicLibrary
-                      .starredSongs()
-                      .then(slice2(paging))
-                      .then(([page, total]) =>
-                        getMetadataResult({
-                          mediaMetadata: page.map((it) =>
-                            topSongMetadata(urlWithToken(apiKey), it)
+                  case "favouriteSongs": {
+                    // getStarred2 is unpaginated: 8615ms end-to-end at 11,505 starred songs,
+                    // against a 4500ms deadline, re-run for EVERY page Sonos requests. So this
+                    // browse is served only from the warm cache; cold, it kicks the warm and
+                    // shows the retry placeholder rather than blocking (same shape as artists).
+                    const peekedStarred = musicLibrary.peekStarredSongs();
+                    if (peekedStarred) {
+                      return peekedStarred
+                        .then(slice2(paging))
+                        .then(([page, total]) =>
+                          getMetadataResult({
+                            mediaMetadata: page.map((it) =>
+                              topSongMetadata(urlWithToken(apiKey), it)
+                            ),
+                            index: paging._index,
+                            // Sonos S2 rejects a container advertising a very large total, so
+                            // never advertise more than the flat cap even if the user has starred
+                            // more than that.
+                            total: Math.min(total, MAX_ALBUMS_FLAT),
+                          })
+                        );
+                    }
+                    void musicLibrary.starredSongs().catch(() => undefined);
+                    return getMetadataResult({
+                      mediaCollection: [
+                        {
+                          itemType: "container",
+                          id: "favouriteSongs",
+                          title: "Loading your favourite songs… (open again shortly)",
+                          albumArtURI: albumArtURI(
+                            iconArtURI(bonobUrl, "heart").href()
                           ),
-                          index: paging._index,
-                          total,
-                        })
-                      );
+                        },
+                      ],
+                      index: 0,
+                      total: 1,
+                    });
+                  }
                   case "relatedArtists":
                     return musicLibrary
                       .artist(typeId!)

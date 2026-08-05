@@ -762,9 +762,12 @@ describe("SubsonicMusicLibrary", () => {
     encodingFor: jest.fn(),
   };
 
+  // Hoisted so tests can assert on the client itself (e.g. cache invalidation on star/unstar).
+  const subsonicClient = new Subsonic(url, customPlayers);
+
   const subsonic = new SubsonicMusicLibrary(
     // todo: this should be a mock...
-    new Subsonic(url, customPlayers),
+    subsonicClient,
     { username, password },
     customPlayers as unknown as CustomPlayers
   );
@@ -1904,6 +1907,9 @@ describe("SubsonicMusicLibrary", () => {
                     "User-Agent": "bonob",
                   },
                   responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
                 }
               );
             });
@@ -2017,6 +2023,9 @@ describe("SubsonicMusicLibrary", () => {
                   Range: range,
                 },
                 responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
               }
             );
           });
@@ -2076,6 +2085,9 @@ describe("SubsonicMusicLibrary", () => {
                 "User-Agent": "bonob",
               },
               responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
             }
           );
         });
@@ -2122,6 +2134,9 @@ describe("SubsonicMusicLibrary", () => {
                 Range: range,
               },
               responseType: "stream",
+            // audio opts out of the process-wide JSON maxContentLength ceiling
+            maxContentLength: -1,
+            maxBodyLength: -1,
             }
           );
         });
@@ -2580,6 +2595,36 @@ describe("SubsonicMusicLibrary", () => {
               headers,
             }
           );
+        });
+
+        // Favourite Songs is served from a cache, so bonob's OWN star must drop it. Without this
+        // the user hearts a track on Sonos, opens Favourite Songs, and their own action is absent
+        // until the TTL expires - our UI silently ignoring our own write.
+        it("invalidates the cached favourite-songs list so the new love shows immediately", async () => {
+          const track = aTrack({
+            id: trackId,
+            artist,
+            album: albumToAlbumSummary(album),
+            rating: { love: false, stars: 0 },
+          });
+
+          mockGET
+            .mockImplementationOnce(() =>
+              Promise.resolve(ok(getSongJson(track)))
+            )
+            .mockImplementationOnce(() =>
+              Promise.resolve(ok(getAlbumJson(album)))
+            )
+            .mockImplementationOnce(() => Promise.resolve(ok(EMPTY)));
+
+          const invalidate = jest.spyOn(
+            subsonicClient,
+            "invalidateStarredSongs"
+          );
+
+          await subsonic.rate(trackId, { love: true, stars: 0 });
+
+          expect(invalidate).toHaveBeenCalled();
         });
       });
 
@@ -4153,6 +4198,7 @@ describe("SubsonicMusicService.login", () => {
     const sub = {
       ping: jest.fn(),
       warmArtists: jest.fn(),
+      warmStarredSongs: jest.fn(),
       albumCount,
       warmAlbumIndex: jest.fn(),
     };
@@ -4172,6 +4218,18 @@ describe("SubsonicMusicService.login", () => {
     expect(library).toBeInstanceOf(SubsonicMusicLibrary);
     // warmArtists receives the credentials round-tripped through parseToken(asToken(...)).
     expect(sub.warmArtists).toHaveBeenCalledWith(credentials);
+    await flush();
+  });
+
+  // Favourite Songs is served ONLY from cache (getStarred2 is unpaginated and took 8615ms at
+  // 11,505 starred songs against a 4500ms deadline). Without a login warm, the first browse of
+  // every session shows the placeholder instead of the user's favourites.
+  it("pre-warms the starred songs so Favourite Songs is not cold on first open", async () => {
+    const { service, sub } = build(jest.fn().mockResolvedValue(0));
+
+    await service.login(asToken(credentials));
+
+    expect(sub.warmStarredSongs).toHaveBeenCalledWith(credentials);
     await flush();
   });
 
