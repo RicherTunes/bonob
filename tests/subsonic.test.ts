@@ -3030,6 +3030,32 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("getArtist caching", () => {
+    // Measured live after caching artist INFO: the two artists that previously breached the
+    // deadline still cost ~3s on a repeat open, and Radiohead degraded at 5934ms cold. The
+    // residual cost is getArtist, which returns ALL of an artist's albums and was uncached, and
+    // it is re-fetched by every one of the three artist() calls a single artist open produces.
+    it("fetches an artist once across repeated opens", async () => {
+      mockGET.mockImplementation(() =>
+        Promise.resolve(
+          ok(subsonicOK({ artist: { id: "a1", name: "An Artist", album: [] } }))
+        )
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.getArtist(credentials, "a1");
+      await subsonic.getArtist(credentials, "a1");
+      await subsonic.getArtist(credentials, "a1");
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("/rest/getArtist?") || (String(c[0]).includes("getArtist") && !String(c[0]).includes("getArtistInfo"))).length
+      ).toEqual(1);
+    });
+  });
+
   describe("genre caching", () => {
     // 1443 genres on the live library, measured at 587ms, and re-fetched for every page of the
     // Genres browse. Genres only change when the library is rescanned.

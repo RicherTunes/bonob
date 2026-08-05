@@ -2048,7 +2048,22 @@ export class Subsonic {
         };
       });
    
+  // getArtist returns ALL of an artist's albums, and a single artist open in Sonos produces up to
+  // three artist() calls (browse, extended metadata, bio text), each re-fetching that whole list.
+  // Measured live: after caching the external artist INFO, opening an artist still cost ~3s, and
+  // one degraded at 5934ms - the residual was this call, not Last.fm. Cached per user + artist id;
+  // an artist's album list only changes on a library rescan.
   getArtist = (
+    credentials: Credentials,
+    id: string
+  ): Promise<
+    IdName & { artistImageUrl: string | undefined; albums: AlbumSummary[] }
+  > =>
+    this.cache.get(`artist:v1:${credentials.username}:${id}`, () =>
+      this.fetchArtist(credentials, id)
+    );
+
+  private fetchArtist = (
     credentials: Credentials,
     id: string
   ): Promise<
