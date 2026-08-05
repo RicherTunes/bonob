@@ -53,6 +53,8 @@ import {
   CoverArtBusyError,
   DEFAULT_MAX_INDEX_SCAN_ALBUMS,
   ALBUM_LIST_MAX_PAGE_SIZE,
+  MAX_RECURSIVE_ALBUMS,
+  MAX_RECURSIVE_TRACKS,
 } from "../src/subsonic";
 
 import { promises as dnsPromises } from "dns";
@@ -3053,6 +3055,106 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       expect(
         mockGET.mock.calls.filter((c) => String(c[0]).includes("/rest/getArtist?") || (String(c[0]).includes("getArtist") && !String(c[0]).includes("getArtistInfo"))).length
       ).toEqual(1);
+    });
+  });
+
+  describe("artistTracks (recursive enumeration for play-artist)", () => {
+    // SMAPI defines canPlay as "playable by enumerating with the recursive flag to obtain a flat
+    // list of mediaMetadata". bonob never implemented recursive, which is why adding canPlay to
+    // artist tiles would have BROKEN play-artist: Sonos would have asked for a flat track list and
+    // received containers. This is that flat list, and it must be bounded and cached or it is the
+    // favouriteSongs hazard again: one artist can own hundreds of albums.
+    const artistWith = (albumCount: number) =>
+      ok(
+        subsonicOK({
+          artist: {
+            id: "a1",
+            name: "An Artist",
+            album: Array.from({ length: albumCount }, (_, i) => ({
+              id: `al-${i}`,
+              name: `Album ${i}`,
+              artistId: "a1",
+              artist: "An Artist",
+            })),
+          },
+        })
+      );
+    const albumWithTracks = (n: number) =>
+      ok(
+        subsonicOK({
+          album: {
+            id: "al-x",
+            name: "Album",
+            artistId: "a1",
+            artist: "An Artist",
+            song: Array.from({ length: n }, (_, i) => ({
+              id: `t-${i}`,
+              title: `Track ${i}`,
+              albumId: "al-x",
+              album: "Album",
+              artistId: "a1",
+              artist: "An Artist",
+              duration: 100,
+              track: i + 1,
+              contentType: "audio/flac",
+            })),
+          },
+        })
+      );
+
+    it("caps the number of albums it will walk for one artist", async () => {
+      mockGET.mockImplementation((url: string) =>
+        Promise.resolve(
+          String(url).includes("getArtist") ? artistWith(400) : albumWithTracks(1)
+        )
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.artistTracks(credentials, "a1");
+      const albumCalls = mockGET.mock.calls.filter((c) =>
+        String(c[0]).includes("/rest/getAlbum")
+      ).length;
+      expect(albumCalls).toBeGreaterThan(0);
+      expect(albumCalls).toBeLessThanOrEqual(MAX_RECURSIVE_ALBUMS);
+    });
+
+    it("caps the number of tracks returned", async () => {
+      mockGET.mockImplementation((url: string) =>
+        Promise.resolve(
+          String(url).includes("getArtist") ? artistWith(50) : albumWithTracks(200)
+        )
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      const tracks = await subsonic.artistTracks(credentials, "a1");
+      expect(tracks.length).toBeLessThanOrEqual(MAX_RECURSIVE_TRACKS);
+      expect(tracks.length).toBeGreaterThan(0);
+    });
+
+    it("is cached: a second enumeration costs no upstream calls", async () => {
+      mockGET.mockImplementation((url: string) =>
+        Promise.resolve(
+          String(url).includes("getArtist") ? artistWith(3) : albumWithTracks(2)
+        )
+      );
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.artistTracks(credentials, "a1");
+      const afterFirst = mockGET.mock.calls.length;
+      await subsonic.artistTracks(credentials, "a1");
+      expect(mockGET.mock.calls.length).toEqual(afterFirst);
     });
   });
 

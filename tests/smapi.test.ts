@@ -830,6 +830,7 @@ describe("wsdl api", () => {
     topSongs: jest.fn(),
     starredSongs: jest.fn(),
     peekStarredSongs: jest.fn(),
+    artistTracks: jest.fn(),
     searchArtists: jest.fn(),
     searchAlbums: jest.fn(),
     searchTracks: jest.fn(),
@@ -2645,6 +2646,7 @@ describe("wsdl api", () => {
                             bonobUrlWithAccessToken,
                             { coverArt: it.image }
                           ).href(),
+                          canPlay: true,
                         })),
                         index: 0,
                         total: 4,
@@ -2674,6 +2676,7 @@ describe("wsdl api", () => {
                               bonobUrlWithAccessToken,
                               { coverArt: it.image }
                             ).href(),
+                            canPlay: true,
                           })
                         ),
                         index: 1,
@@ -2760,7 +2763,47 @@ describe("wsdl api", () => {
               const allAlbums = [pop1, pop2, pop3, pop4, rock1, rock2];
               const popAlbums = [pop1, pop2, pop3, pop4];
 
-              describe("asking for random albums", () => {
+              describe("playing an artist (recursive enumeration)", () => {
+              // SMAPI plays a container by re-requesting it with recursive=true and expecting a
+              // FLAT list of mediaMetadata. bonob never read that flag, so advertising canPlay on
+              // artist tiles would have handed Sonos containers where it expected tracks and
+              // broken play-artist. These pin both halves of the contract.
+              it("returns a flat track list when recursive is set", async () => {
+                const t1 = aTrack();
+                const t2 = aTrack();
+                musicLibrary.artistTracks.mockResolvedValue([t1, t2]);
+
+                const result = await ws.getMetadataAsync({
+                  id: "artist:a1",
+                  index: 0,
+                  count: 100,
+                  recursive: true,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                const items = ([] as any[]).concat(md.mediaMetadata);
+                expect(items.map((m) => m.id)).toEqual([`track:${t1.id}`, `track:${t2.id}`]);
+                expect(md.mediaCollection).toBeUndefined();
+                expect(musicLibrary.artistTracks).toHaveBeenCalledWith("a1");
+              });
+
+              it("still returns containers (top songs + albums) when recursive is NOT set", async () => {
+                musicLibrary.artist.mockResolvedValue(anArtist({ albums: [anAlbum()] }));
+
+                const result = await ws.getMetadataAsync({
+                  id: "artist:a1",
+                  index: 0,
+                  count: 100,
+                });
+
+                const md = (result[0] as any).getMetadataResult;
+                expect(md.mediaCollection).toBeDefined();
+                expect(md.mediaMetadata).toBeUndefined();
+                expect(musicLibrary.artistTracks).not.toHaveBeenCalled();
+              });
+            });
+
+            describe("asking for random albums", () => {
                 const randomAlbums = [pop2, rock1, pop1];
 
                 beforeEach(() => {
@@ -3907,6 +3950,7 @@ describe("wsdl api", () => {
                         artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
+                        canPlay: true,
                       },
                       relatedBrowse: [{
                         id: `relatedArtists:${artist.id}`,
@@ -3939,6 +3983,7 @@ describe("wsdl api", () => {
                         artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
+                        canPlay: true,
                       }
                     },
                   });
@@ -4101,6 +4146,7 @@ describe("wsdl api", () => {
                         artistId: `artist:${artist.id}`,
                         title: artist.name,
                         albumArtURI: coverArtURI(bonobUrlWithAccessToken, { coverArt: artist.image }).href(),
+                        canPlay: true,
                       }
                     },
                   });

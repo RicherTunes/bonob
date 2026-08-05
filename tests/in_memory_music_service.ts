@@ -198,6 +198,7 @@ export class InMemoryMusicService implements MusicService {
       // Always "warm" in the in-memory service, so browse tests exercise the served path rather
       // than the cold placeholder.
       peekStarredSongs: () => Promise.resolve([]),
+      artistTracks: async (_: string) => Promise.resolve([]),
       radioStations: async () => Promise.resolve([]),
       radioStation: async (_: string) => Promise.reject("Unsupported operation"),
       years: async () => Promise.resolve([]),

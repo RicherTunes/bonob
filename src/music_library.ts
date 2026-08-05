@@ -261,6 +261,8 @@ export interface MusicLibrary {
   // Settled starred songs, or undefined when cold/in-flight, so the browse can serve a placeholder
   // instead of blocking. Mirrors peekArtistIndex.
   peekStarredSongs(): Promise<TrackSummary[]> | undefined;
+  // A bounded, flat list of an artist's tracks, for Sonos's recursive enumeration (play-artist).
+  artistTracks(artistId: string): Promise<TrackSummary[]>;
   radioStation(id: string): Promise<RadioStation>
   radioStations(): Promise<RadioStation[]>
 }

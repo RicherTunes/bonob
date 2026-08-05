@@ -436,6 +436,11 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   // so it never blocks on the unpaginated getStarred2 (8.6s at 11.5k songs, vs a 4500ms deadline).
   peekStarredSongs = () => this.subsonic.peekStarredSongs(this.credentials);
 
+  // Flat track list for Sonos's recursive enumeration when playing an artist. Bounded and cached
+  // in the Subsonic layer; see MAX_RECURSIVE_ALBUMS / MAX_RECURSIVE_TRACKS.
+  artistTracks = async (artistId: string) =>
+    this.subsonic.artistTracks(this.credentials, artistId);
+
   radioStations = async () =>
     this.subsonic.getInternetRadioStations(this.credentials);
 

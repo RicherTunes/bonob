@@ -336,6 +336,15 @@ export const ALBUM_SCAN_PAGE_SIZE = 500;
 
 // Upper bound on a single getAlbumList2 browse page. Sonos never asks for more than a few hundred;
 // this only stops a malformed/hostile count from turning one browse into a whole-catalog query.
+// Bounds for recursive artist enumeration (play-artist). SMAPI defines canPlay as "playable by
+// enumerating with the recursive flag to obtain a flat list of mediaMetadata", so advertising it
+// means Sonos will ask for EVERY track by an artist. One artist can own hundreds of albums (Various
+// Artists, a prolific composer), and walking them unbounded inside a 4500ms deadline is the exact
+// hazard that made Favourite Songs unusable at 11.5k rows. A play queue past a few hundred tracks
+// is not useful anyway, so both ends are capped and the result is cached.
+export const MAX_RECURSIVE_ALBUMS = 100;
+export const MAX_RECURSIVE_TRACKS = 500;
+
 export const ALBUM_LIST_MAX_PAGE_SIZE = 500;
 
 // How many albums to actually request for a browse page.
@@ -2171,6 +2180,36 @@ export class Subsonic {
         artistImageUrl: it.artistImageUrl,
         albums: this.toAlbumSummary(it.album || []),
       }));
+
+  // A flat list of an artist's tracks, for Sonos's recursive enumeration when playing an artist.
+  // Bounded at both ends (see MAX_RECURSIVE_*) and cached per user + artist, so a repeat play or a
+  // second page costs nothing upstream.
+  artistTracks = (credentials: Credentials, id: string): Promise<TrackSummary[]> =>
+    this.cache.get(`artistTracks:v1:${credentials.username}:${id}`, () =>
+      this.fetchArtistTracks(credentials, id)
+    );
+
+  private fetchArtistTracks = async (
+    credentials: Credentials,
+    id: string
+  ): Promise<TrackSummary[]> => {
+    const artist = await this.getArtist(credentials, id);
+    const albums = artist.albums.slice(0, MAX_RECURSIVE_ALBUMS);
+    const tracks: TrackSummary[] = [];
+    for (const album of albums) {
+      if (tracks.length >= MAX_RECURSIVE_TRACKS) break;
+      try {
+        const full = await this.getAlbum(credentials, album.id);
+        for (const t of full.tracks) {
+          if (tracks.length >= MAX_RECURSIVE_TRACKS) break;
+          tracks.push(t);
+        }
+      } catch {
+        // One unreadable album must not sink the whole queue: skip it and keep enumerating.
+      }
+    }
+    return tracks;
+  };
 
   getCoverArt = (credentials: Credentials, id: string, size?: number) => {
     // Route through the per-instance coordinator: identical concurrent requests for the same

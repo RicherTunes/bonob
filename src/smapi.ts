@@ -564,6 +564,10 @@ export const artist = (bonobUrl: URLBuilder, artist: ArtistSummary) => ({
   artistId: `artist:${artist.id}`,
   title: artist.name,
   albumArtURI: albumArtURI(coverArtURI(bonobUrl, { coverArt: artist.image }).href()),
+  // Playable now that the recursive flag is implemented: Sonos re-requests this container with
+  // recursive=true and gets a flat, bounded, cached track list. Advertising this WITHOUT the
+  // recursive handler would have broken play-artist, which is why it waited for it.
+  canPlay: true,
 });
 
 export const splitId = (id: string) => {
@@ -1063,8 +1067,8 @@ function bindSmapiSoapServiceToExpress(
               id,
               index,
               count,
-            }: // recursive,
-            { id: string; index: number; count: number; recursive: boolean },
+              recursive,
+            }: { id: string; index: number; count: number; recursive: boolean },
             _,
             soapyHeaders: SoapyHeaders,
             { headers }: Pick<Request, "headers">
@@ -1754,6 +1758,23 @@ function bindSmapiSoapServiceToExpress(
                         });
                       });
                   case "artist":
+                    // SMAPI: a container advertising canPlay is played by re-requesting it with
+                    // the recursive flag and expecting a FLAT list of mediaMetadata. bonob never
+                    // read that flag, which is why adding canPlay to artist tiles earlier would
+                    // have broken play-artist rather than enabled it: Sonos would have asked for
+                    // tracks and received containers. Bounded and cached in artistTracks.
+                    if (recursive) {
+                      return musicLibrary.artistTracks(typeId!).then((tracks) => {
+                        const [page, total] = slice2<TrackSummary>(paging)(tracks);
+                        return getMetadataResult({
+                          mediaMetadata: page.map((it) =>
+                            topSongMetadata(urlWithToken(apiKey), it)
+                          ),
+                          index: paging._index,
+                          total,
+                        });
+                      });
+                    }
                     return musicLibrary.artist(typeId!).then((artist) => {
                       // Offer the artist's top songs as the first entry, then their albums. Page
                       // over the combined list so paging and total stay correct.
