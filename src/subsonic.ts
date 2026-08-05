@@ -912,7 +912,12 @@ export class Subsonic {
         return { summary: x, songs: album.song }
       }).then(({ summary, songs }) => {
         const x: AlbumSummary = summary
-        const y: Track[] = songs.map((it) => asTrack(summary, it, this.customPlayers))
+        // `song` is OPTIONAL in practice: GetAlbumResponse types it as required, but Navidrome
+        // omits it entirely for an album with no tracks. getTrack reaches here via `song.albumId!`,
+        // so an album whose tracks were removed (or a stale id) threw
+        // "Cannot read properties of undefined (reading 'map')" and surfaced in Sonos as a generic
+        // failure rather than an empty album.
+        const y: Track[] = (songs || []).map((it) => asTrack(summary, it, this.customPlayers))
         return {
           ...x,
           tracks: y
