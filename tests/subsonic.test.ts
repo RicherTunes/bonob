@@ -3158,6 +3158,66 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("search caching (Sonos fires each category twice, concurrently)", () => {
+    // Observed live: one user search produced SIX search calls in the same second - all three
+    // categories, twice each. search3 over 831k tracks is the slowest of the three, and under that
+    // concurrency the tracks category exceeded the 4500ms deadline and degraded to empty, so the
+    // Songs section silently returned nothing for a common term ("Rock").
+    //
+    // Caching keyed on the query collapses the duplicate pair into ONE upstream call (SwrCache
+    // coalesces in-flight requests per key) and makes a repeated search free.
+    const searchResponse = () =>
+      ok(subsonicOK({ searchResult3: { song: [], album: [], artist: [] } }));
+
+    it("coalesces the duplicate concurrent search into one upstream call", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(searchResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await Promise.all([
+        subsonic.search3(credentials, { query: "Rock", songCount: 20 }),
+        subsonic.search3(credentials, { query: "Rock", songCount: 20 }),
+      ]);
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("search3")).length
+      ).toEqual(1);
+    });
+
+    it("does not confuse two different terms", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(searchResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.search3(credentials, { query: "Rock", songCount: 20 });
+      await subsonic.search3(credentials, { query: "Jazz", songCount: 20 });
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("search3")).length
+      ).toEqual(2);
+    });
+
+    it("does not confuse the three categories, which ask for different counts", async () => {
+      mockGET.mockImplementation(() => Promise.resolve(searchResponse()));
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        new SwrCache(SystemClock, 60_000)
+      );
+      await subsonic.search3(credentials, { query: "Rock", songCount: 20 });
+      await subsonic.search3(credentials, { query: "Rock", albumCount: 20 });
+      await subsonic.search3(credentials, { query: "Rock", artistCount: 20 });
+      expect(
+        mockGET.mock.calls.filter((c) => String(c[0]).includes("search3")).length
+      ).toEqual(3);
+    });
+  });
+
   describe("genre caching", () => {
     // 1443 genres on the live library, measured at 587ms, and re-fetched for every page of the
     // Genres browse. Genres only change when the library is rescanned.

@@ -2360,7 +2360,31 @@ export class Subsonic {
       coverArt: coverArtURN(album.coverArt),
     }));
 
+  // Sonos issues a user's search as SIX calls in the same second: all three categories, twice
+  // each. search3 over 831k tracks is the slowest of the three, and under that concurrency the
+  // tracks category was measured exceeding the 4500ms deadline on a common term ("Rock"), so the
+  // Songs section silently returned nothing.
+  //
+  // Caching on the query collapses the duplicate pair into one upstream call - SwrCache coalesces
+  // in-flight requests per key, so the second arrival waits on the first rather than starting its
+  // own - and makes a repeated search free. Search results only change on a library scan, so the
+  // browse TTL is generous here rather than risky.
+  //
+  // The key includes the COUNTS because the three categories differ only by which count is
+  // non-zero; keying on the query alone would serve an artist search from the track search's
+  // response.
   search3 = (credentials: Credentials, q: any) =>
+    this.cache.get(
+      `search3:v1:${credentials.username}:${JSON.stringify({
+        query: q.query ?? "",
+        artistCount: q.artistCount ?? 0,
+        albumCount: q.albumCount ?? 0,
+        songCount: q.songCount ?? 0,
+      })}`,
+      () => this.fetchSearch3(credentials, q)
+    );
+
+  private fetchSearch3 = (credentials: Credentials, q: any) =>
     this.getJSONWithRetry<Search3Response>(credentials, "/rest/search3", {
       artistCount: 0,
       albumCount: 0,
