@@ -287,23 +287,28 @@ export class SubsonicMusicLibrary implements MusicLibrary {
     this.radioStations().then((it) => it.find((station) => station.id === id)!);
 
   years = async () => {
-    const q: AlbumQuery = {
-      _index: 0,
-      _count: 100000, // FIXME: better than this, probably doesnt work anyway as max _count is 500 or something
-      type: "alphabeticalByArtist",
-    };
-    const years = this.subsonic
-      .getAlbumList2(this.credentials, q)
-      .then(({ results }) =>
-        results
-          .map((album) => album.year || "?")
-          .filter((item, i, ar) => ar.indexOf(item) === i)
-          .sort()
-          .map((year) => ({
-            ...asYear(year),
-          }))
-          .reverse()
-      );
-    return years;
+    // Subsonic caps a single getAlbumList2 page (Navidrome at 500), so the old `_count: 100000`
+    // silently returned only the FIRST page and the Years menu listed the years of those albums
+    // alone. Its own FIXME suspected as much. On a 113k-album library this showed 56 years instead
+    // of 113 - roughly half the menu missing, with nothing to indicate it.
+    //
+    // Page until a short page marks the end. `alphabeticalByArtist` is stable, so paging it is
+    // safe; a page that comes back full but yields no NEW years is still worth continuing past,
+    // because years repeat heavily across albums.
+    const PAGE = 500;
+    const seen = new Set<string>();
+    for (let offset = 0; ; offset += PAGE) {
+      const { results } = await this.subsonic.getAlbumList2(this.credentials, {
+        _index: offset,
+        _count: PAGE,
+        type: "alphabeticalByArtist",
+      });
+      results.forEach((album) => seen.add(album.year || "?"));
+      if (results.length < PAGE) break;
+    }
+    return [...seen]
+      .sort()
+      .map((year) => ({ ...asYear(year) }))
+      .reverse();
   };
 }
