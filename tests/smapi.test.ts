@@ -2849,6 +2849,51 @@ describe("wsdl api", () => {
               });
             });
 
+            describe("search paging contract", () => {
+              // Measured from the real app: it sends count=20 on the search SUMMARY screen and
+              // count=50 when a category is EXPANDED, and always index=0 - it never pages. So
+              // returning everything meant the summary screen got 50 tiles when it asked for 20,
+              // and every surplus tile is a candidate art fetch across three categories. Slicing
+              // cannot lose expanded results, because expanding re-queries.
+              it("slices to the requested count and reports the true total", async () => {
+                musicLibrary.searchAlbums.mockResolvedValue(
+                  Array.from({ length: 50 }, () => anAlbumSummary())
+                );
+
+                const result = await ws.searchAsync({ id: "albums", term: "x", index: 0, count: 20 });
+
+                const res = (result[0] as any).searchResult;
+                expect(res.count).toEqual(20);
+                expect(res.index).toEqual(0);
+                expect(res.total).toEqual(50);
+              });
+
+              // THE regression trap: a client that omits count leaves it undefined, and a naive
+              // slice(index, index + undefined) is slice(0, NaN) = [] - every search would return
+              // nothing, which reads as "no results" rather than as a bug.
+              it("returns everything when the client omits index and count", async () => {
+                musicLibrary.searchAlbums.mockResolvedValue(
+                  Array.from({ length: 50 }, () => anAlbumSummary())
+                );
+
+                const result = await ws.searchAsync({ id: "albums", term: "x" });
+
+                expect((result[0] as any).searchResult.count).toEqual(50);
+              });
+
+              it("an index past the end is an empty page, not a wrap", async () => {
+                musicLibrary.searchAlbums.mockResolvedValue(
+                  Array.from({ length: 50 }, () => anAlbumSummary())
+                );
+
+                const result = await ws.searchAsync({ id: "albums", term: "x", index: 500, count: 10 });
+
+                const res = (result[0] as any).searchResult;
+                expect(res.count).toEqual(0);
+                expect(res.total).toEqual(50);
+              });
+            });
+
             describe("asking for random albums", () => {
                 const randomAlbums = [pop2, rock1, pop1];
 

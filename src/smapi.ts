@@ -883,8 +883,6 @@ function bindSmapiSoapServiceToExpress(
               `getMediaMetadata:${id}`
             ),
           search: async (
-            // index/count are read for LOGGING ONLY here. Honouring them is a separate change
-            // (wip/search-paging) whose safety case is an observation from the real app.
             { id, term, index, count }: {
               id: string;
               term: string;
@@ -909,28 +907,54 @@ function bindSmapiSoapServiceToExpress(
             logger.info(
               `SMAPI search: category=${sanitizeLogValue(id)} termLength=${(term ?? "").length} index=${index ?? "-"} count=${count ?? "-"}`
             );
+
+            // Honour the index/count Sonos sends. Measured from the real app: it asks for count=20
+            // on the search SUMMARY screen and count=50 when a category is EXPANDED, and always
+            // index=0 - it never pages. So the summary screen was being handed 50 tiles when it
+            // asked for 20, and every surplus tile is a candidate art fetch across three
+            // categories. Slicing cannot lose expanded results, because expanding re-queries.
+            //
+            // `total` stays the number we HOLD, not the number returned: reporting the slice length
+            // would tell the app the search matched only 20 things. Missing or zero paging means
+            // "everything held" - a client that omits count leaves it undefined, and a naive
+            // slice(index, index + undefined) is slice(0, NaN) = [], which would make every search
+            // look like it matched nothing.
+            const pageOf = <T>(items: T[]): { page: T[]; index: number; total: number } => {
+              const from = Number.isFinite(index) && (index as number) > 0 ? (index as number) : 0;
+              const take =
+                Number.isFinite(count) && (count as number) > 0
+                  ? (count as number)
+                  : items.length;
+              return { page: items.slice(from, from + take), index: from, total: items.length };
+            };
             return withTimeout(login(findLoginToken(soapyHeaders, headers))
               .then(withSplitId(id))
               .then(async ({ musicLibrary, apiKey }) => {
                 switch (id) {
                   case "albums":
-                    return musicLibrary.searchAlbums(term).then((it) =>
-                      searchResult({
-                        count: it.length,
-                        mediaCollection: it.map((albumSummary) =>
+                    return musicLibrary.searchAlbums(term).then((it) => {
+                      // Slice the SUMMARIES before building tiles: no point constructing tiles,
+                      // and advertising their art, only to discard them.
+                      const { page, index: from, total } = pageOf(it);
+                      return searchResult({
+                        mediaCollection: page.map((albumSummary) =>
                           album(urlWithToken(apiKey), albumSummary)
                         ),
-                      })
-                    );
+                        index: from,
+                        total,
+                      });
+                    });
                   case "artists":
-                    return musicLibrary.searchArtists(term).then((it) =>
-                      searchResult({
-                        count: it.length,
-                        mediaCollection: it.map((artistSummary) =>
+                    return musicLibrary.searchArtists(term).then((it) => {
+                      const { page, index: from, total } = pageOf(it);
+                      return searchResult({
+                        mediaCollection: page.map((artistSummary) =>
                           artist(urlWithToken(apiKey), artistSummary)
                         ),
-                      })
-                    );
+                        index: from,
+                        total,
+                      });
+                    });
                   case "tracks":
                     return musicLibrary.searchTracks(term).then((it) =>
                       // The Songs category must return SONGS. This used to collapse every track hit
@@ -945,12 +969,16 @@ function bindSmapiSoapServiceToExpress(
                       // albums; distinct songs are legitimately distinct tiles. Coalescing still
                       // holds because tracks from one album carry the same server-returned coverArt
                       // value, so they share a single /art url and a single coordinator key.
-                      searchResult({
-                        count: it.length,
-                        mediaMetadata: it.map((track) =>
-                          topSongMetadata(urlWithToken(apiKey), track)
-                        ),
-                      })
+                      ((): SearchResponse => {
+                        const { page, index: from, total } = pageOf(it);
+                        return searchResult({
+                          mediaMetadata: page.map((track) =>
+                            topSongMetadata(urlWithToken(apiKey), track)
+                          ),
+                          index: from,
+                          total,
+                        });
+                      })()
                     );
                   default:
                     // The TERM is the user's own data and is logged length-only, exactly as the successful
