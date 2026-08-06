@@ -650,14 +650,40 @@ function bindSmapiSoapServiceToExpress(
   // next index rebuild instead.
   const lastUpdate = new LastUpdate(clock);
 
+  // Maps a full-scope api key to its ART-SCOPED sibling, so art URLs never carry a key that can
+  // also stream. One entry is minted per auth() - i.e. per SOAP call - and nothing ever removed
+  // them, so the map grew for the life of the process. Bounded LRU: entries are only needed while
+  // the api key they describe is still valid (api keys expire after the auth timeout anyway), and
+  // an evicted entry is re-minted by the next auth() rather than lost.
+  const MAX_ART_KEY_MAPPINGS = 5_000;
   const artApiKeysByApiKey = new Map<string, string>();
 
-  const urlWithToken = (accessToken: string) =>
-    bonobUrl.append({
+  const rememberArtKey = (apiKey: string, artApiKey: string) => {
+    artApiKeysByApiKey.set(apiKey, artApiKey);
+    while (artApiKeysByApiKey.size > MAX_ART_KEY_MAPPINGS) {
+      const oldest = artApiKeysByApiKey.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      artApiKeysByApiKey.delete(oldest);
+    }
+  };
+
+  const urlWithToken = (accessToken: string) => {
+    const artKey = artApiKeysByApiKey.get(accessToken);
+    // NEVER fall back to the unscoped key. That fallback would silently embed a STREAM-capable
+    // token into every art URL - and art URLs are the ones that end up in logs, caches and proxy
+    // access records. auth() always populates the mapping first, so a miss means the entry was
+    // evicted or something is wrong; failing loudly is correct for a scope-isolation invariant.
+    if (!artKey) {
+      throw new Error(
+        "No art-scoped key for this api key: refusing to emit an art URL carrying a stream-capable token"
+      );
+    }
+    return bonobUrl.append({
       searchParams: {
-        bat: artApiKeysByApiKey.get(accessToken) ?? accessToken,
+        bat: artKey,
       },
     });
+  };
 
   const auth = (loginToken?: string): E.Either<ToSmapiFault, Auth> => {
     const tokenFrom = E.fromNullable(new MissingLoginTokenError());
@@ -675,7 +701,7 @@ function bindSmapiSoapServiceToExpress(
       ),
       E.map(({ serviceToken }) => {
         const apiKey = apiKeys.mint(serviceToken);
-        artApiKeysByApiKey.set(
+        rememberArtKey(
           apiKey,
           apiKeys.mint(scopedApiTokenPayload("art", serviceToken))
         );

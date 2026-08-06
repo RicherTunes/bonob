@@ -430,15 +430,31 @@ function server(
     if (!serviceToken) {
       return res.status(401).send();
     } else {
+      // Validate the body BEFORE touching it. `(req.body as TimePlayed).items` and `new URL(...)`
+      // both throw on anything unexpected, and this route has no catch of its own, so a malformed
+      // report reached Express's default error handler - which, before NODE_ENV=production, meant
+      // a full stack trace in the response. A cast is not a check.
+      const items = Array.isArray((req.body as TimePlayed | undefined)?.items)
+        ? (req.body as TimePlayed).items
+        : [];
       return musicService
         .login(serviceToken)
         .then(musicLibrary => {
-          const scrobbles = (req.body as TimePlayed).items
-            .filter(it => it.type == 'final')
-            .map(({ mediaUrl, durationPlayedMillis }) => ({
-              ...splitId(decodeURIComponent(new URL(mediaUrl).pathname).split(".")[0]!),
-              durationPlayedMillis
-            }))
+          const scrobbles = items
+            .filter((it) => it && it.type == 'final' && typeof it.mediaUrl === "string")
+            .flatMap(({ mediaUrl, durationPlayedMillis }) => {
+              try {
+                return [{
+                  ...splitId(decodeURIComponent(new URL(mediaUrl).pathname).split(".")[0]!),
+                  durationPlayedMillis,
+                }];
+              } catch {
+                // One unparseable mediaUrl must not sink the whole report: Sonos batches several
+                // items per call, and the others are still worth scrobbling.
+                logger.warn("Ignoring an unparseable mediaUrl in a timePlayed report");
+                return [];
+              }
+            })
             .map(({ type, typeId, durationPlayedMillis }) => {
               return type == "track" ? ({ trackId: typeId, durationPlayedMillis }) : null
             })
@@ -457,7 +473,12 @@ function server(
         })
         .then(it => res.status(200).json({ 
           scrobbled: it.filter(scrobble => scrobble.scrobbled).length 
-        }));
+        }))
+        .catch((e) => {
+          // No catch here meant any backend failure fell through to Express's default handler.
+          logger.warn(`timePlayed report failed: ${describeReason(e)}`);
+          return res.status(500).send();
+        });
     }
   }),
 
@@ -465,10 +486,23 @@ function server(
     const id = req.params["id"]!;
     const trace = uuid();
     
+    // Redact by ALLOW-LIST, not by naming the one header we remembered. The old version dumped
+    // every header with only `authorization` masked, so a cookie, a proxy-auth header, or a stray
+    // ?bat= access token in the query string all landed in the log verbatim. Debug level is not a
+    // defence: whoever turns it on to diagnose a streaming problem is exactly who ends up with a
+    // credential in a file.
+    const SAFE_STREAM_HEADERS = ["range", "user-agent", "accept", "accept-encoding", "connection"];
     logger.debug(
-      `${trace} bnb<- ${req.method} ${req.path}?${JSON.stringify(
-        req.query
-      )}, headers=${JSON.stringify({ ...req.headers, "authorization": "*****" })}`
+      `${trace} bnb<- ${req.method} ${sanitizeLogValue(
+        redactAccessTokenFromUrl(req.originalUrl)
+      )}, headers=${JSON.stringify(
+        Object.fromEntries(
+          SAFE_STREAM_HEADERS.filter((h) => req.headers[h] !== undefined).map((h) => [
+            h,
+            sanitizeLogValue(String(req.headers[h])),
+          ])
+        )
+      )}`
     );
 
     const serviceToken = pipe(

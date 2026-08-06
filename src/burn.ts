@@ -68,7 +68,15 @@ export const deriveBurnSalt = (secret: string | undefined): string =>
     : generateRandomString(32);
 
 export const BURN_SALT = deriveBurnSalt(process.env["BNB_SECRET"]);
-const encryptor = jwsEncryption(BURN_SALT);
+
+// NOT ENCRYPTION. jwsEncryption produces an HS256 JWS: the payload rides in PLAINTEXT base64url
+// and anyone holding the URL can read it. What it provides is INTEGRITY - we can tell that a burn
+// we are asked to resolve is one we minted, which is what the allowExternal decision below turns
+// on. The wire value stays "encrypted" (its shorthand `x` is embedded in art URLs Sonos already
+// holds, so renaming it would break burns in flight), but nothing here should be read as implying
+// confidentiality: today the payload is a Deezer artist name or an image URL, and it must stay
+// the kind of thing that is safe to publish in a URL.
+const signer = jwsEncryption(BURN_SALT);
 
 export const format = (
   burn: BUrn,
@@ -85,7 +93,7 @@ export const format = (
   if(o.encrypt) {
     const encryptedToBurn = {
       system: "encrypted",
-      resource: encryptor.encrypt(BURN.format(toBurn))
+      resource: signer.encrypt(BURN.format(toBurn))
     }
     return format(encryptedToBurn, { ...opts, encrypt: false })
   } else {
@@ -111,17 +119,18 @@ export const parse = (burn: string, opts: { allowExternal?: boolean } = {}): BUr
   };
   if(x.system == "encrypted") {
     return pipe(
-      encryptor.decrypt(x.resource),
+      signer.decrypt(x.resource),
       E.match(
         (err) => { throw new Error(err) },
-        // Content that arrived inside a signature-verified encrypted wrapper is
-        // trusted, so an external image URL is only honoured on this path.
+        // Content that arrived inside a SIGNATURE-VERIFIED wrapper is trusted - we minted it -
+        // so an external image URL is only honoured on this path. The wrapper is signed, not
+        // encrypted; the trust comes from the signature, not from secrecy.
         (z) => parse(z, { allowExternal: true })
       )
     );
   } else if ((x.system == "external" || x.system == "deezer") && !opts.allowExternal) {
     // A client-supplied (unsigned) external/deezer burn would let the /art handler
-    // fetch/resolve on a client's behalf. Only accept these via the encrypted (signed) path.
+    // fetch/resolve on a client's behalf. Only accept these via the SIGNED path.
     throw new Error(`Refusing to resolve an unsigned ${x.system} burn: '${burn}'`);
   } else {
     return x;
