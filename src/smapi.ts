@@ -40,6 +40,7 @@ import {
 import { readAlbumIndexPage, readAlbumIndexAll } from "./album_snapshot";
 import { MAX_ARTISTS_FLAT } from "./artist_index";
 import { withTimeout, withDeadline, SMAPI_BROWSE_TIMEOUT_MS, faultOrFallback } from "./timeout";
+import { LastUpdate } from "./last_update";
 import { randomInt } from "./random";
 import {
   isExpiredTokenError,
@@ -644,6 +645,11 @@ function bindSmapiSoapServiceToExpress(
 ) {
   const sonosSoap = new SonosSoap(bonobUrl, linkCodes, smapiAuthTokens, clock);
 
+  // Change stamps for getLastUpdate. Bumped by the mutations bonob can actually observe (a rating,
+  // a playlist edit); a scan done directly in Navidrome is invisible to us and is picked up on the
+  // next index rebuild instead.
+  const lastUpdate = new LastUpdate(clock);
+
   const artApiKeysByApiKey = new Map<string, string>();
 
   const urlWithToken = (accessToken: string) =>
@@ -724,11 +730,15 @@ function bindSmapiSoapServiceToExpress(
             sonosSoap.reportAccountAction({ type }),
           getDeviceAuthToken: ({ linkCode }: { linkCode: string }) =>
             sonosSoap.getDeviceAuthToken({ linkCode }),
+          // Sonos compares these stamps against what it last saw; a CHANGED stamp orders a
+          // re-fetch. Returning now() for both claimed the catalog AND the favourites had changed
+          // on every 60s poll, forever - a standing re-browse and re-art-fetch order against a
+          // 113k-album catalog, issued by the bridge whose caching exists to absorb that load.
           getLastUpdate: () => ({
             getLastUpdateResult: {
               autoRefreshEnabled: true,
-              favorites: clock.now().unix(),
-              catalog: clock.now().unix(),
+              favorites: lastUpdate.favourites(),
+              catalog: lastUpdate.catalog(),
               pollInterval: 60,
             },
           }),
@@ -1964,21 +1974,28 @@ function bindSmapiSoapServiceToExpress(
                   .createPlaylist(title)
                   .then((playlist) => ({ playlist, musicLibrary }))
               )
-              .then(({ musicLibrary, playlist }) => {
+              .then(async ({ musicLibrary, playlist }) => {
+                // AWAIT the seed add. Unawaited, a transient Subsonic failure here was an
+                // unhandled rejection - which Node 20+ turns into process exit - and Sonos was
+                // told the container was created with its seed track before the add had even been
+                // attempted, so a re-browse showed an empty playlist.
                 if (seedId) {
-                  musicLibrary.addToPlaylist(
+                  await musicLibrary.addToPlaylist(
                     playlist.id,
                     seedId.split(":")[1]!
                   );
                 }
                 return playlist;
               })
-              .then((it) => ({
-                createContainerResult: {
-                  id: `playlist:${it.id}`,
-                  updateId: "",
-                },
-              })),
+              .then((it) => {
+                lastUpdate.bumpCatalog();
+                return {
+                  createContainerResult: {
+                    id: `playlist:${it.id}`,
+                    updateId: "",
+                  },
+                };
+              }),
           deleteContainer: async (
             { id }: { id: string },
             _,
@@ -1987,7 +2004,10 @@ function bindSmapiSoapServiceToExpress(
           ) =>
             login(findLoginToken(soapyHeaders, headers))
               .then(({ musicLibrary }) => musicLibrary.deletePlaylist(id))
-              .then((_) => ({ deleteContainerResult: {} })),
+              .then((_) => {
+                lastUpdate.bumpCatalog();
+                return { deleteContainerResult: {} };
+              }),
           addToContainer: async (
             { id, parentId }: { id: string; parentId: string },
             _,
@@ -1999,7 +2019,10 @@ function bindSmapiSoapServiceToExpress(
               .then(({ musicLibrary, typeId }) =>
                 musicLibrary.addToPlaylist(parentId.split(":")[1]!, typeId)
               )
-              .then((_) => ({ addToContainerResult: { updateId: "" } })),
+              .then((_) => {
+                lastUpdate.bumpCatalog();
+                return { addToContainerResult: { updateId: "" } };
+              }),
           removeFromContainer: async (
             { id, indices }: { id: string; indices: string },
             _,
@@ -2012,18 +2035,29 @@ function bindSmapiSoapServiceToExpress(
                 ...it,
                 indices: indices.split(",").map((it) => +it),
               }))
-              .then(({ musicLibrary, typeId, indices }) => {
+              .then(async ({ musicLibrary, typeId, indices }) => {
+                // AWAIT the whole chain. None of this was awaited or caught: a transient failure
+                // was an unhandled rejection (process exit on Node 20+), and Sonos was told the
+                // removal succeeded before it had been attempted - so the immediate re-browse,
+                // now served from the playlist cache, showed the track still there.
                 if (id == "playlists") {
-                  musicLibrary.playlists().then((it) => {
-                    indices.forEach((i) => {
-                      musicLibrary.deletePlaylist(it[i]?.id!);
-                    });
-                  });
+                  const all = await musicLibrary.playlists();
+                  // Delete by id resolved BEFORE any deletion, because deleting shifts the
+                  // positions the remaining indices refer to.
+                  const doomed = indices
+                    .map((i) => all[i]?.id)
+                    .filter((it): it is string => !!it);
+                  for (const playlistId of doomed) {
+                    await musicLibrary.deletePlaylist(playlistId);
+                  }
                 } else {
-                  musicLibrary.removeFromPlaylist(typeId, indices);
+                  await musicLibrary.removeFromPlaylist(typeId, indices);
                 }
               })
-              .then((_) => ({ removeFromContainerResult: { updateId: "" } })),
+              .then((_) => {
+                lastUpdate.bumpCatalog();
+                return { removeFromContainerResult: { updateId: "" } };
+              }),
 
           rateItem: async (
             { id, rating }: { id: string; rating: number },
@@ -2036,7 +2070,13 @@ function bindSmapiSoapServiceToExpress(
               .then(({ musicLibrary, typeId }) =>
                 musicLibrary.rate(typeId, ratingFromInt(Math.abs(rating)))
               )
-              .then((_) => ({ rateItemResult: { shouldSkip: false } })),
+              .then((ok) => {
+                // Tell Sonos the favourites view is stale ONLY when it actually is. rate() reports
+                // false on failure (and logs why), and bumping on a failed write would order a
+                // pointless re-fetch of an unchanged list.
+                if (ok) lastUpdate.bumpFavourites();
+                return { rateItemResult: { shouldSkip: false } };
+              }),
 
           setPlayedSeconds: async (
             { id, seconds }: { id: string; seconds: string },

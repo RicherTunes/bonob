@@ -812,8 +812,11 @@ describe("server", () => {
           mint: jest.fn(),
           authTokenFor: jest.fn(),
         };
+        // now() must actually return a Dayjs: getLastUpdate seeds its change stamps from the
+        // clock when the SMAPI binding is constructed, so a stub returning undefined fails the
+        // whole suite at setup rather than in a test.
         const clock = {
-          now: jest.fn(),
+          now: jest.fn().mockReturnValue(dayjs()),
         };
 
         [

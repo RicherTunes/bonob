@@ -1053,25 +1053,26 @@ describe("wsdl api", () => {
         });
 
         describe("getLastUpdate", () => {
-          it("should return a result with some timestamps", async () => {
-            const now = dayjs();
-            clock.time = now;
-
+          // Sonos compares these stamps against what it last saw; a CHANGED stamp orders a
+          // re-fetch. They used to be clock.now(), so every 60s poll claimed the catalog AND the
+          // favourites had changed - a standing re-browse and re-art-fetch order against a
+          // 113k-album library. They must now be STABLE while nothing changes.
+          it("returns stamps that do not move when nothing has changed", async () => {
             const ws = await createClientAsync(`${service.uri}?wsdl`, {
               endpoint: service.uri,
               httpClient: supersoap(server),
             });
 
-            const result = await ws.getLastUpdateAsync({});
+            const first = await ws.getLastUpdateAsync({});
+            // advance well past a poll interval
+            clock.time = dayjs().add(10, "minutes");
+            const second = await ws.getLastUpdateAsync({});
 
-            expect(result[0]).toEqual({
-              getLastUpdateResult: {
-                autoRefreshEnabled: true,
-                favorites: `${now.unix()}`,
-                catalog: `${now.unix()}`,
-                pollInterval: 60,
-              },
-            });
+            expect(second[0]).toEqual(first[0]);
+            expect(first[0].getLastUpdateResult.autoRefreshEnabled).toEqual(true);
+            expect(first[0].getLastUpdateResult.pollInterval).toEqual(60);
+            expect(first[0].getLastUpdateResult.favorites).toMatch(/^\d+$/);
+            expect(first[0].getLastUpdateResult.catalog).toMatch(/^\d+$/);
           });
         });
 
