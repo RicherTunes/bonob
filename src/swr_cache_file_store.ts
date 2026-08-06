@@ -33,6 +33,10 @@ export function fileStore(
   // Seeded high so the FIRST save prunes: a restart should reclaim whatever the previous run left.
   let savesSincePrune = Number.MAX_SAFE_INTEGER;
 
+  // Background writes, chained per key. See save().
+  const writesInFlight = new Map<string, Promise<void>>();
+  let tmpCounter = 0;
+
   const listByNewest = (): { path: string; size: number }[] => {
     let names: string[];
     try {
@@ -86,43 +90,60 @@ export function fileStore(
     },
 
     save(key, at, value) {
+      // ASYNCHRONOUS on purpose. This used to be writeFileSync, on the event loop, and the browse
+      // cache holds multi-megabyte entries (a 5.2MB file on the live library). When the disk was
+      // saturated by a Navidrome library scan, one such write blocked the whole process: bonob sat
+      // at 0% CPU while EVERY handler breached its 4500ms deadline, including getMetadata:root,
+      // which makes no upstream call at all. Persistence must never be able to stall serving.
       const file = fileFor(key);
-      const tmp = `${file}.${process.pid}.tmp`;
-      try {
-        fs.writeFileSync(tmp, JSON.stringify({ key, at, value }));
-        fs.renameSync(tmp, file); // atomic replace
-      } catch (e) {
+
+      // Writes for one key are chained rather than run concurrently: a shared temp name meant two
+      // in-flight saves of the same key wrote the SAME temp file and renamed it twice, which
+      // interleaved can publish a truncated document. The name is unique now AND the chain keeps
+      // last-write-wins ordering.
+      const previous = writesInFlight.get(key) ?? Promise.resolve();
+      const run = previous.then(async () => {
+        const tmp = `${file}.${process.pid}.${tmpCounter++}.tmp`;
         try {
-          fs.rmSync(tmp, { force: true });
-        } catch {
-          /* ignore cleanup failure */
-        }
-        logger.warn(`SwrCache file store: could not persist ${key}: ${e}`);
-        return;
-      }
-      // Bound the directory - but NOT on every save. listByNewest() is a readdirSync plus a
-      // statSync of every file in the directory, and running it per persisted value meant a browse
-      // storm paid a full directory scan for each cache entry it populated, synchronously, on the
-      // event loop, while SOAP handlers race a 4500ms deadline.
-      //
-      // The bound is a disk-space guard, not a correctness invariant: being a few files over it
-      // between prunes costs nothing. Throttling turns per-save O(files) into O(1) amortised.
-      // Prune once per maxFiles saves rather than on every save. That is O(1) amortised per save
-      // instead of O(files), and it still BOUNDS the directory: at most maxFiles new files can
-      // accumulate between prunes, so the directory never exceeds 2x maxFiles. A time-based
-      // throttle would have been simpler but gives no bound at all under a write storm, which is
-      // exactly when the bound matters.
-      savesSincePrune += 1;
-      if (savesSincePrune >= maxFiles) {
-        savesSincePrune = 0;
-        for (const { path: p } of listByNewest().slice(maxFiles)) {
+          await fs.promises.writeFile(tmp, JSON.stringify({ key, at, value }));
+          await fs.promises.rename(tmp, file); // atomic replace
+        } catch (e) {
           try {
-            fs.rmSync(p, { force: true });
+            await fs.promises.rm(tmp, { force: true });
           } catch {
-            /* best-effort */
+            /* ignore cleanup failure */
+          }
+          logger.warn(`SwrCache file store: could not persist ${key}: ${e}`);
+          return;
+        }
+        // Bound the directory - but NOT on every save. listByNewest() is a directory scan plus a
+        // stat of every file, and running it per persisted value meant a browse storm paid a full
+        // directory scan for each cache entry it populated.
+        //
+        // The bound is a disk-space guard, not a correctness invariant: being a few files over it
+        // between prunes costs nothing. Prune once per maxFiles saves rather than on every save.
+        // That is O(1) amortised per save instead of O(files), and it still BOUNDS the directory:
+        // at most maxFiles new files accumulate between prunes, so it never exceeds 2x maxFiles.
+        savesSincePrune += 1;
+        if (savesSincePrune >= maxFiles) {
+          savesSincePrune = 0;
+          for (const { path: p } of listByNewest().slice(maxFiles)) {
+            try {
+              await fs.promises.rm(p, { force: true });
+            } catch {
+              /* best-effort */
+            }
           }
         }
-      }
+      });
+
+      // The chain must never reject (that would be an unhandled rejection on a background write)
+      // and must not retain finished entries.
+      const settled = run.catch(() => {}).finally(() => {
+        if (writesInFlight.get(key) === settled) writesInFlight.delete(key);
+      });
+      writesInFlight.set(key, settled);
+      return settled;
     },
   };
 }

@@ -54,4 +54,23 @@ export class LastUpdate {
   bumpFavourites = () => {
     this.favouritesAt = this.tick(this.favouritesAt);
   };
+
+  // Whether a "still loading" placeholder has been served since the last time real content was
+  // reported. A cold start serves placeholders while the index builds, and the stamp seeded at
+  // construction is consumed by the poll that FETCHES those placeholders - after which nothing
+  // moves the catalog stamp again (the first index build after a restart only establishes the
+  // fingerprint baseline). Sonos would then hold the placeholder view with no eviction trigger.
+  private placeholderServed = false;
+
+  notePlaceholderServed = () => {
+    this.placeholderServed = true;
+  };
+
+  // Real content is being served where a placeholder was before, so tell Sonos to re-read - once
+  // per episode, not on every subsequent browse.
+  noteContentReady = () => {
+    if (!this.placeholderServed) return;
+    this.placeholderServed = false;
+    this.bumpCatalog();
+  };
 }

@@ -321,8 +321,9 @@ describe("SwrCache", () => {
     const saved: Array<{ key: string; at: number; value: unknown }> = [];
     const store = {
       load: () => [],
-      save: (key: string, at2: number, value: unknown) =>
-        saved.push({ key, at: at2, value }),
+      save: (key: string, at2: number, value: unknown) => {
+        saved.push({ key, at: at2, value });
+      },
     };
     const cache = new SwrCache(new FixedClock(at), 60_000, { store });
     const f = deferredFetcher<string>();
@@ -518,8 +519,9 @@ describe("SwrCache", () => {
     const saved: Array<{ key: string; value: unknown }> = [];
     const store = {
       load: () => [],
-      save: (key: string, _at2: number, value: unknown) =>
-        saved.push({ key, value }),
+      save: (key: string, _at2: number, value: unknown) => {
+        saved.push({ key, value });
+      },
     };
     const cache = new SwrCache(new FixedClock(at), 60_000, {
       maxEntries: 1,

@@ -87,4 +87,45 @@ describe("LastUpdate", () => {
 
     expect(Number(lastUpdate.catalog())).toBeGreaterThan(seeded);
   });
+
+  // A cold restart serves "Loading, please try again..." placeholders while the index builds.
+  // LastUpdate seeds a fresh stamp at construction, so Sonos re-browses within one poll and gets
+  // the PLACEHOLDER - and the catalog stamp then never moves again, because the first index build
+  // after a restart deliberately only establishes the fingerprint baseline. So nothing ever tells
+  // Sonos the real content arrived. A confidently stale view with no eviction trigger is worse
+  // than a slow one.
+  it("bumps the catalog once when real content replaces a placeholder", () => {
+    const clock = new FixedClock(dayjs("2026-08-05T10:00:00Z"));
+    const lastUpdate = new LastUpdate(clock);
+    const before = lastUpdate.catalog();
+
+    lastUpdate.notePlaceholderServed();
+    lastUpdate.noteContentReady();
+
+    expect(lastUpdate.catalog()).not.toEqual(before);
+  });
+
+  it("does not bump when content was ready all along", () => {
+    const clock = new FixedClock(dayjs("2026-08-05T10:00:00Z"));
+    const lastUpdate = new LastUpdate(clock);
+    const before = lastUpdate.catalog();
+
+    lastUpdate.noteContentReady();
+    lastUpdate.noteContentReady();
+
+    expect(lastUpdate.catalog()).toEqual(before);
+  });
+
+  it("bumps only once per placeholder episode, not on every later browse", () => {
+    const clock = new FixedClock(dayjs("2026-08-05T10:00:00Z"));
+    const lastUpdate = new LastUpdate(clock);
+
+    lastUpdate.notePlaceholderServed();
+    lastUpdate.noteContentReady();
+    const afterRecovery = lastUpdate.catalog();
+    lastUpdate.noteContentReady();
+    lastUpdate.noteContentReady();
+
+    expect(lastUpdate.catalog()).toEqual(afterRecovery);
+  });
 });

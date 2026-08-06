@@ -1472,8 +1472,13 @@ function bindSmapiSoapServiceToExpress(
                     // advertise the whole-catalog artist total — the same S2 ceiling that forced albums
                     // into buckets). Cold -> kick the warm and return a bounded placeholder, exactly as
                     // the Albums branch does.
-                    const artistsPlaceholder = () =>
-                      getMetadataResult({
+                    const artistsPlaceholder = () => {
+                      // Record that a placeholder went out, so the transition BACK to real content
+                      // can tell Sonos to re-read it. Without that, a cold start serves this tile,
+                      // Sonos caches it, and the catalog stamp never moves again (the first index
+                      // build after a restart only establishes the fingerprint baseline).
+                      lastUpdate.notePlaceholderServed();
+                      return getMetadataResult({
                         mediaCollection: [
                           {
                             itemType: "container",
@@ -1487,9 +1492,11 @@ function bindSmapiSoapServiceToExpress(
                         index: 0,
                         total: 1,
                       });
+                    };
                     const peekedArtists = musicLibrary.peekArtistIndex();
                     if (peekedArtists) {
                       return peekedArtists.then(async (idx) => {
+                        lastUpdate.noteContentReady();
                         // A catalog that shrank back under the cap can still serve flat from the index.
                         if (idx.total <= MAX_ARTISTS_FLAT) {
                           return getMetadataResult({

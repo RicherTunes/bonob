@@ -13,7 +13,11 @@ type Entry = {
 // value. Values are whatever the fetcher returns and must be JSON-serializable.
 export interface SwrCacheStore {
   load(): Array<{ key: string; at: number; value: unknown }>;
-  save(key: string, at: number, value: unknown): void;
+  // Returns void, or a promise that settles when the write lands. The file store writes
+  // asynchronously (a synchronous multi-MB write on the event loop stalled every SMAPI handler),
+  // so it returns a promise; callers on the serving path deliberately do NOT await it, but a
+  // shutdown or a test can.
+  save(key: string, at: number, value: unknown): void | Promise<void>;
 }
 
 /**
