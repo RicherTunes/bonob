@@ -428,6 +428,10 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   playlist = async (id: string) =>
     this.subsonic.playlist(this.credentials, id);
 
+  // Subsonic's updatePlaylist takes a name, so a rename is the same call the add/remove path uses.
+  renamePlaylist = async (id: string, name: string) =>
+    this.subsonic.updatePlaylist(this.credentials, id, { name });
+
   createPlaylist = async (name: string) =>
     this.subsonic.createPlayList(this.credentials, name);
 

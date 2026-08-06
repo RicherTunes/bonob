@@ -250,6 +250,9 @@ export interface MusicLibrary {
   playlists(): Promise<PlaylistSummary[]>;
   playlist(id: string): Promise<Playlist>;
   createPlaylist(name: string): Promise<PlaylistSummary>
+  // SMAPI's renameContainer. Subsonic's updatePlaylist takes a name, so this is the same call the
+  // add/remove path already uses.
+  renamePlaylist(id: string, name: string): Promise<boolean>
   deletePlaylist(id: string): Promise<boolean>
   addToPlaylist(playlistId: string, trackId: string): Promise<boolean>
   removeFromPlaylist(playlistId: string, indicies: number[]): Promise<boolean>

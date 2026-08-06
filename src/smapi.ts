@@ -481,6 +481,32 @@ export const iconArtURI = (bonobUrl: URLBuilder, icon: ICON, text: string | unde
 export const sonosifyMimeType = (mimeType: string) =>
   mimeType == "audio/x-flac" ? "audio/flac" : mimeType;
 
+// Formats a Sonos player decodes natively, so Navidrome's transcode decision returns canDirectPlay
+// and the response is a byte-range-seekable proxy of the original file.
+//
+// This is what `canSeek` (WSDL: trackMetadata) is keyed on, and the reason it is keyed on the mime
+// type rather than emitted unconditionally: the transcode decision is made PER TRACK at stream
+// time (subsonic_music_library.stream), long after the tile is built, and calling it per tile would
+// be an N+1 across a whole browse page. A transcoded stream's byte offsets do not map linearly to
+// time, so advertising seek on one invites a scrubber that lands in the wrong place - worse than no
+// scrubber. Keying on the format we KNOW direct-plays keeps the promise honest for the common case
+// and stays silent for the rest.
+const SONOS_NATIVELY_SEEKABLE_MIME_TYPES = new Set([
+  "audio/mpeg",
+  "audio/mp3",
+  "audio/flac",
+  "audio/x-flac",
+  "audio/mp4",
+  "audio/aac",
+  "audio/x-m4a",
+  "audio/wav",
+  "audio/x-wav",
+  "audio/ogg",
+]);
+
+export const canSeekMimeType = (mimeType: string | undefined): boolean =>
+  !!mimeType && SONOS_NATIVELY_SEEKABLE_MIME_TYPES.has(mimeType.toLowerCase());
+
 
 /* This doesnt seem to work on S2, only S1, ChatGPT seems to imply it has been deprecated
 even though there is no mention of that in the docs that i can find.
@@ -521,6 +547,7 @@ export const track = (bonobUrl: URLBuilder, track: Track) => ({
   title: track.name,
 
   trackMetadata: {
+    // canSeek is last in the trackMetadata xs:sequence; inSmapiOrder enforces that regardless.
     album: track.album.name,
     albumId: `album:${track.album.id}`,
     albumArtist: track.artist.name,
@@ -532,6 +559,7 @@ export const track = (bonobUrl: URLBuilder, track: Track) => ({
     genre: track.album.genre?.name,
     genreId: track.album.genre?.id,
     trackNumber: track.number,
+    canSeek: canSeekMimeType(track.encoding.mimeType)
   },
   dynamic: {
     property: [{ name: "rating", value: `${ratingAsInt(track.rating)}` }],
@@ -553,6 +581,7 @@ export const topSongMetadata = (bonobUrl: URLBuilder, t: TrackSummary) => ({
     genre: t.genre?.name,
     genreId: t.genre?.id,
     trackNumber: t.number,
+    canSeek: canSeekMimeType(t.encoding.mimeType)
   },
   dynamic: {
     property: [{ name: "rating", value: `${ratingAsInt(t.rating)}` }],
@@ -2122,6 +2151,46 @@ function bindSmapiSoapServiceToExpress(
                 lastUpdate.bumpCatalog();
                 return { removeFromContainerResult: { updateId: "" } };
               }),
+
+          // SMAPI's rename for a container. create/delete/addTo/removeFrom were all implemented and
+          // this was not, so renaming a playlist in the app returned a fault. Subsonic's
+          // updatePlaylist takes a name, so it is the same call the add/remove path already makes.
+          renameContainer: async (
+            { id, title }: { id: string; title: string },
+            _,
+            soapyHeaders: SoapyHeaders,
+            { headers }: Pick<Request, "headers">
+          ) =>
+            login(findLoginToken(soapyHeaders, headers))
+              .then(withSplitId(id))
+              .then(({ musicLibrary, typeId }) =>
+                musicLibrary.renamePlaylist(typeId, title)
+              )
+              .then((_) => {
+                lastUpdate.bumpCatalog();
+                return { renameContainerResult: {} };
+              }),
+
+          // How the PLAYER tells the service that a getMediaURI result failed to play. Unhandled it
+          // faulted and the reason was discarded - on a deployment whose entire debugging loop is
+          // reading logs, that is the one report worth never losing. The response is empty by
+          // contract; the value is entirely in the log line.
+          reportStatus: async ({
+            id,
+            errorCode,
+            message,
+          }: {
+            id: string;
+            errorCode: number;
+            message: string;
+          }) => {
+            logger.warn(
+              `Sonos reported a playback failure for ${sanitizeLogValue(
+                id
+              )}: errorCode=${sanitizeLogValue(String(errorCode))} ${sanitizeLogValue(message)}`
+            );
+            return {};
+          },
 
           rateItem: async (
             { id, rating }: { id: string; rating: number },

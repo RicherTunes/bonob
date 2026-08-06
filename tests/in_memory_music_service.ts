@@ -199,6 +199,7 @@ export class InMemoryMusicService implements MusicService {
       // than the cold placeholder.
       peekStarredSongs: () => Promise.resolve([]),
       artistTracks: async (_: string) => Promise.resolve([]),
+      renamePlaylist: async (_: string, __: string) => Promise.resolve(true),
       radioStations: async () => Promise.resolve([]),
       radioStation: async (_: string) => Promise.reject("Unsupported operation"),
       years: async () => Promise.resolve([]),

@@ -2742,7 +2742,7 @@ export class Subsonic {
     updatePlaylist = (
       credentials: Credentials, 
       playlistId: string, 
-      changes : Partial<{ songIdToAdd: string | undefined, songIndexToRemove: number[] | undefined }> = {}
+      changes : Partial<{ songIdToAdd: string | undefined, songIndexToRemove: number[] | undefined, name: string | undefined }> = {}
     ) => 
       this.getJSON<SubsonicResponse>(credentials, "/rest/updatePlaylist", {
         playlistId,

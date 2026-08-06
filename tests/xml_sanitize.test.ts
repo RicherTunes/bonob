@@ -1,4 +1,4 @@
-import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder, orderEmittedMedia } from "../src/smapi";
+import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder, orderEmittedMedia, canSeekMimeType } from "../src/smapi";
 
 // Build control characters at runtime; never place a literal control char in source.
 const ch = (n: number) => String.fromCharCode(n);
@@ -227,5 +227,24 @@ describe("orderEmittedMedia covers a bare media body", () => {
       "id",
       "itemType",
     ]);
+  });
+});
+
+describe("canSeek", () => {
+  // The Sonos progress bar is only draggable when the track advertises canSeek. It is keyed on the
+  // MIME TYPE rather than emitted unconditionally: the transcode decision is made per track at
+  // stream time, long after the tile is built, and a transcoded stream's byte offsets do not map
+  // linearly to time - so advertising seek on one gives a scrubber that lands in the wrong place,
+  // which is worse than no scrubber.
+  it("is true for formats Sonos decodes natively (so they direct-play)", () => {
+    for (const mime of ["audio/mpeg", "audio/flac", "audio/mp4", "audio/x-flac", "AUDIO/FLAC"]) {
+      expect(canSeekMimeType(mime)).toBe(true);
+    }
+  });
+
+  it("is false for anything that will be transcoded, and for junk", () => {
+    for (const mime of ["audio/x-ms-wma", "audio/opus", "audio/weird", "", undefined]) {
+      expect(canSeekMimeType(mime as any)).toBe(false);
+    }
   });
 });

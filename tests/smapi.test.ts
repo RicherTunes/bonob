@@ -23,6 +23,7 @@ import {
   artist,
   album,
   topSongMetadata,
+  canSeekMimeType,
   coverArtURI,
   searchResult,
   iconArtURI,
@@ -614,6 +615,7 @@ describe("track", () => {
         genre: someTrack.album.genre?.name,
         genreId: someTrack.album.genre?.id,
         trackNumber: someTrack.number,
+        canSeek: canSeekMimeType(someTrack.encoding.mimeType),
       },
       dynamic: {
         property: [
@@ -672,6 +674,7 @@ describe("track", () => {
           genre: someTrack.album.genre?.name,
           genreId: someTrack.album.genre?.id,
           trackNumber: someTrack.number,
+          canSeek: canSeekMimeType(someTrack.encoding.mimeType),
         },
         dynamic: {
           property: [
@@ -833,6 +836,7 @@ describe("wsdl api", () => {
     starredSongs: jest.fn(),
     peekStarredSongs: jest.fn(),
     artistTracks: jest.fn(),
+    renamePlaylist: jest.fn(),
     searchArtists: jest.fn(),
     searchAlbums: jest.fn(),
     searchTracks: jest.fn(),
@@ -2849,6 +2853,44 @@ describe("wsdl api", () => {
               });
             });
 
+            describe("renameContainer", () => {
+              // createContainer / deleteContainer / addToContainer / removeFromContainer were all
+              // implemented and rename was not, so renaming a playlist in the Sonos app got a SOAP
+              // fault. Subsonic's updatePlaylist takes a name, so this was missing plumbing rather
+              // than a missing capability.
+              it("renames the playlist", async () => {
+                musicLibrary.renamePlaylist.mockResolvedValue(true);
+
+                const result = await ws.renameContainerAsync({
+                  id: "playlist:pl-1",
+                  title: "Road trip 2",
+                });
+
+                // The WSDL declares renameContainerResult as an empty sequence, and node-soap
+                // deserialises an empty element as null rather than {}.
+                expect(result[0]).toEqual({ renameContainerResult: null });
+                expect(musicLibrary.renamePlaylist).toHaveBeenCalledWith("pl-1", "Road trip 2");
+              });
+            });
+
+            describe("reportStatus", () => {
+              // This is how the player tells the service that a getMediaURI result failed to play.
+              // Unhandled it faulted and the information was LOST - on a deployment whose entire
+              // debugging loop is reading logs. Logging it is the whole point.
+              it("accepts a playback failure report and logs it", async () => {
+                const result = await ws.reportStatusAsync({
+                  id: "track:t-1",
+                  errorCode: 404,
+                  message: "could not fetch",
+                });
+
+                // reportStatusResponse is an empty complexType in the WSDL, which node-soap
+                // deserialises as null. What matters is that it RESOLVES rather than faulting -
+                // the value of this operation is entirely in the log line it produces.
+                expect(result[0]).toBeNull();
+              });
+            });
+
             describe("search paging contract", () => {
               // Measured from the real app: it sends count=20 on the search SUMMARY screen and
               // count=50 when a category is EXPANDED, and always index=0 - it never pages. So
@@ -4278,6 +4320,7 @@ describe("wsdl api", () => {
                             track
                           ).href(),
                           trackNumber: track.number,
+                          canSeek: canSeekMimeType(track.encoding.mimeType),
                         },
                         dynamic: {
                           property: [
@@ -4326,6 +4369,7 @@ describe("wsdl api", () => {
                             track
                           ).href(),
                           trackNumber: track.number,
+                          canSeek: canSeekMimeType(track.encoding.mimeType),
                         },
                         dynamic: {
                           property: [
