@@ -41,10 +41,16 @@ export interface SwrCacheStore {
  * the backstop here only guarantees a fetcher-without-a-timeout can't wedge a key's
  * in-flight flag forever.
  */
+// Backoff for repeatedly-failing background warms: doubles per consecutive failure, capped.
+const WARM_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const WARM_BACKOFF_MAX_MS = 60 * 60 * 1000;
+
 export class SwrCache {
   private readonly entries = new Map<string, Entry>();
   private readonly maxEntries: number;
   private readonly maxStaleMs: number;
+  // Consecutive background-warm failures per key, for the backoff in warm().
+  private warmFailures = new Map<string, { at: number; count: number }>();
   private readonly backstopMs: number;
   private readonly store?: SwrCacheStore;
   private readonly revive: (v: unknown) => unknown;
@@ -129,15 +135,44 @@ export class SwrCache {
   // any in-flight one and refreshes if stale) and swallow errors. Used to pre-warm a slow
   // list (e.g. getArtists) on connect so the first browse of a session isn't cold.
   warm<T>(key: string, fetch: () => Promise<T>): void {
+    // Back off after a failure. Every SOAP request calls login(), which warms the artists list,
+    // the starred songs and the album index (a ~230-request full-catalog walk). A failed cold
+    // fetch DELETES its entry, so without this the next request restarts the whole scan - a tight
+    // serial retry loop aimed at a backend that is usually failing precisely because it is
+    // overloaded. Applies to the background kick only; a real get() is never held back, so
+    // serving behaviour is unchanged.
+    const failure = this.warmFailures.get(key);
+    if (failure) {
+      const waitMs = Math.min(
+        WARM_BACKOFF_BASE_MS * Math.pow(2, failure.count - 1),
+        WARM_BACKOFF_MAX_MS
+      );
+      if (this.clock.now().valueOf() - failure.at < waitMs) return;
+    }
+
     // Swallowing the REJECTION is required - an unhandled rejection here would crash the process.
     // Swallowing the INFORMATION is not. The album-index build runs through warm(), so a build that
     // threw left no trace at all: no error, no warning, and its .tmp cleaned up behind it. Observed
     // live - a rebuild started, died, and the only evidence was a missing snapshot eleven minutes
     // later. A background job that fails invisibly cannot be operated.
-    void this.get(key, fetch).catch((e) => {
-      const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-      logger.warn(`Background warm of '${key}' failed: ${reason}`);
-    });
+    void this.get(key, fetch).then(
+      () => {
+        this.warmFailures.delete(key);
+      },
+      (e) => {
+        const previous = this.warmFailures.get(key);
+        const count = (previous?.count ?? 0) + 1;
+        this.warmFailures.set(key, { at: this.clock.now().valueOf(), count });
+        const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+        const waitMs = Math.min(
+          WARM_BACKOFF_BASE_MS * Math.pow(2, count - 1),
+          WARM_BACKOFF_MAX_MS
+        );
+        logger.warn(
+          `Background warm of '${key}' failed (${count}x): ${reason}. Not retrying for ${Math.round(waitMs / 1000)}s.`
+        );
+      }
+    );
   }
 
   // Non-blocking read: return the entry's (already resolved) promise ONLY if a value has

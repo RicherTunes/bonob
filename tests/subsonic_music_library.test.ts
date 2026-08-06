@@ -2038,6 +2038,7 @@ describe("SubsonicMusicLibrary", () => {
       const customEncoding = {
         player: `bonob-${uuid()}`,
         mimeType: "transocodedMimeType",
+        transcoded: true,
       };
       const trackWithCustomPlayer: Track = {
         ...track,

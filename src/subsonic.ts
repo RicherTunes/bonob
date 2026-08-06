@@ -938,6 +938,23 @@ export const artistImageURN = (
   }
 };
 
+// FNV-1a, 32-bit. Folds record CONTENT into an index fingerprint so that a rebuild which changes
+// what the catalog holds without changing how MUCH it holds is still recognised as a change -
+// swapping an album for its remaster, retagging a genre, correcting an artist's spelling within
+// the same index letter. Counting alone was blind to every one of those. Cost is a few million
+// character operations against a scan already dominated by ~230 HTTP round trips.
+export const foldContent = (hash: number, value: string | undefined): number => {
+  if (!value) return hash;
+  let h = hash;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+};
+
+export const CONTENT_HASH_SEED = 2166136261;
+
 export const asTrackSummary = (
   song: song,
   customPlayers: CustomPlayers
@@ -1079,6 +1096,11 @@ export class TranscodingCustomPlayers implements CustomPlayers {
       O.map((transcodedMimeType) => ({
         player: `${DEFAULT_CLIENT_APPLICATION}+${mimeType}`,
         mimeType: transcodedMimeType,
+        // A custom player is configured precisely BECAUSE the delivered format differs from the
+        // source; when it is mapped to itself (`flac>flac`) nothing is re-encoded. asTrackSummary
+        // recomputes this against the source anyway, but the type must be honest here too, or a
+        // caller reading encodingFor directly would see an Encoding claiming direct play.
+        transcoded: transcodedMimeType !== mimeType,
       }))
     );
 }
@@ -1784,12 +1806,17 @@ export class Subsonic {
       const buckets: AlbumIndexBucket[] = [];
       let total = 0;
       let totalAlbumCount = 0;
+      let artistContentHash = CONTENT_HASH_SEED;
       try {
         await writer.open();
         for (const g of groups) {
           if (g.artist.length === 0) continue; // an empty letter group: no bucket, no items
           buckets.push({ key: g.name, label: g.name, offset: total, count: g.artist.length });
           for (const artist of g.artist) {
+            artistContentHash = foldContent(
+              foldContent(artistContentHash, artist.id),
+              artist.name
+            );
             await writer.write(artist);
             total++;
             // Navidrome may omit albumCount; NaN serializes as null and would make the ENTIRE
@@ -1810,7 +1837,10 @@ export class Subsonic {
         for (const b of buckets) Object.freeze(b);
         Object.freeze(buckets);
         Object.freeze(idx);
-        this.noteCatalogChanged("artists", `${total}:${totalAlbumCount}:${buckets.length}`);
+        this.noteCatalogChanged(
+          `artists:${credentials.username}`,
+          `${total}:${totalAlbumCount}:${buckets.length}:${artistContentHash}`
+        );
         return idx;
       } catch (e) {
         // A failed/aborted build drops the temp file so a half-written snapshot is never read as
@@ -1829,7 +1859,10 @@ export class Subsonic {
     // catalog changed, so it is where the getLastUpdate stamp has to move.
     this.noteCatalogChanged(
       "artists",
-      `${idx.total}:${idx.totalAlbumCount}:${idx.buckets.length}`
+      `${idx.total}:${idx.totalAlbumCount}:${idx.buckets.length}:${idx.items.reduce(
+        (h, a) => foldContent(foldContent(h, a.id), a.name),
+        CONTENT_HASH_SEED
+      )}`
     );
     return idx;
   };
@@ -1963,7 +1996,9 @@ export class Subsonic {
     if (writer) await writer.open();
     // One async write per album is fine: the writer buffers ~64 KiB internally, and the scan is
     // dominated by its (~N/500) HTTP round trips, not local I/O.
+    let contentHash = CONTENT_HASH_SEED;
     const ingest = async (album: AlbumSummary): Promise<void> => {
+      contentHash = foldContent(foldContent(contentHash, album.id), album.name);
       builder.append(album);
       if (album.year) yearsSet.add(album.year);
       if (writer) await writer.write(album);
@@ -2029,8 +2064,9 @@ export class Subsonic {
       if (writer) {
         const { snapshotFile, offsets } = await writer.finalize(builder.buckets, years);
         this.noteCatalogChanged(
-          "albums",
-          `${builder.total}:${builder.buckets.length}:${years.length}`
+          `albums:${credentials.username}`,
+          `${builder.total}:${builder.buckets.length}:${years.length}:${contentHash}`,
+          this.scanLooksComplete(`albums:${credentials.username}`, builder.total)
         );
         return {
           total: builder.total,
@@ -2044,8 +2080,9 @@ export class Subsonic {
       // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
     // catalog changed, so it is where the getLastUpdate stamp has to move.
     this.noteCatalogChanged(
-      "albums",
-      `${builder.total}:${builder.buckets.length}:${years.length}`
+      `albums:${credentials.username}`,
+      `${builder.total}:${builder.buckets.length}:${years.length}:${contentHash}`,
+      this.scanLooksComplete(`albums:${credentials.username}`, builder.total)
     );
     return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {
@@ -2084,16 +2121,70 @@ export class Subsonic {
   // Mirrors the favourites baseline semantics - the first build after a restart establishes the
   // fingerprint WITHOUT firing, because LastUpdate already seeds a fresh stamp at startup, so
   // firing here as well would just repeat it.
-  private noteCatalogChanged = (source: string, fingerprint: string) => {
-    const previous = this.lastCatalogFingerprint.get(source);
-    this.lastCatalogFingerprint.set(source, fingerprint);
+  // Last total accepted as trustworthy, per index and user, plus a total seen once and held as
+  // suspect. See scanLooksComplete.
+  private lastAcceptedTotal = new Map<string, number>();
+  private suspectTotal = new Map<string, number>();
+
+  // The paged getAlbumList2 walk detects duplicate ids but cannot see OMISSIONS: a delete during
+  // the multi-minute scan shifts every later offset, silently skipping albums with no duplicate
+  // and no short page to give it away. The truncated index then caches for 6 hours, and the
+  // fingerprint gate amplifies it - a wrong total fires a false "catalog changed", then a second
+  // spurious bump when the next good rebuild restores the real one.
+  //
+  // Cross-checking against getArtists was the obvious idea and it is WRONG. Measured on this
+  // library: sum(albumCount) over getArtists is 125,122 while the catalog holds 117,796 albums,
+  // because an album credited to several artists is counted once per artist. A 6.2% standing
+  // overcount would flag every healthy scan as suspect and permanently suppress the stamp.
+  //
+  // The previous accepted total is the sound comparison: it comes from the same source, so it has
+  // no cross-source drift, and real libraries do not lose a tenth of their catalog between scans.
+  // Two strikes, so a genuine mass deletion is accepted on its second consecutive sighting rather
+  // than being disbelieved forever.
+  private scanLooksComplete = (key: string, total: number): boolean => {
+    const previous = this.lastAcceptedTotal.get(key);
+    if (previous === undefined) {
+      this.lastAcceptedTotal.set(key, total);
+      return true; // nothing to compare against yet
+    }
+    if (previous - total <= Math.max(50, previous * 0.1)) {
+      this.lastAcceptedTotal.set(key, total);
+      this.suspectTotal.delete(key);
+      return true;
+    }
+    if (this.suspectTotal.get(key) === total) {
+      // the same reduced total twice running is a real deletion, not a truncated scan
+      this.lastAcceptedTotal.set(key, total);
+      this.suspectTotal.delete(key);
+      return true;
+    }
+    this.suspectTotal.set(key, total);
+    logger.warn(
+      `Album index scan looks truncated: ingested ${total} albums where the last good scan saw ${previous}. Serving it, but NOT reporting a catalog change - a truncated index would otherwise order Sonos to re-read the whole catalog twice. If the next scan agrees, it will be accepted.`
+    );
+    return false;
+  };
+
+  private noteCatalogChanged = (
+    source: string,
+    fingerprint: string,
+    // False when the scan that produced this index cannot be trusted to be complete. Such an
+    // index still SERVES (a suspect index beats a tile stuck on "Loading..."), but it must not
+    // claim the catalog changed, and it must not become the fingerprint baseline - otherwise it
+    // bumps once on its own wrong total and again when the next good rebuild restores the real
+    // one, ordering two full re-reads of a catalog that never changed.
+    trustworthy: boolean = true
+  ) => {
     // An index finished building. Announce that unconditionally: it is what lets a cold start
-    // replace its placeholders, and it must happen on the baseline build too.
+    // replace its placeholders, and it must happen on the baseline build and on a suspect one.
     try {
       this.onIndexBuilt();
     } catch {
       // a stamp is never worth breaking an index build over
     }
+    if (!trustworthy) return;
+    const previous = this.lastCatalogFingerprint.get(source);
+    this.lastCatalogFingerprint.set(source, fingerprint);
     if (previous === undefined || previous === fingerprint) return;
     try {
       this.onCatalogChanged();

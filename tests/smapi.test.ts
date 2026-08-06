@@ -577,7 +577,8 @@ describe("track", () => {
       // audio/x-flac should be mapped to audio/flac
       encoding: {
         player: "something",
-        mimeType: "audio/x-flac"
+        mimeType: "audio/x-flac",
+        transcoded: false,
       },
       name: "great song",
       duration: randomInt(1000),
@@ -636,8 +637,9 @@ describe("track", () => {
         // audio/x-flac should be mapped to audio/flac
         encoding: {
           player: "something",
-          mimeType: "audio/x-flac"
-        },
+          mimeType: "audio/x-flac",
+        transcoded: false,
+      },
         name: "great song",
         duration: randomInt(1000),
         number: randomInt(100),
@@ -2907,6 +2909,13 @@ describe("wsdl api", () => {
                   expect(mc.itemType).toEqual(tile.itemType);
                   expect(typeof mc.title).toEqual("string");
                 }
+              });
+
+              it("carries the userContent attribute the root menu advertises for playlists", async () => {
+                const result = await ws.getExtendedMetadataAsync({ id: "playlists" });
+                const mc = (result[0] as any).getExtendedMetadataResult.mediaCollection;
+                // userContent is an xs:attribute, so node-soap round-trips it as a string
+                expect(String(mc.attributes?.userContent)).toEqual("true");
               });
 
               it("still returns an empty result for an id it genuinely does not know", async () => {

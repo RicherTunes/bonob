@@ -19,6 +19,7 @@ jest.mock("axios", () => ({
   post: jest.fn(),
 }));
 
+import logger from "../src/logger";
 import * as random from "../src/random";
 jest.mock("../src/random");
 
@@ -302,10 +303,20 @@ describe("StreamClient(s)", () => {
       describe("when there is a match", () => {
         it("should return the match", () => {
           expect(customClients.encodingFor({ mimeType: "audio/flac" })).toEqual(
-            O.of({ player: "bonob+audio/flac", mimeType: "audio/flac" })
+            O.of({
+              player: "bonob+audio/flac",
+              mimeType: "audio/flac",
+              // mapped to itself: a custom PLAYER, but nothing is re-encoded
+              transcoded: false,
+            })
           );
           expect(customClients.encodingFor({ mimeType: "audio/mp3" })).toEqual(
-            O.of({ player: "bonob+audio/mp3", mimeType: "audio/ogg" })
+            O.of({
+              player: "bonob+audio/mp3",
+              mimeType: "audio/ogg",
+              // delivered as a different format than the source: a real transcode, so no seek
+              transcoded: true,
+            })
           );
         });
       });
@@ -793,7 +804,8 @@ describe("asTrack", () => {
           const customEncoding = {
             player: "custom-player",
             mimeType: "audio/some-mime-type",
-          };
+        transcoded: false,
+      };
           streamClient.encodingFor.mockReturnValue(O.of(customEncoding));
 
           const result = asTrack(
@@ -2223,7 +2235,8 @@ describe("Subsonic", () => {
           encoding: {
             player: "bonob",
             mimeType: "audio/alac",
-          },
+        transcoded: false,
+      },
           genre: hipHop,
           rating: {
             love: true,
@@ -2236,7 +2249,8 @@ describe("Subsonic", () => {
           encoding: {
             player: "bonob",
             mimeType: "audio/m4a",
-          },
+        transcoded: false,
+      },
           genre: hipHop,
           rating: {
             love: false,
@@ -2249,7 +2263,8 @@ describe("Subsonic", () => {
           encoding: {
             player: "bonob",
             mimeType: "audio/mp3",
-          },
+        transcoded: false,
+      },
           genre: tripHop,
           rating: {
             love: true,
@@ -2265,10 +2280,14 @@ describe("Subsonic", () => {
        beforeEach(() => {
           customPlayers.encodingFor
             .mockReturnValueOnce(
-              O.of({ player: "bonob+audio/alac", mimeType: "audio/flac" })
+              O.of({ player: "bonob+audio/alac", mimeType: "audio/flac",
+        transcoded: false,
+      })
             )
             .mockReturnValueOnce(
-              O.of({ player: "bonob+audio/m4a", mimeType: "audio/opus" })
+              O.of({ player: "bonob+audio/m4a", mimeType: "audio/opus",
+        transcoded: false,
+      })
             )
             .mockReturnValueOnce(O.none);
 
@@ -2854,7 +2873,9 @@ describe("TranscodingCustomPlayers.from: invalid configuration", () => {
   it("still parses a single untranscoded mapping (regression guard)", () => {
     const cp = TranscodingCustomPlayers.from("audio/flac");
     expect(cp.encodingFor({ mimeType: "audio/flac" })).toEqual(
-      O.of({ player: "bonob+audio/flac", mimeType: "audio/flac" })
+      O.of({ player: "bonob+audio/flac", mimeType: "audio/flac",
+        transcoded: false,
+      })
     );
   });
 });
@@ -3287,6 +3308,191 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     // re-browses when the catalog stamp moves, so hanging the signal off a browse handler made it
     // circular: the bump that would cause the browse was itself waiting for that browse. A cold
     // start therefore left Sonos holding "Loading, please try again..." with nothing to evict it.
+    // The scan detects duplicate ids but not OMISSIONS: a delete during the multi-minute walk
+    // shifts every later offset, so albums are silently skipped - no duplicate, no short page,
+    // complete=true - and the truncated index is cached for 6 hours. The fingerprint gate makes
+    // that worse rather than being neutral to it: a truncated index has a different total, so it
+    // fires a false "the catalog changed" and orders Sonos to re-read the whole catalog, then
+    // fires again when the next good rebuild restores the real total.
+    const albumScanHarness = (dir: string) => {
+      const artist = { id: "1", name: "AC/DC" };
+      let albumsToServe = 0;
+      mockGET.mockImplementation((u: string, opts: any) => {
+        if (String(u).includes("getAlbumList2")) {
+          // params may be a plain object or URLSearchParams depending on the call path
+          const prm: any = opts?.params;
+          const offset = Number(
+            (typeof prm?.get === "function" ? prm.get("offset") : prm?.offset) || 0
+          );
+          const remaining = Math.max(0, albumsToServe - offset);
+          const rows = Array.from({ length: Math.min(500, remaining) }, (_, i) =>
+            asAlbumJson(artist, {
+              ...anAlbum({ name: `Album ${offset + i}`, genre: undefined }),
+              id: `al-${offset + i}`,
+              tracks: [],
+            } as any)
+          );
+          return Promise.resolve(ok(subsonicOK({ albumList2: { album: rows } })));
+        }
+        return Promise.resolve(
+          ok(
+            subsonicOK({
+              artists: { index: [{ name: "A", artist: [{ ...artist, albumCount: 1 }] }] },
+            })
+          )
+        );
+      });
+      const subsonic = new Subsonic(
+        url,
+        NO_CUSTOM_PLAYERS,
+        undefined,
+        SwrCache.disabled(),
+        SwrCache.disabled(),
+        false,
+        {},
+        undefined,
+        dir
+      );
+      return {
+        subsonic,
+        serve: (n: number) => {
+          albumsToServe = n;
+        },
+      };
+    };
+
+    it("does not claim the catalog changed when a scan ingests far fewer albums than the last good one", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-trunc-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const { subsonic, serve } = albumScanHarness(dir);
+        const changes: number[] = [];
+        const built: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+        subsonic.onIndexBuilt = () => built.push(1);
+
+        serve(1000);
+        await subsonic.getAlbumIndex(credentials); // baseline
+        warn.mockClear();
+
+        serve(200); // a delete mid-scan silently skipped most of the catalog
+        await subsonic.getAlbumIndex(credentials);
+
+        expect(changes.length).toEqual(0);
+        // the placeholder-eviction signal must STILL fire: a suspect index beats a tile stuck
+        // on "Loading..." forever
+        expect(built.length).toBeGreaterThan(0);
+        expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
+          /truncated/i
+        );
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts a genuinely smaller catalog when a second scan agrees", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-real-delete-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const { subsonic, serve } = albumScanHarness(dir);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1000);
+        await subsonic.getAlbumIndex(credentials); // baseline
+
+        serve(200);
+        await subsonic.getAlbumIndex(credentials); // suspect, held
+        expect(changes.length).toEqual(0);
+
+        await subsonic.getAlbumIndex(credentials); // same total again: a real deletion
+        expect(changes.length).toEqual(1);
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not flag ordinary growth as a truncated scan", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-growth-"));
+      try {
+        const { subsonic, serve } = albumScanHarness(dir);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1000);
+        await subsonic.getAlbumIndex(credentials);
+
+        serve(1040); // a normal week of new albums
+        await subsonic.getAlbumIndex(credentials);
+
+        expect(changes.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // total:albumCount:buckets observes no record CONTENT, so the most ordinary library edit of
+    // all - swapping an album for its remaster, retagging a genre, fixing an artist's spelling
+    // within the same index letter - leaves the fingerprint identical and Sonos is never told.
+    it("reports a catalog change when albums are replaced rather than added", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-fp-content-"));
+      try {
+        const artist = { id: "1", name: "Radiohead" };
+        let titles = ["OK Computer", "Kid A"];
+        mockGET.mockImplementation((u: string, opts: any) => {
+          if (String(u).includes("getAlbumList2")) {
+            const prm: any = opts?.params;
+            const offset = Number(
+              (typeof prm?.get === "function" ? prm.get("offset") : prm?.offset) || 0
+            );
+            const rows =
+              offset === 0
+                ? titles.map((t) =>
+                    asAlbumJson(artist, {
+                      ...anAlbum({ name: t, genre: undefined }),
+                      id: `al-${t}`,
+                      tracks: [],
+                    } as any)
+                  )
+                : [];
+            return Promise.resolve(ok(subsonicOK({ albumList2: { album: rows } })));
+          }
+          return Promise.resolve(
+            ok(
+              subsonicOK({
+                artists: { index: [{ name: "R", artist: [{ ...artist, albumCount: 2 }] }] },
+              })
+            )
+          );
+        });
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          SwrCache.disabled(),
+          SwrCache.disabled(),
+          false,
+          {},
+          undefined,
+          dir
+        );
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        await subsonic.getAlbumIndex(credentials); // baseline
+
+        // a remaster replaces the original: same count, same letters, same years
+        titles = ["OK Computer OKNOTOK", "Kid A"];
+        await subsonic.getAlbumIndex(credentials);
+
+        expect(changes.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("announces that an index finished building, even on the FIRST build after a restart", async () => {
       const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-index-built-"));
       try {

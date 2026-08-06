@@ -75,7 +75,10 @@ export type Encoding = {
   mimeType: string,
   // True when that delivered type is not the source file's type, i.e. the stream will be produced
   // by a transcoder. Seeking is only honest on a direct-played file (see canSeekTrack).
-  transcoded?: boolean
+  // REQUIRED, not optional: canSeekTrack reads `!encoding.transcoded`, so an Encoding built
+  // anywhere that forgot the flag would silently claim seek on a transcoded stream - precisely
+  // the failure the flag exists to prevent. Required means tsc finds every such site.
+  transcoded: boolean
 }
 
 export type TrackSummary = {

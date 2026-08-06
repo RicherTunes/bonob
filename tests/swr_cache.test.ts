@@ -589,3 +589,71 @@ describe("peek marks the entry as recently used", () => {
     expect(cache.peek<string>("page:1")).toBeUndefined();
   });
 });
+describe("backoff after a failed background warm", () => {
+  // Every SOAP request calls login(), which fires warm() for the artists list, the starred songs
+  // AND the album index - a ~230-request full-catalog walk. A failed cold fetch deletes its entry,
+  // so the very next request starts the whole scan again. Against a backend that is failing
+  // BECAUSE it is overloaded, that is a tight serial retry loop aimed at the thing least able to
+  // absorb it, for as long as the failure lasts.
+  it("does not restart a failed warm immediately", async () => {
+    const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+    const cache = new SwrCache(clock, 60_000);
+    let attempts = 0;
+    const failing = () => {
+      attempts += 1;
+      return Promise.reject(new Error("backend overloaded"));
+    };
+
+    cache.warm("albumIndex", failing);
+    await flush();
+    expect(attempts).toEqual(1);
+
+    cache.warm("albumIndex", failing);
+    cache.warm("albumIndex", failing);
+    await flush();
+    expect(attempts).toEqual(1);
+  });
+
+  it("tries again once the backoff has elapsed", async () => {
+    const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+    const cache = new SwrCache(clock, 60_000);
+    let attempts = 0;
+    const failing = () => {
+      attempts += 1;
+      return Promise.reject(new Error("backend overloaded"));
+    };
+
+    cache.warm("albumIndex", failing);
+    await flush();
+    clock.time = dayjs("2026-08-06T10:30:00Z");
+    cache.warm("albumIndex", failing);
+    await flush();
+
+    expect(attempts).toEqual(2);
+  });
+
+  it("clears the backoff after a success so a recovered backend warms normally", async () => {
+    const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+    const cache = new SwrCache(clock, 60_000);
+    let attempts = 0;
+    let broken = true;
+    const sometimes = () => {
+      attempts += 1;
+      return broken ? Promise.reject(new Error("nope")) : Promise.resolve("ok");
+    };
+
+    cache.warm("k", sometimes);
+    await flush();
+    clock.time = dayjs("2026-08-06T10:30:00Z");
+    broken = false;
+    cache.warm("k", sometimes);
+    await flush();
+    expect(attempts).toEqual(2);
+
+    // a later warm of a now-healthy key must not be held back
+    cache.invalidate("k");
+    cache.warm("k", sometimes);
+    await flush();
+    expect(attempts).toEqual(3);
+  });
+});

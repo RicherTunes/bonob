@@ -504,14 +504,23 @@ export const iconArtURI = (bonobUrl: URLBuilder, icon: ICON, text: string | unde
 // bounded before logging. Long enough for any real player diagnostic.
 const MAX_REPORTED_STATUS_MESSAGE = 500;
 
-const KNOWN_CONTAINERS: Record<string, { itemType: ContainerType; title: string }> = {
+const KNOWN_CONTAINERS: Record<
+  string,
+  { itemType: ContainerType; title: string; attributes?: { userContent: boolean } }
+> = {
   artists: { itemType: "container", title: "Artists" },
   albums: { itemType: "albumList", title: "Albums" },
   randomAlbums: { itemType: "albumList", title: "Random" },
   favouriteAlbums: { itemType: "albumList", title: "Favourites" },
   favouriteSongs: { itemType: "trackList", title: "Favourite Songs" },
   starredAlbums: { itemType: "albumList", title: "Top Rated" },
-  playlists: { itemType: "collection", title: "Playlists" },
+  playlists: {
+    itemType: "collection",
+    title: "Playlists",
+    // The root menu advertises this; a descriptor that silently dropped it could withdraw the
+    // create/rename affordance for a client that asks getExtendedMetadata about capabilities.
+    attributes: { userContent: true },
+  },
   genres: { itemType: "container", title: "Genres" },
   years: { itemType: "container", title: "Years" },
   recentlyAdded: { itemType: "albumList", title: "Recently Added" },
@@ -521,8 +530,6 @@ const KNOWN_CONTAINERS: Record<string, { itemType: ContainerType; title: string 
   // Not root tiles, but Sonos asks about these the same way once you are one level down.
   genre: { itemType: "albumList", title: "Genre" },
   year: { itemType: "albumList", title: "Year" },
-  playlist: { itemType: "playlist", title: "Playlist" },
-  relatedArtists: { itemType: "container", title: "Related Artists" },
   artistsByLetter: { itemType: "container", title: "Artists" },
   albumsByLetter: { itemType: "albumList", title: "Albums" },
   artistsChunk: { itemType: "container", title: "Artists" },
@@ -1201,6 +1208,9 @@ function bindSmapiSoapServiceToExpress(
                             id,
                             itemType: known.itemType,
                             title: known.title,
+                            ...(known.attributes
+                              ? { attributes: known.attributes }
+                              : {}),
                           },
                         },
                       };
