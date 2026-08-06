@@ -1304,11 +1304,23 @@ function bindSmapiSoapServiceToExpress(
             // where it asked for tracks, so "play artist" fails confusingly rather than emptily.
             // The playback paths already got reject-don't-fake treatment (withDeadline); this is
             // the same principle for the recursive path.
+            // Every "still loading" title goes through here, so serving one is RECORDED by
+            // construction. The previous version armed only the artists placeholder, which is the
+            // fast one (a single getArtists); the albums placeholder sits in front of the
+            // multi-minute ~230-request catalog scan and was the one that actually needed it.
+            const loading = (text: string): string => {
+              lastUpdate.notePlaceholderServed();
+              return text;
+            };
             const browseTimeoutFallback = recursive
               ? getMetadataResult({ mediaMetadata: [], index: 0, total: 0 })
               : getMetadataResult({
                   mediaCollection: [
-                    { itemType: "container", id, title: "Loading, please try again..." },
+                    {
+                      itemType: "container",
+                      id,
+                      title: loading("Loading, please try again..."),
+                    },
                   ],
                   index: 0,
                   total: 1,
@@ -1473,17 +1485,12 @@ function bindSmapiSoapServiceToExpress(
                     // into buckets). Cold -> kick the warm and return a bounded placeholder, exactly as
                     // the Albums branch does.
                     const artistsPlaceholder = () => {
-                      // Record that a placeholder went out, so the transition BACK to real content
-                      // can tell Sonos to re-read it. Without that, a cold start serves this tile,
-                      // Sonos caches it, and the catalog stamp never moves again (the first index
-                      // build after a restart only establishes the fingerprint baseline).
-                      lastUpdate.notePlaceholderServed();
                       return getMetadataResult({
                         mediaCollection: [
                           {
                             itemType: "container",
                             id: "artists",
-                            title: "Loading your artists… (open again shortly)",
+                            title: loading("Loading your artists… (open again shortly)"),
                             albumArtURI: albumArtURI(
                               iconArtURI(bonobUrl, "artists").href()
                             ),
@@ -1496,7 +1503,6 @@ function bindSmapiSoapServiceToExpress(
                     const peekedArtists = musicLibrary.peekArtistIndex();
                     if (peekedArtists) {
                       return peekedArtists.then(async (idx) => {
-                        lastUpdate.noteContentReady();
                         // A catalog that shrank back under the cap can still serve flat from the index.
                         if (idx.total <= MAX_ARTISTS_FLAT) {
                           return getMetadataResult({
@@ -1542,7 +1548,7 @@ function bindSmapiSoapServiceToExpress(
                           {
                             itemType: "container",
                             id: `artistsByLetter:${typeId}`,
-                            title: "Loading your artists… (open again shortly)",
+                            title: loading("Loading your artists… (open again shortly)"),
                             albumArtURI: albumArtURI(
                               iconArtURI(bonobUrl, "artists").href()
                             ),
@@ -1614,7 +1620,7 @@ function bindSmapiSoapServiceToExpress(
                           {
                             itemType: "container",
                             id: `artistsChunk:${typeId}`,
-                            title: "Loading your artists… (open again shortly)",
+                            title: loading("Loading your artists… (open again shortly)"),
                             albumArtURI: albumArtURI(
                               iconArtURI(bonobUrl, "artists").href()
                             ),
@@ -1657,7 +1663,7 @@ function bindSmapiSoapServiceToExpress(
                           {
                             itemType: "albumList",
                             id: "albums",
-                            title: "Loading your albums… (open again shortly)",
+                            title: loading("Loading your albums… (open again shortly)"),
                             albumArtURI: albumArtURI(
                               iconArtURI(bonobUrl, "albums").href()
                             ),
@@ -2088,7 +2094,7 @@ function bindSmapiSoapServiceToExpress(
                         {
                           itemType: "container",
                           id: "favouriteSongs",
-                          title: "Loading your favourite songs… (open again shortly)",
+                          title: loading("Loading your favourite songs… (open again shortly)"),
                           albumArtURI: albumArtURI(
                             iconArtURI(bonobUrl, "heart").href()
                           ),

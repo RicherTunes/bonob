@@ -49,6 +49,11 @@ LABEL   maintainer="RicherTunes" \
         org.opencontainers.image.description="bonob SONOS SMAPI implementation - modified fork of simojenki/bonob" \
         org.opencontainers.image.licenses="GPLv3"
 
+# fs.promises writes/renames and dns.lookup share the libuv threadpool (4 by default). A few
+# concurrent multi-MB cache writes to a busy disk would otherwise starve DNS resolution for
+# outbound calls to the music server - the same "everything is slow at 0% CPU" signature that
+# synchronous writes produced.
+ENV UV_THREADPOOL_SIZE=8
 ENV BNB_PORT=4534
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=UTC

@@ -18,6 +18,8 @@ export interface SwrCacheStore {
   // so it returns a promise; callers on the serving path deliberately do NOT await it, but a
   // shutdown or a test can.
   save(key: string, at: number, value: unknown): void | Promise<void>;
+  // Optional: await everything still being written (shutdown flush).
+  flush?(): Promise<void>;
 }
 
 /**

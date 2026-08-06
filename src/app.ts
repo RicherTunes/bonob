@@ -167,6 +167,10 @@ const subsonicClient = new Subsonic(
 // starred refresh is the only moment it can see a star made in another client. Both feed the same
 // stamps getLastUpdate reports.
 subsonicClient.onCatalogChanged = () => lastUpdate.bumpCatalog();
+// An index finishing is what replaces a cold start's "Loading..." placeholders with real content.
+// It has to come from the BUILD: Sonos re-browses only when the stamp moves, so driving this from
+// a browse handler is circular and never fires.
+subsonicClient.onIndexBuilt = () => lastUpdate.noteContentReady();
 subsonicClient.onFavouritesChanged = () => lastUpdate.bumpFavourites();
 
 const subsonic = new SubsonicMusicService(
@@ -292,8 +296,16 @@ process.on('SIGTERM', () => {
     process.exit(0);
   }, 10_000);
   forced.unref();
-  expressServer.close(() => {
+  expressServer.close(async () => {
     logger.info('HTTP server closed');
+    // Persistence writes are asynchronous now, so a redeploy moments after a browse would drop
+    // the entry the cache exists to preserve (with writeFileSync, a returned save() meant bytes on
+    // disk). Bounded by the same forced-exit timer above, so a wedged disk cannot hang the restart.
+    try {
+      await browseCacheStore?.flush?.();
+    } catch {
+      /* a persistence flush is never worth blocking a shutdown */
+    }
     process.exit(0);
   });
 });

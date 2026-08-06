@@ -253,4 +253,77 @@ describe("not blocking the event loop", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  // Per-key chaining still let an unbounded number of DISTINCT keys write at once. fs.promises
+  // writes, renames and dns.lookup all share the libuv threadpool (4 by default), so a handful of
+  // concurrent multi-MB writes to a saturated disk starve DNS resolution for outbound Navidrome
+  // calls - reproducing the original incident's signature with the synchronous write already gone.
+  it("does not run unbounded concurrent writes across distinct keys", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bnb-store-conc-"));
+    let inFlight = 0;
+    let peak = 0;
+    const realWrite = fs.promises.writeFile;
+    const spy = jest
+      .spyOn(fs.promises, "writeFile")
+      .mockImplementation(async (...args: unknown[]) => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        try {
+          return await (realWrite as never as (...a: unknown[]) => Promise<void>)(...args);
+        } finally {
+          inFlight -= 1;
+        }
+      });
+    try {
+      const store = fileStore(dir);
+      await Promise.all(
+        Array.from({ length: 10 }, (_, i) => store.save(`key${i}`, 1, { i }))
+      );
+      expect(peak).toEqual(1);
+    } finally {
+      spy.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // listByNewest is readdirSync + statSync per file, and savesSincePrune is seeded so the FIRST
+  // save after every restart prunes - putting a synchronous multi-hundred-syscall sweep in the
+  // cold-start window, on the same event loop, for the same reason writeFileSync was a problem.
+  it("prunes without synchronous directory syscalls", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bnb-store-prune-sync-"));
+    const readdirSync = jest.spyOn(fs, "readdirSync");
+    const statSync = jest.spyOn(fs, "statSync");
+    try {
+      const store = fileStore(dir, { maxFiles: 2 });
+      readdirSync.mockClear();
+      statSync.mockClear();
+
+      for (let i = 0; i < 4; i++) await store.save(`k${i}`, i + 1, { i });
+
+      expect(readdirSync).not.toHaveBeenCalled();
+      expect(statSync).not.toHaveBeenCalled();
+    } finally {
+      readdirSync.mockRestore();
+      statSync.mockRestore();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // An async write is in flight across many event-loop turns, so SIGTERM during a redeploy can
+  // strand a multi-MB .tmp. Nothing ever removed those: the bound only counts .json files.
+  it("sweeps stale temp files on load so they cannot accumulate forever", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bnb-store-tmp-"));
+    try {
+      const orphan = path.join(dir, "abc.json.999.7.tmp");
+      fs.writeFileSync(orphan, "half-written");
+      fs.utimesSync(orphan, new Date(Date.now() - 3600_000), new Date(Date.now() - 3600_000));
+
+      fileStore(dir).load();
+
+      expect(fs.existsSync(orphan)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

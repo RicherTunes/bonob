@@ -2087,6 +2087,13 @@ export class Subsonic {
   private noteCatalogChanged = (source: string, fingerprint: string) => {
     const previous = this.lastCatalogFingerprint.get(source);
     this.lastCatalogFingerprint.set(source, fingerprint);
+    // An index finished building. Announce that unconditionally: it is what lets a cold start
+    // replace its placeholders, and it must happen on the baseline build too.
+    try {
+      this.onIndexBuilt();
+    } catch {
+      // a stamp is never worth breaking an index build over
+    }
     if (previous === undefined || previous === fingerprint) return;
     try {
       this.onCatalogChanged();
@@ -2357,6 +2364,13 @@ export class Subsonic {
   // stamps, so Sonos re-reads a stale browse view exactly once per real change instead of on
   // every 60s poll (the old behaviour) or never (the behaviour before this hook existed).
   onCatalogChanged: () => void = () => {};
+
+  // Fired whenever an index finishes building, INCLUDING the first build after a restart (unlike
+  // onCatalogChanged, which deliberately treats that one as a fingerprint baseline). A cold start
+  // serves "Loading, please try again..." placeholders, and Sonos only re-browses when the catalog
+  // stamp moves - so the eviction signal cannot be hung off a browse handler without becoming
+  // circular: the bump that would cause the browse would itself be waiting for that browse.
+  onIndexBuilt: () => void = () => {};
 
   // Called when the starred list is refreshed and its SIZE changed, which is how a star made in
   // the Navidrome web UI (or any other client) becomes visible to Sonos. Comparing sizes rather

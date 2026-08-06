@@ -3283,6 +3283,47 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     // (BNB_SUBSONIC_CACHE_DIR=/cache, verified on the live container). getLastUpdate therefore
     // reported a catalog stamp that never moved: the exact permanent staleness the hook was
     // written to repair. These tests build through the snapshot path on purpose.
+    // The placeholder-eviction signal must come from the BUILD, not from a browse. Sonos only
+    // re-browses when the catalog stamp moves, so hanging the signal off a browse handler made it
+    // circular: the bump that would cause the browse was itself waiting for that browse. A cold
+    // start therefore left Sonos holding "Loading, please try again..." with nothing to evict it.
+    it("announces that an index finished building, even on the FIRST build after a restart", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-index-built-"));
+      try {
+        mockGET.mockImplementation(() =>
+          Promise.resolve(
+            ok(
+              subsonicOK({
+                artists: {
+                  index: [{ name: "A", artist: [{ id: "1", name: "AC/DC", albumCount: 2 }] }],
+                },
+              })
+            )
+          )
+        );
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          SwrCache.disabled(),
+          SwrCache.disabled(),
+          false,
+          {},
+          undefined,
+          dir
+        );
+        const built: number[] = [];
+        subsonic.onIndexBuilt = () => built.push(1);
+
+        await subsonic.getArtistIndex(credentials);
+
+        // the FIRST build is exactly the one a cold start depends on
+        expect(built.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("reports a catalog change when the artist index REBUILDS with new content on the snapshot-backed path", async () => {
       const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-catalog-hook-artist-"));
       try {

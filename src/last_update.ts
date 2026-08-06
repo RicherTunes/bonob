@@ -16,6 +16,10 @@ import { Clock, SystemClock } from "./clock";
 // outside Sonos is picked up on the next index rebuild rather than immediately. That is the honest
 // trade: bonob cannot observe what it is not told about, and claiming a change every 60 seconds to
 // cover that case costs far more than it buys.
+// Floor between two placeholder-driven catalog bumps. Long enough that a flapping index cannot
+// storm a large catalog with re-browse orders, short enough that a real cold start recovers fast.
+const MIN_PLACEHOLDER_BUMP_INTERVAL_MS = 60_000;
+
 export class LastUpdate {
   private readonly clock: Clock;
   private catalogAt: number;
@@ -61,6 +65,7 @@ export class LastUpdate {
   // moves the catalog stamp again (the first index build after a restart only establishes the
   // fingerprint baseline). Sonos would then hold the placeholder view with no eviction trigger.
   private placeholderServed = false;
+  private lastPlaceholderBumpAt: number | undefined;
 
   notePlaceholderServed = () => {
     this.placeholderServed = true;
@@ -70,6 +75,18 @@ export class LastUpdate {
   // per episode, not on every subsequent browse.
   noteContentReady = () => {
     if (!this.placeholderServed) return;
+    // A placeholder-driven bump orders Sonos to re-read the WHOLE catalog (SMAPI has no finer
+    // granularity than "catalog"), so a section that flaps cold/warm - an album index that keeps
+    // failing and retrying while the backend is saturated - could issue a full re-browse of a
+    // 113k-album library per cycle, precisely when the backend can least afford it. One bump per
+    // interval at most; the flag stays set so a genuine recovery still lands on the next one.
+    const now = this.clock.now().valueOf();
+    if (
+      this.lastPlaceholderBumpAt !== undefined &&
+      now - this.lastPlaceholderBumpAt < MIN_PLACEHOLDER_BUMP_INTERVAL_MS
+    )
+      return;
+    this.lastPlaceholderBumpAt = now;
     this.placeholderServed = false;
     this.bumpCatalog();
   };
