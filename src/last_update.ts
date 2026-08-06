@@ -30,22 +30,28 @@ export class LastUpdate {
     this.clock = clock ?? SystemClock;
     // Seeded at construction rather than 0 so a restart looks like a change exactly once, which is
     // correct: in-memory state was lost, so Sonos re-reading is the right outcome.
-    this.catalogAt = this.now();
-    this.favouritesAt = this.now();
+    this.catalogAt = this.tick(undefined);
+    this.favouritesAt = this.tick(undefined);
   }
 
-  private now(): number {
-    return this.clock.now().unix();
+  // Milliseconds, and never less than one tick past the stamp already issued. Seconds alone lost
+  // any bump landing in the same second as the value Sonos last saw, and a raw clock read would let
+  // an NTP correction move a stamp BACKWARDS onto a value Sonos had already seen - which reads as
+  // "nothing changed" and strands it on a stale view. The WSDL types both stamps as xs:string, so
+  // any monotonically changing token is valid here.
+  private tick(previous: number | undefined): number {
+    const now = this.clock.now().valueOf();
+    return previous === undefined ? now : Math.max(now, previous + 1);
   }
 
   catalog = () => this.catalogAt;
   favourites = () => this.favouritesAt;
 
   bumpCatalog = () => {
-    this.catalogAt = this.now();
+    this.catalogAt = this.tick(this.catalogAt);
   };
 
   bumpFavourites = () => {
-    this.favouritesAt = this.now();
+    this.favouritesAt = this.tick(this.favouritesAt);
   };
 }

@@ -703,6 +703,8 @@ describe("asTrack", () => {
           expect(result.encoding).toEqual({
             player: "bonob",
             mimeType: "nonTranscodedContentType",
+            // delivered mime IS the source mime: nothing transcodes, so seek stays honest
+            transcoded: false,
           });
         });
       });
@@ -722,6 +724,8 @@ describe("asTrack", () => {
           expect(result.encoding).toEqual({
             player: "bonob",
             mimeType: "transcodedContentType",
+            // Navidrome will transcode for this player, so the track must not advertise seek
+            transcoded: true,
           });
         });
       });
@@ -750,6 +754,7 @@ describe("asTrack", () => {
             expect(result.encoding).toEqual({
               player: "bonob",
               mimeType: "nonTranscodedContentType",
+              transcoded: false,
             });
             expect(streamClient.encodingFor).toHaveBeenCalledWith({
               mimeType: "nonTranscodedContentType",
@@ -774,6 +779,7 @@ describe("asTrack", () => {
             expect(result.encoding).toEqual({
               player: "bonob",
               mimeType: "transcodedContentType1",
+              transcoded: true,
             });
             expect(streamClient.encodingFor).toHaveBeenCalledWith({
               mimeType: "nonTranscodedContentType",
@@ -800,7 +806,8 @@ describe("asTrack", () => {
             streamClient as unknown as CustomPlayers
           );
 
-          expect(result.encoding).toEqual(customEncoding);
+          // a custom player delivering a different mime than the source IS a transcode
+          expect(result.encoding).toEqual({ ...customEncoding, transcoded: true });
           expect(streamClient.encodingFor).toHaveBeenCalledWith({
             mimeType: "sourced-from/subsonic",
           });
@@ -2281,6 +2288,8 @@ describe("Subsonic", () => {
                 encoding: {
                   player: "bonob+audio/alac",
                   mimeType: "audio/flac",
+                  // a custom player delivering flac for an alac source is a transcode
+                  transcoded: true,
                 },
                 // todo: this doesnt seem right? why dont the ratings come back?
                 rating: {
@@ -2293,6 +2302,7 @@ describe("Subsonic", () => {
                 encoding: {
                   player: "bonob+audio/m4a",
                   mimeType: "audio/opus",
+                  transcoded: true,
                 },
                 rating: {
                   love: false,
@@ -2304,6 +2314,8 @@ describe("Subsonic", () => {
                 encoding: {
                   player: "bonob",
                   mimeType: "audio/mp3",
+                  // no custom player matched this one: delivered as-is, so seek stays honest
+                  transcoded: false,
                 },
                 rating: {
                   love: false,
@@ -3265,6 +3277,112 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     // made outside Sonos. These hooks are the missing half - and an earlier version of this work
     // claimed in a comment that they existed while nothing called them, which is exactly why they
     // are pinned by tests now.
+    // The catalog hook was added and pinned by nothing. Both index builders call it only on the
+    // RESIDENT (no snapshot dir) branch, which src/subsonic.ts itself describes as "only used by
+    // tests/cache-disabled setups" - so the hook was dead on the one configuration we deploy
+    // (BNB_SUBSONIC_CACHE_DIR=/cache, verified on the live container). getLastUpdate therefore
+    // reported a catalog stamp that never moved: the exact permanent staleness the hook was
+    // written to repair. These tests build through the snapshot path on purpose.
+    it("reports a catalog change when the artist index REBUILDS with new content on the snapshot-backed path", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-catalog-hook-artist-"));
+      try {
+        let artists = [{ id: "1", name: "AC/DC", albumCount: 2 }];
+        mockGET.mockImplementation(() =>
+          Promise.resolve(
+            ok(subsonicOK({ artists: { index: [{ name: "A", artist: artists }] } }))
+          )
+        );
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          SwrCache.disabled(),
+          SwrCache.disabled(),
+          false,
+          {},
+          undefined,
+          dir
+        );
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        // first build establishes the baseline: LastUpdate already bumps at startup
+        await subsonic.getArtistIndex(credentials);
+        expect(changes.length).toEqual(0);
+
+        // a rebuild that found nothing new must NOT order a re-browse of the whole catalog
+        await subsonic.getArtistIndex(credentials);
+        expect(changes.length).toEqual(0);
+
+        // a Navidrome-side scan added an artist
+        artists = [
+          { id: "1", name: "AC/DC", albumCount: 2 },
+          { id: "2", name: "Abba", albumCount: 3 },
+        ];
+        await subsonic.getArtistIndex(credentials);
+        expect(changes.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("reports a catalog change when the album index REBUILDS with new content on the snapshot-backed path", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-catalog-hook-album-"));
+      try {
+        const artist = { id: "1", name: "AC/DC" };
+        let albums = [anAlbum({ name: "Powerage", genre: undefined })];
+        mockGET.mockImplementation((u: string, opts: any) => {
+          if (String(u).includes("getAlbumList2")) {
+            // Page by the requested offset rather than a call counter, so the pages stay in step
+            // across the three rebuilds this test performs.
+            const offset = Number(opts?.params?.offset || 0);
+            const page =
+              offset === 0
+                ? albums.map((a) => asAlbumJson(artist, { ...a, tracks: [] } as any))
+                : [];
+            return Promise.resolve(ok(subsonicOK({ albumList2: { album: page } })));
+          }
+          return Promise.resolve(
+            ok(
+              subsonicOK({
+                artists: {
+                  index: [{ name: "A", artist: [{ ...artist, albumCount: albums.length }] }],
+                },
+              })
+            )
+          );
+        });
+        const subsonic = new Subsonic(
+          url,
+          NO_CUSTOM_PLAYERS,
+          undefined,
+          SwrCache.disabled(),
+          SwrCache.disabled(),
+          false,
+          {},
+          undefined,
+          dir
+        );
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        await subsonic.getAlbumIndex(credentials);
+        expect(changes.length).toEqual(0);
+
+        await subsonic.getAlbumIndex(credentials);
+        expect(changes.length).toEqual(0);
+
+        albums = [
+          anAlbum({ name: "Powerage", genre: undefined }),
+          anAlbum({ name: "Back In Black", genre: undefined }),
+        ];
+        await subsonic.getAlbumIndex(credentials);
+        expect(changes.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("reports a favourites change when the starred count changes on refresh", async () => {
       let starred = [asSongJson(aTrack()), asSongJson(aTrack())];
       mockGET.mockImplementation(() =>

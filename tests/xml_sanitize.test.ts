@@ -1,4 +1,4 @@
-import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder, orderEmittedMedia, canSeekMimeType } from "../src/smapi";
+import { sanitizeXml, getMetadataResult, searchResult, inSmapiOrder, orderEmittedMedia, canSeekMimeType, canSeekTrack } from "../src/smapi";
 
 // Build control characters at runtime; never place a literal control char in source.
 const ch = (n: number) => String.fromCharCode(n);
@@ -246,5 +246,31 @@ describe("canSeek", () => {
     for (const mime of ["audio/x-ms-wma", "audio/opus", "audio/weird", "", undefined]) {
       expect(canSeekMimeType(mime as any)).toBe(false);
     }
+  });
+});
+
+describe("canSeek on a transcoded stream", () => {
+  // canSeek was keyed on the DELIVERED mime, which asTrackSummary sets to the post-transcode type
+  // when a custom player matches or Navidrome advertises transcodedContentType for the player. A
+  // flac transcoded to audio/mpeg therefore landed in the natively-seekable set and advertised a
+  // scrubber over an ffmpeg stream whose byte offsets do not map linearly to time - by this
+  // codebase's own rationale, worse than no scrubber. Not reachable on the current deployment
+  // (no custom players, no transcode configured); armed by a config change.
+  it("does not advertise seek when the delivered format is not the source format", () => {
+    expect(
+      canSeekTrack({ player: "bonob", mimeType: "audio/mpeg", transcoded: true })
+    ).toBe(false);
+  });
+
+  it("still advertises seek for a direct-played native format", () => {
+    expect(
+      canSeekTrack({ player: "bonob", mimeType: "audio/flac", transcoded: false })
+    ).toBe(true);
+  });
+
+  it("still refuses a non-native format that was not transcoded", () => {
+    expect(
+      canSeekTrack({ player: "bonob", mimeType: "audio/opus", transcoded: false })
+    ).toBe(false);
   });
 });

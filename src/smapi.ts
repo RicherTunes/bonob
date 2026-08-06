@@ -10,6 +10,7 @@ import logger from "./logger";
 
 import { LinkCodes } from "./link_codes";
 import {
+  Encoding,
   AlbumQuery,
   AlbumSummary,
   ArtistSummary,
@@ -399,7 +400,17 @@ class SonosSoap {
   }
 }
 
-export type ContainerType = "container" | "search" | "albumList";
+// The SMAPI itemTypes bonob actually emits. This was previously "container" | "search" |
+// "albumList" while the root menu emitted trackList, collection, stream and playlist as well -
+// those entries are untyped object literals, so the narrow union never caught it.
+export type ContainerType =
+  | "container"
+  | "search"
+  | "albumList"
+  | "trackList"
+  | "collection"
+  | "stream"
+  | "playlist";
 
 export type Container = {
   itemType: ContainerType;
@@ -478,6 +489,47 @@ export const iconArtURI = (bonobUrl: URLBuilder, icon: ICON, text: string | unde
     pathname: `/icon/${text == undefined ? icon : `${icon}:${text}`}/size/legacy`,
   });
 
+// Container ids Sonos may ask for extended metadata on before opening them. Every root section
+// reaches getExtendedMetadata this way; without an entry here the tile is described as nothing.
+//
+// The itemType MUST match what the root getMetadata advertises for the same id - answering
+// "container" for starredAlbums while the root menu calls it an albumList gives Sonos two
+// different answers for one id, which is worse than answering nothing. A test walks the real root
+// response and asserts every id agrees, so this cannot drift away from the menu above it.
+//
+// Titles are deliberately plain English rather than localised: getExtendedMetadata destructures
+// only the id and has no accept-language in scope, and a container that is DESCRIBED beats one
+// that is not.
+// reportStatus takes an arbitrary client-supplied message and needs no auth, so its length is
+// bounded before logging. Long enough for any real player diagnostic.
+const MAX_REPORTED_STATUS_MESSAGE = 500;
+
+const KNOWN_CONTAINERS: Record<string, { itemType: ContainerType; title: string }> = {
+  artists: { itemType: "container", title: "Artists" },
+  albums: { itemType: "albumList", title: "Albums" },
+  randomAlbums: { itemType: "albumList", title: "Random" },
+  favouriteAlbums: { itemType: "albumList", title: "Favourites" },
+  favouriteSongs: { itemType: "trackList", title: "Favourite Songs" },
+  starredAlbums: { itemType: "albumList", title: "Top Rated" },
+  playlists: { itemType: "collection", title: "Playlists" },
+  genres: { itemType: "container", title: "Genres" },
+  years: { itemType: "container", title: "Years" },
+  recentlyAdded: { itemType: "albumList", title: "Recently Added" },
+  recentlyPlayed: { itemType: "albumList", title: "Recently Played" },
+  mostPlayed: { itemType: "albumList", title: "Most Played" },
+  internetRadio: { itemType: "stream", title: "Internet Radio" },
+  // Not root tiles, but Sonos asks about these the same way once you are one level down.
+  genre: { itemType: "albumList", title: "Genre" },
+  year: { itemType: "albumList", title: "Year" },
+  playlist: { itemType: "playlist", title: "Playlist" },
+  relatedArtists: { itemType: "container", title: "Related Artists" },
+  artistsByLetter: { itemType: "container", title: "Artists" },
+  albumsByLetter: { itemType: "albumList", title: "Albums" },
+  artistsChunk: { itemType: "container", title: "Artists" },
+  albumsChunk: { itemType: "albumList", title: "Albums" },
+};
+
+
 export const sonosifyMimeType = (mimeType: string) =>
   mimeType == "audio/x-flac" ? "audio/flac" : mimeType;
 
@@ -506,6 +558,14 @@ const SONOS_NATIVELY_SEEKABLE_MIME_TYPES = new Set([
 
 export const canSeekMimeType = (mimeType: string | undefined): boolean =>
   !!mimeType && SONOS_NATIVELY_SEEKABLE_MIME_TYPES.has(mimeType.toLowerCase());
+
+// The mime above is the mime Sonos will be DELIVERED, not the source file's. When a custom player
+// or a Navidrome player transcode is configured, a flac arrives as audio/mpeg - natively decodable,
+// so the set above says "seekable", but it is ffmpeg output with no linear byte-to-time mapping and
+// no 206 support. Advertising a scrubber there is the failure this whole feature set out to avoid,
+// so a transcoded stream never claims seek regardless of its format.
+export const canSeekTrack = (encoding: Encoding): boolean =>
+  !encoding.transcoded && canSeekMimeType(encoding.mimeType);
 
 
 /* This doesnt seem to work on S2, only S1, ChatGPT seems to imply it has been deprecated
@@ -559,7 +619,7 @@ export const track = (bonobUrl: URLBuilder, track: Track) => ({
     genre: track.album.genre?.name,
     genreId: track.album.genre?.id,
     trackNumber: track.number,
-    canSeek: canSeekMimeType(track.encoding.mimeType)
+    canSeek: canSeekTrack(track.encoding)
   },
   dynamic: {
     property: [{ name: "rating", value: `${ratingAsInt(track.rating)}` }],
@@ -581,7 +641,7 @@ export const topSongMetadata = (bonobUrl: URLBuilder, t: TrackSummary) => ({
     genre: t.genre?.name,
     genreId: t.genre?.id,
     trackNumber: t.number,
-    canSeek: canSeekMimeType(t.encoding.mimeType)
+    canSeek: canSeekTrack(t.encoding)
   },
   dynamic: {
     property: [{ name: "rating", value: `${ratingAsInt(t.rating)}` }],
@@ -787,12 +847,16 @@ function bindSmapiSoapServiceToExpress(
           // re-fetch. Returning now() for both claimed the catalog AND the favourites had changed
           // on every 60s poll, forever - a standing re-browse and re-art-fetch order against a
           // 113k-album catalog, issued by the bridge whose caching exists to absorb that load.
+          // Element order is the WSDL lastUpdate xs:sequence: catalog, favorites, pollInterval,
+          // autoRefreshEnabled. node-soap serializes object keys in insertion order, so this
+          // object literal IS the wire order - it was previously autoRefreshEnabled-first, which
+          // made every getLastUpdate response schema-invalid. Pinned by a raw-XML test.
           getLastUpdate: () => ({
             getLastUpdateResult: {
-              autoRefreshEnabled: true,
-              favorites: lastUpdate.favourites(),
               catalog: lastUpdate.catalog(),
+              favorites: lastUpdate.favourites(),
               pollInterval: 60,
+              autoRefreshEnabled: true,
             },
           }),
           refreshAuthToken: async (
@@ -1110,9 +1174,6 @@ function bindSmapiSoapServiceToExpress(
                       );
 
                   case "topSongs":
-                    // Sonos asks for extended metadata on the Top Songs container before opening
-                    // it. Returning the "unsupported" empty result meant the tile rendered as
-                    // nothing. It is a plain track list, so describe it as one.
                     return {
                       getExtendedMetadataResult: {
                         mediaCollection: {
@@ -1122,13 +1183,35 @@ function bindSmapiSoapServiceToExpress(
                         },
                       },
                     };
-                  default:
+                  default: {
+                    // Sonos asks for extended metadata on EVERY container tile before opening it.
+                    // Answering "unsupported" with an empty result described nothing, and a browse
+                    // of the live library showed it happening for starredAlbums, playlists, genres,
+                    // years, year, recentlyAdded and recentlyPlayed - every root section. Top Songs
+                    // was fixed as a special case first, which missed that the gap was systematic.
+                    //
+                    // These are all plain browsable containers, so describe them as such rather
+                    // than returning nothing. An id we genuinely do not recognise still returns the
+                    // empty result, and still says so in the log.
+                    const known = KNOWN_CONTAINERS[type];
+                    if (known) {
+                      return {
+                        getExtendedMetadataResult: {
+                          mediaCollection: {
+                            id,
+                            itemType: known.itemType,
+                            title: known.title,
+                          },
+                        },
+                      };
+                    }
                     logger.info(
                       `Sonos requested extended meta data for currently unsupported type=${sanitizeLogValue(type)}, typeId=${sanitizeLogValue(typeId)}`
                     )
                     return {
                       getExtendedMetadataResult: {}
                     };
+                  }
                 }
               })
               .then(sanitizeXml)
@@ -2166,7 +2249,18 @@ function bindSmapiSoapServiceToExpress(
               .then(({ musicLibrary, typeId }) =>
                 musicLibrary.renamePlaylist(typeId, title)
               )
-              .then((_) => {
+              .then((renamed) => {
+                // renamePlaylist resolves FALSE when Subsonic answers non-ok. Ignoring the boolean
+                // told Sonos the rename succeeded and moved the catalog stamp, so the re-browse it
+                // performed showed the OLD name back with no error reported anywhere.
+                if (!renamed) {
+                  throw {
+                    Fault: {
+                      faultcode: "Server.ServiceUnknownError",
+                      faultstring: "Failed to rename the playlist",
+                    },
+                  };
+                }
                 lastUpdate.bumpCatalog();
                 return { renameContainerResult: {} };
               }),
@@ -2184,10 +2278,14 @@ function bindSmapiSoapServiceToExpress(
             errorCode: number;
             message: string;
           }) => {
+            // Every field here is client-supplied and this handler is reachable without a login
+            // token, so the message is truncated before it reaches the log. sanitizeLogValue
+            // already neutralises CR/LF and control characters; this bounds the volume.
+            const reported = String(message ?? "").slice(0, MAX_REPORTED_STATUS_MESSAGE);
             logger.warn(
               `Sonos reported a playback failure for ${sanitizeLogValue(
                 id
-              )}: errorCode=${sanitizeLogValue(String(errorCode))} ${sanitizeLogValue(message)}`
+              )}: errorCode=${sanitizeLogValue(String(errorCode))} ${sanitizeLogValue(reported)}`
             );
             return {};
           },

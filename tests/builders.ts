@@ -207,7 +207,10 @@ export function aTrackSummary(fields: Partial<TrackSummary> = {}): TrackSummary 
     name: `Track ${id}`,
     encoding: {
       player: "bonob",
-      mimeType: `audio/mp3-${id}`
+      mimeType: `audio/mp3-${id}`,
+      // Fixture tracks are direct-played: the delivered mime IS the source mime. asTrackSummary
+      // sets this on every real track, so a fixture without it no longer matches one.
+      transcoded: false
     },
     duration: randomInt(500),
     number: randomInt(100),

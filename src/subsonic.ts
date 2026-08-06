@@ -951,7 +951,11 @@ export const asTrackSummary = (
       mimeType: song.transcodedContentType
         ? song.transcodedContentType
         : song.contentType,
-    }))
+    })),
+    // Whether the delivered type differs from the source file's type, which is exactly when a
+    // transcoder sits in the path. Both branches above can produce one: a custom player's
+    // transcodedMimeType, or Navidrome's transcodedContentType for this player.
+    (e) => ({ ...e, transcoded: e.mimeType !== song.contentType })
   ),
   duration: song.duration || 0,
   number: song.track || 0,
@@ -1806,6 +1810,7 @@ export class Subsonic {
         for (const b of buckets) Object.freeze(b);
         Object.freeze(buckets);
         Object.freeze(idx);
+        this.noteCatalogChanged("artists", `${total}:${totalAlbumCount}:${buckets.length}`);
         return idx;
       } catch (e) {
         // A failed/aborted build drops the temp file so a half-written snapshot is never read as
@@ -1822,7 +1827,10 @@ export class Subsonic {
     Object.freeze(idx.buckets);
     // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
     // catalog changed, so it is where the getLastUpdate stamp has to move.
-    this.noteCatalogChanged();
+    this.noteCatalogChanged(
+      "artists",
+      `${idx.total}:${idx.totalAlbumCount}:${idx.buckets.length}`
+    );
     return idx;
   };
 
@@ -2020,6 +2028,10 @@ export class Subsonic {
       const years = [...yearsSet].sort();
       if (writer) {
         const { snapshotFile, offsets } = await writer.finalize(builder.buckets, years);
+        this.noteCatalogChanged(
+          "albums",
+          `${builder.total}:${builder.buckets.length}:${years.length}`
+        );
         return {
           total: builder.total,
           buckets: builder.buckets,
@@ -2031,7 +2043,10 @@ export class Subsonic {
       }
       // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
     // catalog changed, so it is where the getLastUpdate stamp has to move.
-    this.noteCatalogChanged();
+    this.noteCatalogChanged(
+      "albums",
+      `${builder.total}:${builder.buckets.length}:${years.length}`
+    );
     return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {
       if (writer) await writer.abort();
@@ -2058,8 +2073,21 @@ export class Subsonic {
       `albumIndex:v3:${credentials.username}`
     );
 
-  // Kick the index build in the background (on login) so it is ready before the user opens Albums.
-  private noteCatalogChanged = () => {
+  // Last observed content fingerprint per index, so a rebuild can tell whether the catalog ACTUALLY
+  // changed. Both indexes rebuild on the index-cache TTL (6h) whether or not Navidrome scanned
+  // anything, so firing on every build would order Sonos to re-browse and re-fetch art for a 113k
+  // album catalog four times a day for nothing - the same standing-re-browse cost the getLastUpdate
+  // rework was written to remove, just on a slower clock.
+  private lastCatalogFingerprint = new Map<string, string>();
+
+  // Called when an index build completes: the only moment bonob can observe a Navidrome-side scan.
+  // Mirrors the favourites baseline semantics - the first build after a restart establishes the
+  // fingerprint WITHOUT firing, because LastUpdate already seeds a fresh stamp at startup, so
+  // firing here as well would just repeat it.
+  private noteCatalogChanged = (source: string, fingerprint: string) => {
+    const previous = this.lastCatalogFingerprint.get(source);
+    this.lastCatalogFingerprint.set(source, fingerprint);
+    if (previous === undefined || previous === fingerprint) return;
     try {
       this.onCatalogChanged();
     } catch {

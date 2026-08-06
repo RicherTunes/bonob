@@ -57,4 +57,34 @@ describe("LastUpdate", () => {
 
     expect(second.catalog()).not.toEqual(first.catalog());
   });
+
+  // The stamps were unix SECONDS, so a bump landing in the same second as the value Sonos last saw
+  // was invisible and the change was simply lost. A playlist renamed moments after a scan finished
+  // is exactly that case, and unlike favourites it has no later refresh to self-heal.
+  it("always changes the stamp on a bump, even within the same clock tick", () => {
+    const clock = new FixedClock(dayjs("2026-08-05T10:00:00Z"));
+    const lastUpdate = new LastUpdate(clock);
+
+    const seeded = lastUpdate.catalog();
+    lastUpdate.bumpCatalog();
+    const afterFirst = lastUpdate.catalog();
+    lastUpdate.bumpCatalog();
+    const afterSecond = lastUpdate.catalog();
+
+    expect(afterFirst).not.toEqual(seeded);
+    expect(afterSecond).not.toEqual(afterFirst);
+  });
+
+  // A backwards clock step (NTP correction) must not make a bump look like a REVERT to a stamp
+  // Sonos has already seen, which would leave it holding a stale view believing it was current.
+  it("never moves a stamp backwards when the clock does", () => {
+    const clock = new FixedClock(dayjs("2026-08-05T10:00:00Z"));
+    const lastUpdate = new LastUpdate(clock);
+    const seeded = Number(lastUpdate.catalog());
+
+    clock.time = dayjs("2026-08-05T09:00:00Z");
+    lastUpdate.bumpCatalog();
+
+    expect(Number(lastUpdate.catalog())).toBeGreaterThan(seeded);
+  });
 });

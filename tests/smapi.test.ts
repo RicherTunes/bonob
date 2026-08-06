@@ -1057,6 +1057,31 @@ describe("wsdl api", () => {
         });
 
         describe("getLastUpdate", () => {
+          // The WSDL sequence is catalog, favorites, pollInterval, autoRefreshEnabled (lastUpdate
+          // complexType). bonob emitted autoRefreshEnabled first, and node-soap serializes object
+          // keys in insertion order, so every getLastUpdate response bonob sent was schema-invalid.
+          // The XSD sweep that caught the other two ordering bugs ran on captured production
+          // BROWSE responses, and getLastUpdate was not among them - hence this direct wire check.
+          it("emits the lastUpdate elements in the WSDL sequence order", async () => {
+            const ws = await createClientAsync(`${service.uri}?wsdl`, {
+              endpoint: service.uri,
+              httpClient: supersoap(server),
+            });
+
+            await ws.getLastUpdateAsync({});
+
+            const xml: string = (ws as any).lastResponse;
+            const order = [
+              "catalog",
+              "favorites",
+              "pollInterval",
+              "autoRefreshEnabled",
+            ].map((el) => xml.indexOf(`<${el}`) >= 0 ? xml.indexOf(`<${el}`) : xml.indexOf(`:${el}>`));
+
+            for (const pos of order) expect(pos).toBeGreaterThan(-1);
+            expect(order).toEqual([...order].sort((a, b) => a - b));
+          });
+
           // Sonos compares these stamps against what it last saw; a CHANGED stamp orders a
           // re-fetch. They used to be clock.now(), so every 60s poll claimed the catalog AND the
           // favourites had changed - a standing re-browse and re-art-fetch order against a
@@ -2853,7 +2878,58 @@ describe("wsdl api", () => {
               });
             });
 
+            describe("extended metadata for root containers", () => {
+              // Sonos asks for extended metadata on EVERY container tile before opening it. A live
+              // browse of the whole root menu showed "currently unsupported" for starredAlbums,
+              // playlists, genres, years, year, recentlyAdded and recentlyPlayed - every section.
+              // Top Songs was fixed as a special case first, which missed that it was systematic.
+              it("describes every tile the root menu offers, agreeing on itemType", async () => {
+                const root = await ws.getMetadataAsync({
+                  id: "root",
+                  index: 0,
+                  count: 100,
+                });
+                const tiles = [
+                  (root[0] as any).getMetadataResult.mediaCollection,
+                ].flat();
+                expect(tiles.length).toBeGreaterThan(5);
+
+                for (const tile of tiles) {
+                  const result = await ws.getExtendedMetadataAsync({ id: tile.id });
+                  const mc = (result[0] as any).getExtendedMetadataResult
+                    ?.mediaCollection;
+
+                  // Answering "unsupported" with an empty result described the tile as nothing.
+                  expect(mc).toBeDefined();
+                  expect(mc.id).toEqual(tile.id);
+                  // ...and answering a DIFFERENT itemType than the menu just advertised for the
+                  // same id would be worse than answering nothing.
+                  expect(mc.itemType).toEqual(tile.itemType);
+                  expect(typeof mc.title).toEqual("string");
+                }
+              });
+
+              it("still returns an empty result for an id it genuinely does not know", async () => {
+                const result = await ws.getExtendedMetadataAsync({ id: "somethingInvented:42" });
+                // An empty getExtendedMetadataResult is an empty element in the WSDL, which
+                // node-soap deserialises as null rather than {} - the same shape reportStatus and
+                // renameContainer return.
+                expect((result[0] as any).getExtendedMetadataResult).toBeNull();
+              });
+            });
+
             describe("renameContainer", () => {
+              // renamePlaylist resolves FALSE when Subsonic answers non-ok. The handler ignored the
+              // boolean, so Sonos was told the rename succeeded and bumped the catalog stamp; the
+              // re-browse it then performed showed the old name back, with no error anywhere.
+              it("faults instead of reporting success when the rename fails", async () => {
+                musicLibrary.renamePlaylist = jest.fn().mockResolvedValue(false);
+
+                await expect(
+                  ws.renameContainerAsync({ id: "playlist:1", title: "New Name" })
+                ).rejects.toBeDefined();
+              });
+
               // createContainer / deleteContainer / addToContainer / removeFromContainer were all
               // implemented and rename was not, so renaming a playlist in the Sonos app got a SOAP
               // fault. Subsonic's updatePlaylist takes a name, so this was missing plumbing rather
@@ -2874,6 +2950,26 @@ describe("wsdl api", () => {
             });
 
             describe("reportStatus", () => {
+              // reportStatus needs no login token, so anyone who can reach the public /ws endpoint
+              // can write log lines. sanitizeLogValue already neutralises CR/LF and control
+              // characters, so injection is covered; this bounds the volume.
+              it("truncates an oversized client-supplied message before logging it", async () => {
+                const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+                try {
+                  await ws.reportStatusAsync({
+                    id: "track:1",
+                    errorCode: 1,
+                    message: "A".repeat(10000),
+                  });
+
+                  const logged = warn.mock.calls.map((c) => String(c[0])).join("");
+                  expect(logged).toContain("A".repeat(100));
+                  expect(logged.length).toBeLessThan(1000);
+                } finally {
+                  warn.mockRestore();
+                }
+              });
+
               // This is how the player tells the service that a getMediaURI result failed to play.
               // Unhandled it faulted and the information was LOST - on a deployment whose entire
               // debugging loop is reading logs. Logging it is the whole point.

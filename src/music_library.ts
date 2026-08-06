@@ -70,7 +70,12 @@ export type Rating = {
 
 export type Encoding = {
   player: string,
-  mimeType: string
+  // The mime type Sonos will actually be DELIVERED, which is the post-transcode type whenever a
+  // custom player matches or Navidrome advertises transcodedContentType for the player.
+  mimeType: string,
+  // True when that delivered type is not the source file's type, i.e. the stream will be produced
+  // by a transcoder. Seeking is only honest on a direct-played file (see canSeekTrack).
+  transcoded?: boolean
 }
 
 export type TrackSummary = {
