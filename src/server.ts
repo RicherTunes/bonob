@@ -291,7 +291,15 @@ function server(
           password,
         }),
         TE.match(
-          (e: AuthFailure) => ({
+          (e: AuthFailure) => {
+            // Count the failure against this link code. bonob relays credentials to Navidrome
+            // SERVER-SIDE, so every guess reaches Navidrome from the VPS's own IP: Navidrome-side
+            // brute-force detection sees one client (bonob), which destroys source attribution and
+            // risks bonob itself being banned - a denial of service by proxy on the household's
+            // music. At the limit the code is burned, so an attacker must go back through
+            // getAppLink for each new one.
+            linkCodes.recordFailure(linkCode);
+            return {
             status: 403,
             template: `login/${loginTheme}/login`,
             params: {
@@ -302,7 +310,8 @@ function server(
               linkCode: linkCode,
               loginRoute: bonobUrl.append({ pathname: LOGIN_ROUTE }).pathname(),
             },
-          }),
+          };
+          },
           (success: AuthSuccess) => {
             try {
               linkCodes.associate(linkCode, success);

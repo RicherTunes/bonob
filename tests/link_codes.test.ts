@@ -1,5 +1,5 @@
-import { InMemoryLinkCodes } from "../src/link_codes"
-import { FixedClock } from "../src/clock"
+import { InMemoryLinkCodes, MAX_LOGIN_ATTEMPTS_PER_LINK_CODE } from "../src/link_codes"
+import { FixedClock, SystemClock } from "../src/clock"
 import dayjs from "dayjs"
 
 describe("InMemoryLinkCodes", () => {
@@ -119,3 +119,47 @@ describe("InMemoryLinkCodes", () => {
     });
   });
 })
+describe("InMemoryLinkCodes bounds and login throttling", () => {
+  // getAppLink is UNAUTHENTICATED and mints a link code every call, so an attacker can mint
+  // freely. The TTL sweep bounds age but not COUNT, so a flood is unbounded memory in a process
+  // that also holds every API token in memory.
+  it("caps how many live link codes it will hold", () => {
+    const codes = new InMemoryLinkCodes(SystemClock, "1h", 100);
+    for (let i = 0; i < 500; i++) codes.mint();
+    expect(codes.count()).toBeLessThanOrEqual(100);
+  });
+
+  it("evicts the OLDEST when capped, so a flood cannot push out a code minted seconds ago", () => {
+    const codes = new InMemoryLinkCodes(SystemClock, "1h", 3);
+    const first = codes.mint();
+    codes.mint();
+    codes.mint();
+    expect(codes.has(first)).toBe(true);
+    codes.mint(); // over cap: the oldest goes
+    expect(codes.has(first)).toBe(false);
+  });
+
+  // bonob relays credentials to Navidrome server-side, so every guess arrives from the VPS's own
+  // IP. Navidrome-side brute-force detection therefore sees ONE client - bonob - which both
+  // destroys source attribution and risks bonob itself being banned, taking music down for the
+  // household. bonob has to do its own counting.
+  it("refuses a link code after too many failed attempts", () => {
+    const codes = new InMemoryLinkCodes(SystemClock, "1h");
+    const code = codes.mint();
+    expect(codes.has(code)).toBe(true);
+    for (let i = 0; i < MAX_LOGIN_ATTEMPTS_PER_LINK_CODE; i++) codes.recordFailure(code);
+    expect(codes.has(code)).toBe(false);
+  });
+
+  it("a successful association is unaffected by earlier failures below the limit", () => {
+    const codes = new InMemoryLinkCodes(SystemClock, "1h");
+    const code = codes.mint();
+    codes.recordFailure(code);
+    codes.associate(code, {
+      serviceToken: "t",
+      userId: "u",
+      nickname: "n",
+    });
+    expect(codes.associationFor(code)).toBeDefined();
+  });
+});

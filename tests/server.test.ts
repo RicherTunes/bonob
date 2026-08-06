@@ -806,6 +806,7 @@ describe("server", () => {
           has: jest.fn(),
           associate: jest.fn(),
           associationFor: jest.fn(),
+          recordFailure: jest.fn(),
         };
         const apiTokens = {
           mint: jest.fn(),

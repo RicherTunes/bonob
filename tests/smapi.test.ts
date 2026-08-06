@@ -808,6 +808,7 @@ describe("wsdl api", () => {
     has: jest.fn(),
     associate: jest.fn(),
     associationFor: jest.fn(),
+    recordFailure: jest.fn(),
   };
   const musicLibrary = {
     artists: jest.fn(),
