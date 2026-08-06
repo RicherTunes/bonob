@@ -3258,6 +3258,50 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     });
   });
 
+  describe("catalog and favourites change hooks", () => {
+    // getLastUpdate reports change stamps to Sonos, and a CHANGED stamp is what makes it re-read a
+    // stale browse view. Those stamps used to move on every poll (a standing re-browse order); the
+    // fix made them move only on observed mutations, which then made them move NEVER for changes
+    // made outside Sonos. These hooks are the missing half - and an earlier version of this work
+    // claimed in a comment that they existed while nothing called them, which is exactly why they
+    // are pinned by tests now.
+    it("reports a favourites change when the starred count changes on refresh", async () => {
+      let starred = [asSongJson(aTrack()), asSongJson(aTrack())];
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ starred2: { song: starred } })))
+      );
+      const subsonic = new Subsonic(url, NO_CUSTOM_PLAYERS, undefined, new SwrCache(SystemClock, 60_000));
+      const changes: number[] = [];
+      subsonic.onFavouritesChanged = () => changes.push(1);
+
+      // first fetch establishes the baseline and must NOT report a change
+      await subsonic.starredSongs(credentials);
+      expect(changes.length).toEqual(0);
+
+      // a star made in another client: the refresh sees a different count
+      starred = [asSongJson(aTrack()), asSongJson(aTrack()), asSongJson(aTrack())];
+      subsonic.invalidateStarredSongs(credentials);
+      await subsonic.starredSongs(credentials);
+      expect(changes.length).toEqual(1);
+    });
+
+    it("does not report a favourites change when nothing changed", async () => {
+      const starred = [asSongJson(aTrack())];
+      mockGET.mockImplementation(() =>
+        Promise.resolve(ok(subsonicOK({ starred2: { song: starred } })))
+      );
+      const subsonic = new Subsonic(url, NO_CUSTOM_PLAYERS, undefined, new SwrCache(SystemClock, 60_000));
+      const changes: number[] = [];
+      subsonic.onFavouritesChanged = () => changes.push(1);
+
+      await subsonic.starredSongs(credentials);
+      subsonic.invalidateStarredSongs(credentials);
+      await subsonic.starredSongs(credentials);
+
+      expect(changes.length).toEqual(0);
+    });
+  });
+
   describe("genre caching", () => {
     // 1443 genres on the live library, measured at 587ms, and re-fetched for every page of the
     // Genres browse. Genres only change when the library is rescanned.

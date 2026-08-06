@@ -641,14 +641,12 @@ function bindSmapiSoapServiceToExpress(
   apiKeys: APITokens,
   clock: Clock,
   i8n: I8N,
-  smapiAuthTokens: SmapiAuthTokens
+  smapiAuthTokens: SmapiAuthTokens,
+  // Injected rather than constructed here: the Subsonic layer must be able to bump the SAME
+  // instance when an index rebuild reveals a catalog change, and that happens far from here.
+  lastUpdate: LastUpdate = new LastUpdate(clock)
 ) {
   const sonosSoap = new SonosSoap(bonobUrl, linkCodes, smapiAuthTokens, clock);
-
-  // Change stamps for getLastUpdate. Bumped by the mutations bonob can actually observe (a rating,
-  // a playlist edit); a scan done directly in Navidrome is invisible to us and is picked up on the
-  // next index rebuild instead.
-  const lastUpdate = new LastUpdate(clock);
 
   // Maps a full-scope api key to its ART-SCOPED sibling, so art URLs never carry a key that can
   // also stream. One entry is minted per auth() - i.e. per SOAP call - and nothing ever removed

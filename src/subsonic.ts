@@ -1820,6 +1820,9 @@ export class Subsonic {
     Object.freeze(idx.items);
     for (const b of idx.buckets) Object.freeze(b);
     Object.freeze(idx.buckets);
+    // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
+    // catalog changed, so it is where the getLastUpdate stamp has to move.
+    this.noteCatalogChanged();
     return idx;
   };
 
@@ -2026,7 +2029,10 @@ export class Subsonic {
           years,
         };
       }
-      return { total: builder.total, buckets: builder.buckets, items: items!, years };
+      // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
+    // catalog changed, so it is where the getLastUpdate stamp has to move.
+    this.noteCatalogChanged();
+    return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {
       if (writer) await writer.abort();
       throw e;
@@ -2053,6 +2059,14 @@ export class Subsonic {
     );
 
   // Kick the index build in the background (on login) so it is ready before the user opens Albums.
+  private noteCatalogChanged = () => {
+    try {
+      this.onCatalogChanged();
+    } catch {
+      // a stamp is never worth breaking an index build over
+    }
+  };
+
   warmAlbumIndex = (credentials: Credentials): void =>
     this.indexCache.warm(`albumIndex:v3:${credentials.username}`, () =>
       this.buildAlbumIndex(credentials)
@@ -2310,15 +2324,43 @@ export class Subsonic {
   // declaring starred data too volatile to cache. The volatility rule is still honoured: bonob's own
   // writes (rate() -> star/unstar) call invalidateStarredSongs, so a heart tapped on Sonos is never
   // hidden by our own cache. Only stars made in OTHER clients lag, bounded by the browse TTL.
+  // Called when bonob LEARNS the catalog changed - i.e. when an index build completes, which is
+  // the only moment it can observe a Navidrome-side scan. Wired by app.ts to the getLastUpdate
+  // stamps, so Sonos re-reads a stale browse view exactly once per real change instead of on
+  // every 60s poll (the old behaviour) or never (the behaviour before this hook existed).
+  onCatalogChanged: () => void = () => {};
+
+  // Called when the starred list is refreshed and its SIZE changed, which is how a star made in
+  // the Navidrome web UI (or any other client) becomes visible to Sonos. Comparing sizes rather
+  // than contents is deliberate: it is O(1), and a same-size swap is rare enough that waiting for
+  // the next real change is a fair trade against diffing 11k rows on every refresh.
+  onFavouritesChanged: () => void = () => {};
+
   private starredSongsKey = (credentials: Credentials) =>
     `starredSongs:v1:${credentials.username}`;
 
+  // Last observed starred count per user, so a refresh can tell whether anything actually changed.
+  private lastStarredCount = new Map<string, number>();
+
   private fetchStarredSongs = (credentials: Credentials): Promise<TrackSummary[]> =>
-    this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) =>
-      Object.freeze(
+    this.getJSONWithRetry<GetStarredResponse>(credentials, "/rest/getStarred2").then((it) => {
+      const songs = Object.freeze(
         (it.starred2.song || []).map((s) => asTrackSummary(s, this.customPlayers))
-      ) as TrackSummary[]
-    );
+      ) as TrackSummary[];
+      // A star made in the Navidrome web UI (or any other client) is invisible to bonob until this
+      // refresh. Without telling Sonos, the favourites view it cached would stay stale until a
+      // restart - which is what the getLastUpdate rework traded away and this trades back.
+      const previous = this.lastStarredCount.get(credentials.username);
+      this.lastStarredCount.set(credentials.username, songs.length);
+      if (previous !== undefined && previous !== songs.length) {
+        try {
+          this.onFavouritesChanged();
+        } catch {
+          // a stamp is never worth failing a refresh over
+        }
+      }
+      return songs;
+    });
 
   starredSongs = (credentials: Credentials): Promise<TrackSummary[]> =>
     this.cache.get<TrackSummary[]>(this.starredSongsKey(credentials), () =>

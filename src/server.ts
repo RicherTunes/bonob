@@ -54,6 +54,7 @@ import {
 } from "./smapi_auth";
 import { isValidMimeType, sanitizeLogValue } from "./utils";
 import { describeReason } from "./timeout";
+import { LastUpdate } from "./last_update";
 
 export const BONOB_ACCESS_TOKEN_HEADER = "bat";
 
@@ -90,6 +91,10 @@ export type ServerOpts = {
   deezerImageResolver: ImageFetcher;
   loginTheme: string;
   enableS1: boolean;
+  // Shared change stamps for getLastUpdate. Injected so app.ts can wire the SAME instance to the
+  // Subsonic layer's change hooks - an index rebuild is the only moment bonob can observe that
+  // Navidrome's catalog changed, and it happens far from the SOAP handlers.
+  lastUpdate: LastUpdate;
 };
 
 const DEFAULT_TIMEOUT = "1h"
@@ -155,6 +160,7 @@ const DEFAULT_SERVER_OPTS: ServerOpts = {
   deezerImageResolver: deezerImageFetcher,
   loginTheme: DEFAULT_LOGIN_THEME,
   enableS1: false,
+  lastUpdate: new LastUpdate(SystemClock),
 };
 
 function server(
@@ -851,7 +857,8 @@ function server(
     apiTokens,
     clock,
     i8n,
-    serverOpts.smapiAuthTokens
+    serverOpts.smapiAuthTokens,
+    serverOpts.lastUpdate
   );
 
   if (serverOpts.applyContextPath) {

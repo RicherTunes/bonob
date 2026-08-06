@@ -15,6 +15,7 @@ import {
 import { SubsonicMusicService} from "./subsonic_music_library";
 import { InMemoryAPITokens, sha256 } from "./api_tokens";
 import { InMemoryLinkCodes } from "./link_codes";
+import { LastUpdate } from "./last_update";
 import readConfig, {
   albumSnapshotMaxBytes,
   albumSnapshotKeepPerKey,
@@ -137,8 +138,13 @@ const indexCache = new SwrCache(clock, 6 * 60 * 60 * 1000, {
   backstopMs: 20 * 60 * 1000,
 });
 
-const subsonic = new SubsonicMusicService(
-  new Subsonic(
+// ONE instance shared by the SOAP handlers (which bump it on a rating or a playlist edit) and by
+// the Subsonic layer (which bumps it when an index rebuild reveals a Navidrome-side scan, or when
+// a starred refresh shows a star made in another client). Without the second half, getLastUpdate
+// would report "nothing changed" indefinitely and Sonos would keep serving a stale browse view.
+const lastUpdate = new LastUpdate(clock);
+
+const subsonicClient = new Subsonic(
     config.subsonic.url,
     customPlayers,
     artistImageFetcher,
@@ -155,7 +161,16 @@ const subsonic = new SubsonicMusicService(
       keepPerKey: albumSnapshotKeepPerKey(),
       protectPerKey: albumSnapshotProtectPerKey(),
     }
-  ),
+);
+
+// An index rebuild is the only moment bonob can observe that Navidrome's catalog changed; a
+// starred refresh is the only moment it can see a star made in another client. Both feed the same
+// stamps getLastUpdate reports.
+subsonicClient.onCatalogChanged = () => lastUpdate.bumpCatalog();
+subsonicClient.onFavouritesChanged = () => lastUpdate.bumpFavourites();
+
+const subsonic = new SubsonicMusicService(
+  subsonicClient,
   customPlayers,
   config.subsonic.transcode
 );
@@ -211,6 +226,7 @@ const app = server(
     logRequests: config.logRequests,
     version,
     smapiAuthTokens: new JWTSmapiLoginTokens(clock, config.secret, config.authTimeout),
+    lastUpdate,
     externalImageResolver: artistImageFetcher,
     deezerImageResolver: deezerArtResolver,
     deezerArtistImage: cachedDeezerArtistImage,
