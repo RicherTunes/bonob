@@ -810,7 +810,9 @@ function bindSmapiSoapServiceToExpress(
                       ],
                     };
                   default:
-                    logger.info(`Sonos asked for an unsupported getMediaURI: ${type}:${typeId}`);
+                    logger.info(
+                      `Sonos asked for an unsupported getMediaURI: ${sanitizeLogValue(type)}:${sanitizeLogValue(typeId)}`
+                    );
                     return {
                       getMediaURIResult: iconArtURI(bonobUrl, "error", "?").href(),
                     }
@@ -842,7 +844,9 @@ function bindSmapiSoapServiceToExpress(
                       getMediaMetadataResult: track(urlWithToken(apiKey), it),
                     }));
                   default:
-                    logger.info(`Sonos asked for an unsupported getMediaMetadata: ${type}:${typeId}`);
+                    logger.info(
+                      `Sonos asked for an unsupported getMediaMetadata: ${sanitizeLogValue(type)}:${sanitizeLogValue(typeId)}`
+                    );
                     return {
                       getMediaMetadataResult: {}
                     }
@@ -925,7 +929,11 @@ function bindSmapiSoapServiceToExpress(
                       })
                     );
                   default:
-                    logger.info(`Sonos asked for an unsupported search of: ${id}, term=${term}`);
+                    // The TERM is the user's own data and is logged length-only, exactly as the successful
+                    // search path does; the category id is client-controlled and is neutralised.
+                    logger.info(
+                      `Sonos asked for an unsupported search of: ${sanitizeLogValue(id)}, termLength=${(term ?? "").length}`
+                    );
                     return searchResult({
                       count: 0,
                       mediaCollection: [],
@@ -1034,7 +1042,9 @@ function bindSmapiSoapServiceToExpress(
                       },
                     };
                   default:
-                    logger.info(`Sonos requested extended meta data for currently unsupported type=${type}, typeId=${typeId}`)
+                    logger.info(
+                      `Sonos requested extended meta data for currently unsupported type=${sanitizeLogValue(type)}, typeId=${sanitizeLogValue(typeId)}`
+                    )
                     return {
                       getExtendedMetadataResult: {}
                     };
@@ -1946,7 +1956,9 @@ function bindSmapiSoapServiceToExpress(
                         });
                       });
                   default:
-                    logger.info(`Sonos asked for an unsupported getMetadata: ${type}:${typeId}`);
+                    logger.info(
+                      `Sonos asked for an unsupported getMetadata: ${sanitizeLogValue(type)}:${sanitizeLogValue(typeId)}`
+                    );
                     return getMetadataResult({
                       mediaMetadata: [],
                       index: paging._index,

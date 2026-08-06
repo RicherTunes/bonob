@@ -45,8 +45,15 @@ const REVERSE_SHORTHAND_MAPPINGS: Record<string, string> = Object.keys(SHORTHAND
   ret[SHORTHAND_MAPPINGS[key] as unknown as string] = key;
   return ret;
 }, {} as Record<string, string>)
-if(SHORTHAND_MAPPINGS.length != REVERSE_SHORTHAND_MAPPINGS.length) {
-  throw `Invalid SHORTHAND_MAPPINGS, must be duplicate!`
+// Both are Records, so the old `.length != .length` compared undefined to undefined and could
+// NEVER fire - a guard that looked like protection and was not. The hazard it was reaching for is
+// real: two systems mapping to the same shorthand letter silently collapse the reverse map, so one
+// system's burns would decode as the other's. Compare key COUNTS, which is what actually detects it.
+if (
+  Object.keys(SHORTHAND_MAPPINGS).length !==
+  Object.keys(REVERSE_SHORTHAND_MAPPINGS).length
+) {
+  throw `Invalid SHORTHAND_MAPPINGS: two systems share a shorthand, so the reverse mapping lost one`;
 }
 
 // Derive a STABLE art-burn signing key from the app secret (with domain separation), so that

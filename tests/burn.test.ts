@@ -208,3 +208,19 @@ describe("BUrn", () => {
   });
 });
 
+
+describe("shorthand mappings", () => {
+  // The module-load guard used to compare `.length` on two Records - undefined on both sides, so
+  // it could never fire. The hazard is real: two systems sharing a shorthand letter silently
+  // collapse the reverse map, and one system's burns then decode as the other's.
+  // The uniqueness of the shorthand letters is enforced at MODULE LOAD by the guard in burn.ts:
+  // if two systems shared a letter, the reverse map would be short and importing this module would
+  // throw. So every test in this file importing successfully IS that assertion. What is worth
+  // pinning here is the behaviour that guard protects: every system survives a round trip.
+  it("round-trips every system", () => {
+    for (const system of ["internal", "external", "subsonic", "navidrome", "deezer"]) {
+      const urn = { system, resource: `${system}-resource` };
+      expect(parse(formatForURL(urn))).toEqual(urn);
+    }
+  });
+});

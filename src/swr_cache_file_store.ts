@@ -29,6 +29,10 @@ export function fileStore(
     path.join(dir, createHash("sha1").update(key).digest("hex") + ".json");
 
   // The store's json files, newest first, with size (best-effort; unreadable entries dropped).
+  // Saves since the directory was last rescanned to enforce the file-count bound. See save().
+  // Seeded high so the FIRST save prunes: a restart should reclaim whatever the previous run left.
+  let savesSincePrune = Number.MAX_SAFE_INTEGER;
+
   const listByNewest = (): { path: string; size: number }[] => {
     let names: string[];
     try {
@@ -96,12 +100,27 @@ export function fileStore(
         logger.warn(`SwrCache file store: could not persist ${key}: ${e}`);
         return;
       }
-      // Bound the directory: prune the oldest files beyond maxFiles.
-      for (const { path: p } of listByNewest().slice(maxFiles)) {
-        try {
-          fs.rmSync(p, { force: true });
-        } catch {
-          /* best-effort */
+      // Bound the directory - but NOT on every save. listByNewest() is a readdirSync plus a
+      // statSync of every file in the directory, and running it per persisted value meant a browse
+      // storm paid a full directory scan for each cache entry it populated, synchronously, on the
+      // event loop, while SOAP handlers race a 4500ms deadline.
+      //
+      // The bound is a disk-space guard, not a correctness invariant: being a few files over it
+      // between prunes costs nothing. Throttling turns per-save O(files) into O(1) amortised.
+      // Prune once per maxFiles saves rather than on every save. That is O(1) amortised per save
+      // instead of O(files), and it still BOUNDS the directory: at most maxFiles new files can
+      // accumulate between prunes, so the directory never exceeds 2x maxFiles. A time-based
+      // throttle would have been simpler but gives no bound at all under a write storm, which is
+      // exactly when the bound matters.
+      savesSincePrune += 1;
+      if (savesSincePrune >= maxFiles) {
+        savesSincePrune = 0;
+        for (const { path: p } of listByNewest().slice(maxFiles)) {
+          try {
+            fs.rmSync(p, { force: true });
+          } catch {
+            /* best-effort */
+          }
         }
       }
     },

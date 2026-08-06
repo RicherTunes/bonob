@@ -6,7 +6,7 @@ import sharp from "sharp";
 import { randomUUID as uuid } from "crypto";
 import dayjs from "dayjs";
 
-import { PassThrough, Transform, TransformCallback } from "stream";
+import { PassThrough, Transform } from "stream";
 
 import { Sonos, Service, SONOS_LANG } from "./sonos";
 import {
@@ -57,10 +57,6 @@ import { describeReason } from "./timeout";
 
 export const BONOB_ACCESS_TOKEN_HEADER = "bat";
 
-interface RangeFilter extends Transform {
-  range: (length: number) => string;
-}
-
 type TimePlayed = {
   items: {
       mediaUrl: string,
@@ -69,38 +65,10 @@ type TimePlayed = {
   }[]
 }
 
-export function rangeFilterFor(rangeHeader: string): RangeFilter {
-  // if (rangeHeader == undefined) return new PassThrough();
-  const match = rangeHeader.match(/^bytes=(\d+)-$/);
-  if (match) return new RangeBytesFromFilter(Number.parseInt(match[1]!));
-  else throw `Unsupported range: ${rangeHeader}`;
-}
-
-export class RangeBytesFromFilter extends Transform {
-  from: number;
-  count: number = 0;
-
-  constructor(f: number) {
-    super();
-    this.from = f;
-  }
-
-  _transform(chunk: any, _: BufferEncoding, next: TransformCallback) {
-    if (this.count + chunk.length <= this.from) {
-      // before start
-      next();
-    } else if (this.from <= this.count) {
-      // off the end
-      next(null, chunk);
-    } else {
-      // from somewhere in chunk
-      next(null, chunk.slice(this.from - this.count));
-    }
-    this.count = this.count + chunk.length;
-  }
-
-  range = (number: number) => `${this.from}-${number - 1}/${number}`;
-}
+// REMOVED: rangeFilterFor / RangeBytesFromFilter. No route used them - the Range header is passed
+// upstream and the response is proxied through a PassThrough - so they were dead production code
+// kept alive only by their own tests. rangeFilterFor also threw a bare string rather than an Error,
+// which would have produced an unhelpful failure had anything ever called it.
 
 export type ServerOpts = {
   linkCodes: () => LinkCodes;

@@ -2,7 +2,7 @@ import { left, right } from 'fp-ts/Either'
 
 import jws from 'jws';
 
-import { cryptoEncryption, jwsEncryption } from '../src/encryption';
+import { jwsEncryption } from '../src/encryption';
 
 describe("jwsEncryption", () => {
   it("can encrypt and decrypt", () => {
@@ -78,30 +78,7 @@ describe("jwsEncryption", () => {
   });
 })
 
-describe("cryptoEncryption", () => {
-  it("can encrypt and decrypt", () => {
-    const e = cryptoEncryption("secret squirrel");
-
-    const value = "bobs your uncle"
-    const hash = e.encrypt(value)
-    expect(hash).not.toContain(value);
-    expect(e.decrypt(hash)).toEqual(right(value));
-  });
-
-  it("returns different values for different secrets", () => {
-    const e1 = cryptoEncryption("e1");
-    const e2 = cryptoEncryption("e2");
-
-    const value = "bobs your uncle"
-    const h1 = e1.encrypt(value)
-    const h2 = e2.encrypt(value)
-
-    expect(h1).not.toEqual(h2);
-  });
-  
-  it("should return left on invalid value", () => {
-    const e = cryptoEncryption("secret squirrel");
-
-    expect(e.decrypt("not-valid")).toEqual(left("Invalid value to decrypt"));
-  });
-})
+// cryptoEncryption was REMOVED, along with these tests. It had no callers in src/ and carried a
+// module-level `const IV = randomBytes(16)` reused for every encryption under one key - exactly
+// what CBC mode forbids. The tests were the only thing keeping it alive, which is how a landmine
+// survives a codebase: nothing uses it, so nothing exercises the flaw, so nothing removes it.

@@ -62,14 +62,18 @@ describe("fileStore", () => {
     expect(loaded.map((e) => e.key)).toEqual(["small"]);
   });
 
-  it("caps the directory to maxFiles on save (bounds disk)", () => {
+  // The bound is AMORTISED, not immediate. save() used to rescan the whole directory (readdirSync
+  // plus a statSync per file) on EVERY persisted value, synchronously, while SOAP handlers race a
+  // 4500ms deadline; it now prunes once per maxFiles saves. So at most maxFiles new files can
+  // accumulate between prunes and the directory never exceeds 2x maxFiles - in production that is
+  // a 256x reduction in directory scans for at most 256 extra small JSON files, which is a bound
+  // on DISK, not a correctness invariant.
+  it("keeps the directory bounded across many saves (amortised)", () => {
     const s = fileStore(dir, { maxFiles: 2 });
-    s.save("a", 1, "A");
-    s.save("b", 2, "B");
-    s.save("c", 3, "C");
-    s.save("d", 4, "D");
+    for (const [k, v] of [["a", "A"], ["b", "B"], ["c", "C"], ["d", "D"], ["e", "E"], ["f", "F"]])
+      s.save(k!, 1, v);
     const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-    expect(files.length).toBeLessThanOrEqual(2);
+    expect(files.length).toBeLessThanOrEqual(4); // 2x maxFiles
   });
 
   it("skips an entry with a missing/non-finite timestamp", () => {
@@ -181,5 +185,31 @@ describe("fileStore", () => {
     writeSpy.mockRestore();
     rmSpy.mockRestore();
     warnSpy.mockRestore();
+  });
+});
+
+describe("prune cost", () => {
+  // save() used to run listByNewest() - a readdirSync plus a statSync of EVERY file in the
+  // directory - on every persisted value, synchronously, on the event loop, while SOAP handlers
+  // are racing a 4500ms browse deadline. A browse storm that populates many albumPage/search3
+  // keys paid that repeatedly. The write itself is one small file; the directory scan is the cost.
+  it("does not rescan the directory on every save", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-prune-"));
+    const store = fileStore(dir);
+    const readdir = jest.spyOn(fs, "readdirSync");
+    readdir.mockClear();
+
+    for (let i = 0; i < 25; i++) store.save(`k${i}`, i, { v: i });
+
+    // one scan for the batch, not one per save
+    expect(readdir.mock.calls.length).toBeLessThan(25);
+    readdir.mockRestore();
+  });
+
+  it("still persists every value it was given", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bonob-prune2-"));
+    const store = fileStore(dir);
+    for (let i = 0; i < 5; i++) store.save(`key${i}`, i + 1, { v: i });
+    expect(fileStore(dir).load().length).toEqual(5);
   });
 });

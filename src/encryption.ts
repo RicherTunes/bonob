@@ -1,16 +1,7 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  randomBytes,
-  createHash,
-} from "crypto";
-import { option as O, either as E } from "fp-ts";
+import { option as O } from "fp-ts";
 import { Either, left, right } from 'fp-ts/Either'
 import { pipe } from "fp-ts/lib/function";
 import jws from "jws";
-
-const ALGORITHM = "aes-256-cbc";
-const IV = randomBytes(16);
 
 export type Hash = {
   iv: string;
@@ -54,38 +45,11 @@ export const jwsEncryption = (secret: string): Encryption => {
   }
 }
 
-export const cryptoEncryption = (secret: string): Encryption => {
-  const key = createHash("sha256")
-    .update(String(secret))
-    .digest("base64")
-    .substring(0, 32);
-
-  return {
-    encrypt: (value: string) => {
-      const cipher = createCipheriv(ALGORITHM, key, IV);
-      return `${IV.toString("hex")}.${Buffer.concat([
-        cipher.update(value),
-        cipher.final(),
-      ]).toString("hex")}`;
-    },
-    decrypt: (value: string) => pipe(
-      right(value),
-      E.map(it => it.split(".")),
-      E.flatMap(it => it.length == 2 ? right({ iv: it[0]!, data: it[1]! }) : left("Invalid value to decrypt")),
-      E.map(it => ({
-        hash: it,
-        decipher: createDecipheriv(
-          ALGORITHM,
-          key,
-          Buffer.from(it.iv, "hex")
-        )
-      })),
-      E.map(it => Buffer.concat([
-        it.decipher.update(Buffer.from(it.hash.data, "hex")),
-        it.decipher.final(),
-      ]).toString())
-    ),
-  };
-};
+// REMOVED: cryptoEncryption. It had no callers anywhere in src/ - only its own tests kept it
+// alive - and it carried a real crypto defect waiting for whoever adopted it next: a MODULE-LEVEL
+// `const IV = randomBytes(16)` reused for every encryption in the process, plus a key derived by
+// truncating base64 of a sha256. Reusing an IV across messages under one key is exactly what CBC
+// mode must not do. Dead code with a landmine in it is worse than no code, so it is gone rather
+// than fixed: nothing needs it.
 
 export default jwsEncryption;
