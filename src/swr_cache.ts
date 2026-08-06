@@ -50,7 +50,10 @@ export class SwrCache {
   private readonly maxEntries: number;
   private readonly maxStaleMs: number;
   // Consecutive background-warm failures per key, for the backoff in warm().
-  private warmFailures = new Map<string, { at: number; count: number }>();
+  private warmFailures = new Map<
+    string,
+    { at: number; count: number; attempt?: Promise<unknown> }
+  >();
   private readonly backstopMs: number;
   private readonly store?: SwrCacheStore;
   private readonly revive: (v: unknown) => unknown;
@@ -155,14 +158,26 @@ export class SwrCache {
     // threw left no trace at all: no error, no warning, and its .tmp cleaned up behind it. Observed
     // live - a rebuild started, died, and the only evidence was a missing snapshot eleven minutes
     // later. A background job that fails invisibly cannot be operated.
-    void this.get(key, fetch).then(
+    const attempt = this.get(key, fetch);
+    void attempt.then(
       () => {
         this.warmFailures.delete(key);
       },
       (e) => {
+        // Count once per underlying FETCH, not per waiting caller. warm() coalesces onto one
+        // in-flight get(), but every caller attaches its own rejection handler - so a single
+        // failed scan with six SOAP logins waiting on it counted six consecutive failures and
+        // jumped straight to the 1h cap, pinning the Albums tile on a placeholder for an hour
+        // where the pre-backoff code recovered on the next request. Coalesced callers share one
+        // promise object, so its identity is the fetch's identity.
+        if (this.warmFailures.get(key)?.attempt === attempt) return;
         const previous = this.warmFailures.get(key);
         const count = (previous?.count ?? 0) + 1;
-        this.warmFailures.set(key, { at: this.clock.now().valueOf(), count });
+        this.warmFailures.set(key, {
+          at: this.clock.now().valueOf(),
+          count,
+          attempt,
+        });
         const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
         const waitMs = Math.min(
           WARM_BACKOFF_BASE_MS * Math.pow(2, count - 1),

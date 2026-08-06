@@ -530,6 +530,8 @@ const KNOWN_CONTAINERS: Record<
   // Not root tiles, but Sonos asks about these the same way once you are one level down.
   genre: { itemType: "albumList", title: "Genre" },
   year: { itemType: "albumList", title: "Year" },
+  // Reachable: emitted as a relatedBrowse id and handled when browsed, so Sonos can ask about it.
+  relatedArtists: { itemType: "container", title: "Related Artists" },
   artistsByLetter: { itemType: "container", title: "Artists" },
   albumsByLetter: { itemType: "albumList", title: "Albums" },
   artistsChunk: { itemType: "container", title: "Artists" },

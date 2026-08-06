@@ -614,6 +614,34 @@ describe("backoff after a failed background warm", () => {
     expect(attempts).toEqual(1);
   });
 
+  // warm() coalesces onto one in-flight get(), but each caller attaches its OWN rejection
+  // handler - so a single failed scan with N warms waiting on it counted N consecutive failures
+  // and jumped straight to the 1h cap. Every SOAP request warms the album index, so a household
+  // browsing during a multi-minute scan easily stacks five or more; one WireGuard blip then pinned
+  // the Albums tile on "Loading..." for an hour, where before the commit it recovered on the very
+  // next request.
+  it("counts one failure per underlying fetch, not per coalesced warm", async () => {
+    const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+    const cache = new SwrCache(clock, 60_000);
+    let attempts = 0;
+    const failing = () => {
+      attempts += 1;
+      return Promise.reject(new Error("backend overloaded"));
+    };
+
+    // six SOAP logins landing while one scan is in flight: they coalesce onto its promise, and
+    // each attaches its own rejection handler
+    for (let i = 0; i < 6; i++) cache.warm("albumIndex", failing as never);
+    await flush();
+    expect(attempts).toEqual(1);
+
+    // one failure => the FIRST backoff step (5 min), not the 1h cap
+    clock.time = dayjs("2026-08-06T10:06:00Z");
+    cache.warm("albumIndex", failing as never);
+    await flush();
+    expect(attempts).toEqual(2);
+  });
+
   it("tries again once the backoff has elapsed", async () => {
     const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
     const cache = new SwrCache(clock, 60_000);

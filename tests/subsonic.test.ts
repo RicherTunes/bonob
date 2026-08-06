@@ -3361,7 +3361,7 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       };
     };
 
-    it("does not claim the catalog changed when a scan ingests far fewer albums than the last good one", async () => {
+    it("scan-omission guard: does not claim a catalog change when a scan ingests far fewer albums than the last good one", async () => {
       const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-trunc-"));
       const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
       try {
@@ -3391,7 +3391,7 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       }
     });
 
-    it("accepts a genuinely smaller catalog when a second scan agrees", async () => {
+    it("scan-omission guard: accepts a genuinely smaller catalog when a second scan agrees", async () => {
       const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-real-delete-"));
       const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
       try {
@@ -3414,7 +3414,32 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       }
     });
 
-    it("does not flag ordinary growth as a truncated scan", async () => {
+    it("scan-omission guard: accepts a real deletion even when the catalog keeps changing after it", async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-churn-"));
+      try {
+        const { subsonic, serve } = albumScanHarness(dir);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1000);
+        await subsonic.getAlbumIndex(credentials); // baseline
+
+        serve(200); // half the library archived: suspect on first sighting
+        await subsonic.getAlbumIndex(credentials);
+        expect(changes.length).toEqual(0);
+
+        // Requiring the second sighting to match byte-for-byte meant that adding a few albums
+        // after a real deletion never produced two identical totals, so the stamp stayed
+        // suppressed until the catalog grew back past the old baseline.
+        serve(205);
+        await subsonic.getAlbumIndex(credentials);
+        expect(changes.length).toEqual(1);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("scan-omission guard: does not flag ordinary growth as suspect", async () => {
       const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-growth-"));
       try {
         const { subsonic, serve } = albumScanHarness(dir);

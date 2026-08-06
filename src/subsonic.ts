@@ -944,8 +944,10 @@ export const artistImageURN = (
 // the same index letter. Counting alone was blind to every one of those. Cost is a few million
 // character operations against a scan already dominated by ~230 HTTP round trips.
 export const foldContent = (hash: number, value: string | undefined): number => {
-  if (!value) return hash;
-  let h = hash;
+  // A trailing separator, so "al-1"+"X" cannot fold to the same value as "al-"+"1X".
+  let h = hash ^ 0x1f;
+  h = Math.imul(h, 16777619) >>> 0;
+  if (!value) return h;
   for (let i = 0; i < value.length; i++) {
     h ^= value.charCodeAt(i);
     h = Math.imul(h, 16777619);
@@ -1858,7 +1860,7 @@ export class Subsonic {
     // The index just finished: this is the ONLY moment bonob can observe that Navidrome's
     // catalog changed, so it is where the getLastUpdate stamp has to move.
     this.noteCatalogChanged(
-      "artists",
+      `artists:${credentials.username}`,
       `${idx.total}:${idx.totalAlbumCount}:${idx.buckets.length}:${idx.items.reduce(
         (h, a) => foldContent(foldContent(h, a.id), a.name),
         CONTENT_HASH_SEED
@@ -2152,8 +2154,12 @@ export class Subsonic {
       this.suspectTotal.delete(key);
       return true;
     }
-    if (this.suspectTotal.get(key) === total) {
-      // the same reduced total twice running is a real deletion, not a truncated scan
+    const suspect = this.suspectTotal.get(key);
+    if (suspect !== undefined && Math.abs(suspect - total) <= Math.max(50, suspect * 0.1)) {
+      // Two consecutive scans agreeing (within the same tolerance) is a real deletion, not a
+      // truncated scan. Requiring byte-exact equality meant that archiving half a library and
+      // then adding a few albums a week never produced two identical totals, so the stamp stayed
+      // suppressed until the catalog grew back past the old baseline.
       this.lastAcceptedTotal.set(key, total);
       this.suspectTotal.delete(key);
       return true;
