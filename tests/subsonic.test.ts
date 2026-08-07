@@ -1573,11 +1573,12 @@ describe("Subsonic", () => {
         const firstPage = Array.from({ length: 500 }, (_, i) =>
           anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
         );
-        // Pages overlap by one, so a healthy page 2 begins with album-499. Drift is when it does
-        // NOT: the catalog moved under the scan and records between the pages were skipped.
+        // Pages overlap by one, so a healthy page 2 BEGINS with album-499 - that repeat is
+        // expected and dropped. A genuine duplicate is a record already ingested reappearing
+        // AWAY from the seam, which must still be refused.
         const driftedSecondPage = [
-          anAlbumSummary({ id: "album-500", name: "Album 500" }),
-          anAlbumSummary({ id: "album-501", name: "Album 501" }),
+          anAlbumSummary({ id: "album-499", name: "Album 499" }),
+          anAlbumSummary({ id: "album-300", name: "Duplicate Album 300" }),
         ];
 
         mockGET.mockImplementation((_u: string, config: any) => {
@@ -3370,6 +3371,7 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       // every later offset shifts by one, which is how a mid-scan delete skips records without
       // ever producing a duplicate id or a short page.
       let shiftAfterPages = Number.POSITIVE_INFINITY;
+      let shiftDirection = 1;
       let pagesServed = 0;
       mockGET.mockImplementation((u: string, opts: any) => {
         if (String(u).includes("getAlbumList2")) {
@@ -3378,9 +3380,9 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
           const offset = Number(
             (typeof prm?.get === "function" ? prm.get("offset") : prm?.offset) || 0
           );
-          const shift = pagesServed >= shiftAfterPages ? 1 : 0;
+          const shift = pagesServed >= shiftAfterPages ? shiftDirection : 0;
           pagesServed += 1;
-          const base = offset + shift;
+          const base = Math.max(0, offset + shift);
           const remaining = Math.max(0, albumsToServe - base);
           const rows = Array.from({ length: Math.min(500, remaining) }, (_, i) =>
             asAlbumJson(artist, {
@@ -3418,6 +3420,12 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         },
         deleteAfterPages: (n: number) => {
           shiftAfterPages = n;
+          shiftDirection = 1;
+        },
+        // An album added earlier in the catalog shifts later offsets the other way.
+        insertAfterPages: (n: number) => {
+          shiftAfterPages = n;
+          shiftDirection = -1;
         },
       };
     };
@@ -3514,12 +3522,57 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       }
     });
 
-    it("scan-omission guard: notices a single album deleted while the scan is running", async () => {
+    it("scan-omission guard: keeps the previous index when a delete lands mid-scan", async () => {
       // The total-based threshold cannot see this: one album removed from a large catalog shifts
       // every later offset by one, skipping a handful of records with no duplicate id, no short
       // page, and a total that moves far too little to trip max(50, 10%). Pages overlap by one
-      // record so each page must begin with the previous page's last id; a shift breaks that.
-      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-shift-"));
+      // record so each must begin with the previous page's last id; a shift breaks that seam.
+      //
+      // This is the REFRESH path, which is how it actually happens in production: a stale but
+      // still-served index is rebuilt in the background, so the rejection never reaches a caller
+      // and the only observable outcomes are that the good index survives and no catalog change
+      // is claimed.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-seam-warm-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+        const cache = new SwrCache(clock, 60_000);
+        const { subsonic, serve, deleteAfterPages } = albumScanHarness(dir, cache);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1500);
+        const good = await subsonic.getAlbumIndex(credentials);
+        expect(good.total).toEqual(1500);
+        warn.mockClear();
+
+        // stale but within maxStale: served while a background rebuild runs
+        clock.time = dayjs("2026-08-06T10:02:00Z");
+        serve(1500);
+        deleteAfterPages(1);
+        await subsonic.getAlbumIndex(credentials);
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(changes.length).toEqual(0);
+        expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
+          /refused/i
+        );
+        // the good index survived: the refused rebuild did not replace it
+        const after = await subsonic.getAlbumIndex(credentials);
+        expect(after.total).toEqual(1500);
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("scan-omission guard: serves a best-effort index rather than a placeholder when there is nothing cached", async () => {
+      // Refusing keeps the PREVIOUS GOOD index - but on a cold start there isn't one, so refusing
+      // leaves the tile on "Loading..." instead. That inverts this codebase's own rule that a
+      // suspect index beats a stuck placeholder. Worse, the seam breaks on ANY mid-scan shift, so
+      // a Navidrome rescan overlapping the multi-minute scan can keep a cold bonob on a
+      // placeholder indefinitely.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-seam-cold-"));
       const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
       try {
         const { subsonic, serve, deleteAfterPages } = albumScanHarness(dir);
@@ -3527,19 +3580,40 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         subsonic.onCatalogChanged = () => changes.push(1);
 
         serve(1500);
-        await subsonic.getAlbumIndex(credentials); // undisturbed baseline
+        deleteAfterPages(1); // catalog shifts during the very first build
+
+        const idx = await subsonic.getAlbumIndex(credentials);
+
+        expect(idx.total).toBeGreaterThan(0); // served, not refused
+        expect(changes.length).toEqual(0); // but never claimed as a catalog change
+        expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
+          /changed mid-scan/i
+        );
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("scan-omission guard: notices an album ADDED mid-scan, not only a deletion", async () => {
+      // The seam breaks on any shift at a page boundary. An insert shifts the other way, and had
+      // no coverage at all.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-seam-insert-"));
+      try {
+        const { subsonic, serve, insertAfterPages } = albumScanHarness(dir);
+        const changes: number[] = [];
 
         serve(1500);
-        deleteAfterPages(1); // an album vanishes once the walk is under way
+        await subsonic.getAlbumIndex(credentials); // good baseline
+        subsonic.onCatalogChanged = () => changes.push(1);
 
-        // Refused, exactly like a duplicate id: the previous good index stays in place rather
-        // than being replaced by one that is knowingly missing records.
+        serve(1500);
+        insertAfterPages(1);
         await expect(subsonic.getAlbumIndex(credentials)).rejects.toThrow(
           "Inconsistent album index scan"
         );
         expect(changes.length).toEqual(0);
       } finally {
-        warn.mockRestore();
         rmSync(dir, { recursive: true, force: true });
       }
     });
@@ -4277,10 +4351,11 @@ describe("Subsonic: album index scan aborts (and leaves no .tmp) on an inconsist
       const firstPage = Array.from({ length: 500 }, (_, i) =>
         anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
       );
-      // Pages overlap by one, so a healthy second page begins with album-499. Drift is when it
-      // does not: the catalog moved under the scan and records between the pages were skipped.
+      // A healthy second page begins with album-499 (the deliberate overlap, dropped on ingest);
+      // a record already seen reappearing after it is a genuine duplicate and must be refused.
       const driftedSecondPage = [
-        anAlbumSummary({ id: "album-501", name: "Album 501" }),
+        anAlbumSummary({ id: "album-499", name: "Album 499" }),
+        anAlbumSummary({ id: "album-42", name: "Duplicate Album 42" }),
       ];
 
       const mockGET = jest.fn();

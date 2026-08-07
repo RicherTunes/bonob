@@ -124,6 +124,9 @@ export class InMemoryMusicService implements MusicService {
               .sort((x, y) => x.name.localeCompare(y.name)),
           ])
         ),
+      // The in-memory service is always warm, so a background kick is a no-op here.
+      warmAlbumIndex: () => {},
+      warmArtistIndex: () => {},
       peekAlbumIndex: () =>
         Promise.resolve(
           buildAlbumIndexFromPages([

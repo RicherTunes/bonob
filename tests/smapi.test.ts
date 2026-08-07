@@ -826,6 +826,11 @@ describe("wsdl api", () => {
     album: jest.fn(),
     albums: jest.fn(),
     albumIndex: jest.fn(),
+    // The cold browse path kicks a rebuild through these rather than through albumIndex()/
+    // artistIndex(): those go via the cache's get(), where the failure backoff does NOT apply,
+    // so every browse of a cold index started another full catalog scan.
+    warmAlbumIndex: jest.fn(),
+    warmArtistIndex: jest.fn(),
     peekAlbumIndex: jest.fn(),
     albumCount: jest.fn(),
     peekAlbumCount: jest.fn(),
@@ -2379,14 +2384,17 @@ describe("wsdl api", () => {
                     albumArtURI: iconArtURI(bonobUrl, "artists").href(),
                   });
                   // and it kicked the warm in the background
-                  expect(musicLibrary.artistIndex).toHaveBeenCalled();
+                  expect(musicLibrary.warmArtistIndex).toHaveBeenCalled();
                 });
 
                 it("swallows a failing background artist warm so it cannot surface as an unhandled rejection", async () => {
+                  // The kick goes through the cache's gated warm(), which swallows the rejection
+                  // itself. What must still hold here is that a warm failing OUTRIGHT cannot break
+                  // the browse that kicked it - a synchronous throw escaped the old form.
                   musicLibrary.peekArtistIndex.mockReturnValue(undefined);
-                  musicLibrary.artistIndex.mockReturnValue(
-                    Promise.reject(new Error("warm failed"))
-                  );
+                  musicLibrary.warmArtistIndex.mockImplementation(() => {
+                    throw new Error("warm failed");
+                  });
 
                   const unhandled: unknown[] = [];
                   const onUR = (reason: unknown) => unhandled.push(reason);
@@ -2399,7 +2407,7 @@ describe("wsdl api", () => {
                     });
                     const md = (result[0] as any).getMetadataResult;
                     expect(md.total).toEqual(1);
-                    expect(musicLibrary.artistIndex).toHaveBeenCalled();
+                    expect(musicLibrary.warmArtistIndex).toHaveBeenCalled();
                     await new Promise((resolve) => setTimeout(resolve, 0));
                     expect(unhandled).toEqual([]);
                   } finally {
@@ -2470,7 +2478,7 @@ describe("wsdl api", () => {
                 const md = (result[0] as any).getMetadataResult;
                 expect(md.total).toEqual(1);
                 expect(md.mediaCollection).toMatchObject({ id: "artists" });
-                expect(musicLibrary.artistIndex).toHaveBeenCalled();
+                expect(musicLibrary.warmArtistIndex).toHaveBeenCalled();
               });
             });
 
@@ -2558,7 +2566,7 @@ describe("wsdl api", () => {
                 const md = (result[0] as any).getMetadataResult;
                 expect(md.total).toEqual(1);
                 expect(md.mediaCollection).toMatchObject({ id: "artistsByLetter:S" });
-                expect(musicLibrary.artistIndex).toHaveBeenCalled();
+                expect(musicLibrary.warmArtistIndex).toHaveBeenCalled();
               });
             });
 
@@ -2628,7 +2636,7 @@ describe("wsdl api", () => {
                 const md = (result[0] as any).getMetadataResult;
                 expect(md.total).toEqual(1);
                 expect(md.mediaCollection).toMatchObject({ id: "artistsChunk:P_0" });
-                expect(musicLibrary.artistIndex).toHaveBeenCalled();
+                expect(musicLibrary.warmArtistIndex).toHaveBeenCalled();
               });
             });
 
@@ -3472,11 +3480,10 @@ describe("wsdl api", () => {
                   musicLibrary.peekAlbumCount.mockReturnValue(
                     Promise.resolve(MAX_ALBUMS_FLAT + 5000)
                   );
-                  // a rejecting warm proves the fire-and-forget .catch swallows the failure
-                  // rather than surfacing it on the browse path
-                  musicLibrary.albumIndex.mockReturnValue(
-                    Promise.reject(new Error("build boom"))
-                  );
+                  // a warm that fails outright must not surface on the browse path
+                  musicLibrary.warmAlbumIndex.mockImplementation(() => {
+                    throw new Error("build boom");
+                  });
 
                   const result = await ws.getMetadataAsync({
                     id: "albums",
@@ -3488,7 +3495,7 @@ describe("wsdl api", () => {
                   expect(md.total).toEqual(1);
                   expect(md.mediaCollection).toMatchObject({ id: "albums" });
                   // the large path kicks the index and never touches the live albums fetch
-                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                  expect(musicLibrary.warmAlbumIndex).toHaveBeenCalled();
                   expect(musicLibrary.albums).not.toHaveBeenCalled();
                 });
 
@@ -3618,7 +3625,7 @@ describe("wsdl api", () => {
                     title: "Indexing your albums… (open again shortly)",
                   });
                   // it kicked the background build rather than awaiting it
-                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                  expect(musicLibrary.warmAlbumIndex).toHaveBeenCalled();
                 });
 
                 it("splits an oversized letter into bounded sub-buckets", async () => {
@@ -3729,9 +3736,9 @@ describe("wsdl api", () => {
                 it("does not block on a cold index for a valid chunk, kicking the build and serving a placeholder", async () => {
                   // valid chunk id (P_0 passes the parser) but the index is not warm yet
                   musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
-                  musicLibrary.albumIndex.mockReturnValue(
-                    Promise.reject(new Error("build boom"))
-                  );
+                  musicLibrary.warmAlbumIndex.mockImplementation(() => {
+                    throw new Error("build boom");
+                  });
 
                   const result = await ws.getMetadataAsync({
                     id: "albumsChunk:P_0",
@@ -3746,7 +3753,7 @@ describe("wsdl api", () => {
                     id: "albumsChunk:P_0",
                     title: "Indexing your albums… (open again shortly)",
                   });
-                  expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                  expect(musicLibrary.warmAlbumIndex).toHaveBeenCalled();
                 });
 
                 it("treats a chunk id with no underscore as chunk 0 of the letter", async () => {
@@ -3775,12 +3782,14 @@ describe("wsdl api", () => {
                 });
 
                 it("swallows a failing background index warm so it cannot surface as an unhandled rejection", async () => {
-                  // The fire-and-forget warm is `void albumIndex().catch(() => undefined)`: the catch
-                  // is the only thing stopping a rejecting warm from becoming an unhandled rejection.
+                  // The kick now goes through the cache's gated warm(), which swallows the
+                  // rejection itself. What must still be proven here is that a warm which fails
+                  // OUTRIGHT cannot break the browse that kicked it - a synchronous throw would
+                  // have escaped the old `void ...catch()` form.
                   musicLibrary.peekAlbumIndex.mockReturnValue(undefined);
-                  musicLibrary.albumIndex.mockReturnValue(
-                    Promise.reject(new Error("warm failed"))
-                  );
+                  musicLibrary.warmAlbumIndex.mockImplementation(() => {
+                    throw new Error("warm failed");
+                  });
 
                   const unhandled: unknown[] = [];
                   const onUR = (reason: unknown) => unhandled.push(reason);
@@ -3793,7 +3802,7 @@ describe("wsdl api", () => {
                     });
                     const md = (result[0] as any).getMetadataResult;
                     expect(md.total).toEqual(1);
-                    expect(musicLibrary.albumIndex).toHaveBeenCalled();
+                    expect(musicLibrary.warmAlbumIndex).toHaveBeenCalled();
                     // cross a macrotask boundary so an unhandled rejection would have fired
                     await new Promise((resolve) => setTimeout(resolve, 0));
                     expect(unhandled).toEqual([]);

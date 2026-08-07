@@ -2042,6 +2042,9 @@ export class Subsonic {
     // Cost is one extra record per 500, i.e. ~0.2% more requests on a scan already dominated by
     // its ~230 round trips.
     let previousPageLastId: string | undefined;
+    // Set when a page boundary did not line up and there was no cached index to refuse in favour
+    // of: the index is served, but must not be reported as a catalog change.
+    let seamBroken = false;
     try {
       for (
         let offset = 0;
@@ -2056,13 +2059,31 @@ export class Subsonic {
         let records = page;
         if (previousPageLastId !== undefined) {
           if (page[0]!.id !== previousPageLastId) {
-            // The catalog moved under the scan, so records between the pages were skipped.
-            // REFUSE, exactly as the duplicate-id guard does: refusing leaves the previous good
-            // index in place and says why, where caching a knowingly incomplete index hides
-            // albums from the A-Z menu for six hours with nothing logged.
-            throw new Error(
-              `Inconsistent album index scan: offset ${offset} began with '${page[0]!.id}' where the previous page ended on '${previousPageLastId}', so the catalog changed mid-scan and records were skipped`
+            // The catalog moved under the scan, so records between the pages were skipped. Note
+            // this fires on ANY shift at a page boundary - a delete, an ADD, or a retag that moves
+            // an album across the boundary - not only the delete case.
+            //
+            // Refusing is right only when there is something to fall back TO. With a previous
+            // index cached, refusing keeps it and says why, which beats replacing it with one
+            // known to be missing records. With nothing cached, refusing leaves the tile stuck on
+            // "Loading..." instead - inverting this codebase's own rule that a suspect index
+            // beats a stuck placeholder, and a Navidrome rescan overlapping this multi-minute
+            // scan could keep a cold bonob there indefinitely.
+            if (cachedAlbumTotal !== undefined) {
+              // Logged as well as thrown: on the refresh path the rejection is swallowed by the
+              // cache's background handler, so without this a refused rebuild is silent.
+              logger.warn(
+                `Album index scan refused: the catalog changed mid-scan at offset ${offset} ('${page[0]!.id}' where the previous page ended on '${previousPageLastId}'), so records were skipped. Keeping the previous index.`
+              );
+              throw new Error(
+                `Inconsistent album index scan: offset ${offset} began with '${page[0]!.id}' where the previous page ended on '${previousPageLastId}', so the catalog changed mid-scan and records were skipped`
+              );
+            }
+            seamBroken = true;
+            logger.warn(
+              `Album index scan: the catalog changed mid-scan at offset ${offset} ('${page[0]!.id}' where the previous page ended on '${previousPageLastId}'), so records may be missing. No previous index to fall back on, so serving this one best-effort and NOT reporting a catalog change; the next rebuild will correct it.`
             );
+            // The seam did not hold, so page[0] is a different record, not the deliberate repeat.
           } else {
             // drop the deliberate overlap record, which was ingested with the previous page
             records = page.slice(1);
@@ -2119,7 +2140,7 @@ export class Subsonic {
             `albums:${credentials.username}`,
             builder.total,
             cachedAlbumTotal
-          )
+          ) && !seamBroken
         );
         return {
           total: builder.total,
@@ -2139,7 +2160,7 @@ export class Subsonic {
         `albums:${credentials.username}`,
         builder.total,
         cachedAlbumTotal
-      )
+      ) && !seamBroken
     );
     return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {

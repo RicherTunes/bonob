@@ -227,6 +227,10 @@ export class SubsonicMusicLibrary implements MusicLibrary {
   peekAlbumIndex = (): Promise<AlbumIndex<AlbumSummary>> | undefined =>
     this.subsonic.peekAlbumIndex(this.credentials);
 
+  warmAlbumIndex = (): void => this.subsonic.warmAlbumIndex(this.credentials);
+
+  warmArtistIndex = (): void => this.subsonic.warmArtists(this.credentials);
+
   album = (id: string): Promise<Album> =>
     this.subsonic.getAlbum(this.credentials, id);
 

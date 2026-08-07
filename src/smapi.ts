@@ -1320,6 +1320,17 @@ function bindSmapiSoapServiceToExpress(
             // construction. The previous version armed only the artists placeholder, which is the
             // fast one (a single getArtists); the albums placeholder sits in front of the
             // multi-minute ~230-request catalog scan and was the one that actually needed it.
+            // A background warm must never break the browse that kicked it. The previous form,
+            // `void albumIndex().catch(() => undefined)`, guarded the REJECTION; a synchronous
+            // throw would still have escaped.
+            const kickWarm = (warm: () => void): void => {
+              try {
+                warm();
+              } catch (e) {
+                logger.warn(`Background index warm could not be kicked: ${e}`);
+              }
+            };
+
             const loading = (text: string): string => {
               lastUpdate.notePlaceholderServed();
               return text;
@@ -1546,7 +1557,7 @@ function bindSmapiSoapServiceToExpress(
                     }
                     // Cold: never block the browse on the multi-second getArtists. Kick the warm and
                     // show the retry placeholder.
-                    void musicLibrary.artistIndex().catch(() => undefined);
+                    kickWarm(() => musicLibrary.warmArtistIndex());
                     return artistsPlaceholder();
                   }
                   case "artistsByLetter": {
@@ -1554,7 +1565,7 @@ function bindSmapiSoapServiceToExpress(
                     if (!peekedLetter) {
                       // Never block a leaf browse on the multi-second getArtists; kick the warm and
                       // show the retry placeholder instead.
-                      void musicLibrary.artistIndex().catch(() => undefined);
+                      kickWarm(() => musicLibrary.warmArtistIndex());
                       return getMetadataResult({
                         mediaCollection: [
                           {
@@ -1626,7 +1637,7 @@ function bindSmapiSoapServiceToExpress(
                     }
                     const peekedChunk = musicLibrary.peekArtistIndex();
                     if (!peekedChunk) {
-                      void musicLibrary.artistIndex().catch(() => undefined);
+                      kickWarm(() => musicLibrary.warmArtistIndex());
                       return getMetadataResult({
                         mediaCollection: [
                           {
@@ -1745,7 +1756,7 @@ function bindSmapiSoapServiceToExpress(
                       }
                       // Large catalog, index not warm yet: kick the build, show the placeholder
                       // (never block the browse on the multi-minute scan).
-                      void musicLibrary.albumIndex().catch(() => undefined);
+                      kickWarm(() => musicLibrary.warmAlbumIndex());
                       return albumsPlaceholder();
                     });
                   }
@@ -1754,7 +1765,7 @@ function bindSmapiSoapServiceToExpress(
                     if (!peekedLetter) {
                       // Never block a leaf browse on the multi-minute scan (S2 would time out);
                       // kick the build and show the retry placeholder instead.
-                      void musicLibrary.albumIndex().catch(() => undefined);
+                      kickWarm(() => musicLibrary.warmAlbumIndex());
                       return getMetadataResult({
                         mediaCollection: [
                           {
@@ -1826,7 +1837,7 @@ function bindSmapiSoapServiceToExpress(
                     }
                     const peekedChunk = musicLibrary.peekAlbumIndex();
                     if (!peekedChunk) {
-                      void musicLibrary.albumIndex().catch(() => undefined);
+                      kickWarm(() => musicLibrary.warmAlbumIndex());
                       return getMetadataResult({
                         mediaCollection: [
                           {

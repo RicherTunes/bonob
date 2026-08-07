@@ -221,6 +221,13 @@ export interface MusicLibrary {
   // Non-blocking peek: the index if already built, else undefined (browse falls back while
   // the multi-minute scan runs). Returns the already-resolved promise when warm.
   peekAlbumIndex(): Promise<AlbumIndex<AlbumSummary>> | undefined;
+  // Kick a rebuild in the BACKGROUND, subject to the failure backoff. The browse path used to do
+  // this by fire-and-forgetting albumIndex()/artistIndex(), which go through the cache's get() -
+  // and the backoff gate lives only in warm(). So whenever the index was cold or past its stale
+  // cap, EVERY browse started another full catalog scan, ungated, against a backend that was
+  // usually failing because it was overloaded.
+  warmAlbumIndex(): void;
+  warmArtistIndex(): void;
   // Total album count, cheap from the cached artist list. Used to decide whether the catalog
   // is large enough to need the bucketed A-Z index at all (small libraries serve the flat list).
   albumCount(): Promise<number>;
