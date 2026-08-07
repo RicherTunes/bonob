@@ -368,6 +368,11 @@ export const albumListPageSize = (q: {
     ? ALBUM_LIST_MAX_PAGE_SIZE
     : Math.min(ALBUM_LIST_MAX_PAGE_SIZE, Math.max(1, q._count || 1));
 
+// How many rebuilds in a row may be refused for a broken page seam before the index is accepted
+// best-effort instead. One or two breaks are a race; every rebuild breaking is a server that
+// pages differently than this guard assumes, and refusing forever would freeze the index.
+const MAX_CONSECUTIVE_SEAM_REFUSALS = 2;
+
 // Safety cap on the index scan, to stop a runaway or pathological server walking forever. Raised
 // from a hardcoded 2,000,000 - a catalog of millions is the target, and at 2M the old cap silently
 // truncated the index rather than refusing. Override with BNB_MAX_INDEX_SCAN_ALBUMS.
@@ -2069,7 +2074,16 @@ export class Subsonic {
             // "Loading..." instead - inverting this codebase's own rule that a suspect index
             // beats a stuck placeholder, and a Navidrome rescan overlapping this multi-minute
             // scan could keep a cold bonob there indefinitely.
-            if (cachedAlbumTotal !== undefined) {
+            // A one-off shift is a race worth refusing: keep the good index and try again. A
+            // shift that repeats identically every rebuild is not a race - it is a server that
+            // does not page the way this guard assumes. bonob targets generic Subsonic servers
+            // and the overlap was verified only against Navidrome, so refusing forever would
+            // freeze such a user's index at whatever it held when they upgraded. After
+            // MAX_CONSECUTIVE_SEAM_REFUSALS, take the best-effort index instead.
+            const refusalKey = `albums:${credentials.username}`;
+            const refusalsSoFar = this.consecutiveSeamRefusals.get(refusalKey) ?? 0;
+            if (cachedAlbumTotal !== undefined && refusalsSoFar < MAX_CONSECUTIVE_SEAM_REFUSALS) {
+              this.consecutiveSeamRefusals.set(refusalKey, refusalsSoFar + 1);
               // Logged as well as thrown: on the refresh path the rejection is swallowed by the
               // cache's background handler, so without this a refused rebuild is silent.
               logger.warn(
@@ -2080,6 +2094,11 @@ export class Subsonic {
               );
             }
             seamBroken = true;
+            if (refusalsSoFar >= MAX_CONSECUTIVE_SEAM_REFUSALS) {
+              logger.warn(
+                `Album index scan: the page seam has broken the same way on every rebuild (${refusalsSoFar} refusals). This server may not page getAlbumList2 the way the overlap check assumes, so the index is being accepted best-effort rather than refused indefinitely. It is NOT reported as a catalog change.`
+              );
+            } else
             logger.warn(
               `Album index scan: the catalog changed mid-scan at offset ${offset} ('${page[0]!.id}' where the previous page ended on '${previousPageLastId}'), so records may be missing. No previous index to fall back on, so serving this one best-effort and NOT reporting a catalog change; the next rebuild will correct it.`
             );
@@ -2116,6 +2135,8 @@ export class Subsonic {
         const probe = await this.scanAlbums(credentials, this.maxIndexScanAlbums);
         if (probe.length === 0) complete = true;
       }
+
+      if (!seamBroken) this.consecutiveSeamRefusals.delete(`albums:${credentials.username}`);
 
       // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
       // partial result was returned, cached and persisted as if it were the whole catalog: every
@@ -2203,6 +2224,8 @@ export class Subsonic {
   // suspect. See scanLooksComplete.
   private lastAcceptedTotal = new Map<string, number>();
   private suspectTotal = new Map<string, number>();
+  // Consecutive rebuilds refused for a broken page seam, per user. See the seam check.
+  private consecutiveSeamRefusals = new Map<string, number>();
 
   // The paged getAlbumList2 walk detects duplicate ids but cannot see OMISSIONS: a delete during
   // the multi-minute scan shifts every later offset, silently skipping albums with no duplicate

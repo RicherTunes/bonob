@@ -3566,6 +3566,68 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
       }
     });
 
+    it("scan-omission guard: stops refusing when the seam breaks in the SAME way every rebuild", async () => {
+      // A one-off shift is a race worth refusing: keep the good index, try again later. A shift
+      // that repeats identically every rebuild is not a race - it is a server that does not page
+      // the way this guard assumes. bonob targets generic Subsonic servers (gonic, Airsonic), and
+      // the overlap was verified only against Navidrome, so refusing forever would leave such a
+      // user with an index frozen at whatever it held when they upgraded.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-seam-persistent-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+        const cache = new SwrCache(clock, 60_000);
+        const { subsonic, serve, deleteAfterPages } = albumScanHarness(dir, cache);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1500);
+        await subsonic.getAlbumIndex(credentials); // good baseline
+
+        // every rebuild from here on breaks the seam the same way
+        const rebuild = async (at: string) => {
+          clock.time = dayjs(at);
+          serve(1500);
+          deleteAfterPages(1);
+          await subsonic.getAlbumIndex(credentials);
+          // the rebuild is a background refresh; give it room to finish before the next step
+          await new Promise((r) => setTimeout(r, 600));
+        };
+
+        // Every rebuild from here breaks the seam identically. Early ones are refused (a race
+        // deserves another chance); once the budget is spent the index is accepted best-effort
+        // rather than refused forever.
+        //
+        // The rebuilds are deliberately CLOSE TOGETHER: a refused refresh does not restamp the
+        // entry, so widely spaced rebuilds let it age past maxStale (4x TTL), at which point peek
+        // returns undefined and the COLD path logs the same message - which would make this test
+        // pass with the tolerance removed. Keeping every rebuild inside the stale window means
+        // only the tolerance can produce it.
+        for (const at of [
+          "2026-08-06T10:01:10Z",
+          "2026-08-06T10:02:20Z",
+          "2026-08-06T10:03:30Z",
+        ]) {
+          await rebuild(at);
+        }
+
+        // Match the refusal line specifically: the accept line also contains the word
+        // "refused" ("rather than refused indefinitely"), which a looser filter counts as one.
+        const refusals = warn.mock.calls.filter((c) =>
+          /scan refused/i.test(String(c[0]))
+        ).length;
+        // bounded by the budget: without the tolerance every rebuild refuses
+        expect(refusals).toEqual(2);
+        expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
+          /same way on every rebuild/i
+        );
+        expect(changes.length).toEqual(0); // never claimed as a catalog change
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
     it("scan-omission guard: serves a best-effort index rather than a placeholder when there is nothing cached", async () => {
       // Refusing keeps the PREVIOUS GOOD index - but on a cold start there isn't one, so refusing
       // leaves the tile on "Loading..." instead. That inverts this codebase's own rule that a
