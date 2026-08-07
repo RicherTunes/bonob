@@ -1468,11 +1468,13 @@ describe("Subsonic", () => {
           1000
         );
         const artist = anArtist();
-        let n = 0;
-        // A server that never returns a short page - the catalog outruns the cap.
-        mockGET.mockImplementation(() => {
-          const page = Array.from({ length: 500 }, () =>
-            anAlbumSummary({ id: `album-${n++}`, name: `Album ${n}` })
+        // A server that never returns a short page - the catalog outruns the cap. Pages are
+        // generated from the REQUESTED offset because the scan overlaps them by one record and
+        // checks the seam; ids that ignore the offset would look like a mid-scan catalog change.
+        mockGET.mockImplementation((_u: string, config: any) => {
+          const offset = Number(config.params.get("offset"));
+          const page = Array.from({ length: 500 }, (_, i) =>
+            anAlbumSummary({ id: `album-${offset + i}`, name: `Album ${offset + i}` })
           );
           return Promise.resolve(
             ok(
@@ -1535,10 +1537,12 @@ describe("Subsonic", () => {
 
         // A catalog that exceeds the non-multiple cap is refused, and nothing is cached.
         const over = mk(1200);
-        let n = 0;
-        mockGET.mockImplementation(() => {
-          const page = Array.from({ length: 500 }, () =>
-            anAlbumSummary({ id: `a-${n++}`, name: `Album ${n}` })
+        // Offset-driven ids: the scan overlaps pages by one and checks the seam, so a mock that
+        // ignored the requested offset would trip the mid-scan-change guard before the cap guard.
+        mockGET.mockImplementation((_u: string, config: any) => {
+          const offset = Number(config.params.get("offset"));
+          const page = Array.from({ length: 500 }, (_, i) =>
+            anAlbumSummary({ id: `a-${offset + i}`, name: `Album ${offset + i}` })
           );
           return Promise.resolve(
             ok(getAlbumListJson(page.map((album) => [artist, album] as [Artist, AlbumSummary])))
@@ -1569,8 +1573,10 @@ describe("Subsonic", () => {
         const firstPage = Array.from({ length: 500 }, (_, i) =>
           anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
         );
+        // Pages overlap by one, so a healthy page 2 begins with album-499. Drift is when it does
+        // NOT: the catalog moved under the scan and records between the pages were skipped.
         const driftedSecondPage = [
-          anAlbumSummary({ id: "album-499", name: "Duplicate Album 499" }),
+          anAlbumSummary({ id: "album-500", name: "Album 500" }),
           anAlbumSummary({ id: "album-501", name: "Album 501" }),
         ];
 
@@ -3360,9 +3366,9 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     const albumScanHarness = (dir: string, sharedCache?: SwrCache) => {
       const artist = { id: "1", name: "AC/DC" };
       let albumsToServe = 0;
-      // After this many getAlbumList2 pages, behave as though one album earlier in the catalog
-      // was deleted: every later offset shifts by one, which is how a mid-scan delete skips
-      // records without ever producing a duplicate id.
+      // After this many pages, behave as though one album EARLIER in the catalog was deleted:
+      // every later offset shifts by one, which is how a mid-scan delete skips records without
+      // ever producing a duplicate id or a short page.
       let shiftAfterPages = Number.POSITIVE_INFINITY;
       let pagesServed = 0;
       mockGET.mockImplementation((u: string, opts: any) => {
@@ -3502,6 +3508,36 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
           /looks truncated/i
         );
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("scan-omission guard: notices a single album deleted while the scan is running", async () => {
+      // The total-based threshold cannot see this: one album removed from a large catalog shifts
+      // every later offset by one, skipping a handful of records with no duplicate id, no short
+      // page, and a total that moves far too little to trip max(50, 10%). Pages overlap by one
+      // record so each page must begin with the previous page's last id; a shift breaks that.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-shift-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const { subsonic, serve, deleteAfterPages } = albumScanHarness(dir);
+        const changes: number[] = [];
+        subsonic.onCatalogChanged = () => changes.push(1);
+
+        serve(1500);
+        await subsonic.getAlbumIndex(credentials); // undisturbed baseline
+
+        serve(1500);
+        deleteAfterPages(1); // an album vanishes once the walk is under way
+
+        // Refused, exactly like a duplicate id: the previous good index stays in place rather
+        // than being replaced by one that is knowingly missing records.
+        await expect(subsonic.getAlbumIndex(credentials)).rejects.toThrow(
+          "Inconsistent album index scan"
+        );
+        expect(changes.length).toEqual(0);
       } finally {
         warn.mockRestore();
         rmSync(dir, { recursive: true, force: true });
@@ -4241,7 +4277,11 @@ describe("Subsonic: album index scan aborts (and leaves no .tmp) on an inconsist
       const firstPage = Array.from({ length: 500 }, (_, i) =>
         anAlbumSummary({ id: `album-${i}`, name: `Album ${i}` })
       );
-      const driftedSecondPage = [anAlbumSummary({ id: "album-499", name: "Dup" })];
+      // Pages overlap by one, so a healthy second page begins with album-499. Drift is when it
+      // does not: the catalog moved under the scan and records between the pages were skipped.
+      const driftedSecondPage = [
+        anAlbumSummary({ id: "album-501", name: "Album 501" }),
+      ];
 
       const mockGET = jest.fn();
       const mockRandom = jest.fn().mockReturnValue("saltysalty");

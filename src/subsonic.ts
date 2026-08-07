@@ -2030,15 +2030,46 @@ export class Subsonic {
     // exactly `cap`; a full page that still exceeds the allowance is itself proof the catalog is
     // larger than the cap, which the probe below then turns into a refusal.
     let ingested = 0;
+    // Pages OVERLAP by one record: each request advances by ALBUM_SCAN_PAGE_SIZE - 1, so every
+    // page after the first must begin with the record the previous page ended on.
+    //
+    // Without the overlap, a delete midway through the multi-minute walk shifts every later
+    // offset by one and records are skipped with no duplicate id, no short page, and a total that
+    // moves far too little for any threshold to notice - the common case, one album removed while
+    // the scan runs. The seam check is the only thing that can see it. (Re-reading a page at the
+    // end cannot: after the delete it returns the same shifted content that was ingested.)
+    //
+    // Cost is one extra record per 500, i.e. ~0.2% more requests on a scan already dominated by
+    // its ~230 round trips.
+    let previousPageLastId: string | undefined;
     try {
-      for (let offset = 0; ingested < this.maxIndexScanAlbums; offset += ALBUM_SCAN_PAGE_SIZE) {
+      for (
+        let offset = 0;
+        ingested < this.maxIndexScanAlbums;
+        offset += ALBUM_SCAN_PAGE_SIZE - 1
+      ) {
         const page = await this.scanAlbums(credentials, offset);
         if (page.length === 0) {
           complete = true;
           break;
         }
+        let records = page;
+        if (previousPageLastId !== undefined) {
+          if (page[0]!.id !== previousPageLastId) {
+            // The catalog moved under the scan, so records between the pages were skipped.
+            // REFUSE, exactly as the duplicate-id guard does: refusing leaves the previous good
+            // index in place and says why, where caching a knowingly incomplete index hides
+            // albums from the A-Z menu for six hours with nothing logged.
+            throw new Error(
+              `Inconsistent album index scan: offset ${offset} began with '${page[0]!.id}' where the previous page ended on '${previousPageLastId}', so the catalog changed mid-scan and records were skipped`
+            );
+          } else {
+            // drop the deliberate overlap record, which was ingested with the previous page
+            records = page.slice(1);
+          }
+        }
         const remaining = this.maxIndexScanAlbums - ingested;
-        for (const album of page.slice(0, remaining)) {
+        for (const album of records.slice(0, remaining)) {
           if (seen.has(album.id)) {
             throw new Error(
               `Inconsistent album index scan: duplicate album id '${album.id}' at offset ${offset}`
@@ -2048,6 +2079,7 @@ export class Subsonic {
           await ingest(album);
           ingested++;
         }
+        previousPageLastId = page[page.length - 1]!.id;
         // A short page means the catalog ended within this page (and within the cap): complete.
         if (page.length < ALBUM_SCAN_PAGE_SIZE) {
           complete = true;
