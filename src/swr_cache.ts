@@ -54,6 +54,26 @@ export class SwrCache {
     string,
     { at: number; count: number; attempt?: Promise<unknown> }
   >();
+
+  // Failure accounting for the warm() backoff. Recorded from the UNDERLYING fetch (cold or
+  // background refresh), not from warm()'s own handlers: a warm that is served a STALE value
+  // counts as a success and used to clear the count, while the refresh it kicked failed silently.
+  // That made a persistently failing rebuild a back-to-back scan loop for up to maxStale.
+  private noteFetchOutcome(key: string, ok: boolean, attempt: Promise<unknown>): void {
+    if (ok) {
+      this.warmFailures.delete(key);
+      return;
+    }
+    // Count once per underlying fetch: coalesced callers share one promise, so its identity is
+    // the fetch's identity.
+    if (this.warmFailures.get(key)?.attempt === attempt) return;
+    const count = (this.warmFailures.get(key)?.count ?? 0) + 1;
+    this.warmFailures.set(key, {
+      at: this.clock.now().valueOf(),
+      count,
+      attempt,
+    });
+  }
   private readonly backstopMs: number;
   private readonly store?: SwrCacheStore;
   private readonly revive: (v: unknown) => unknown;
@@ -158,36 +178,21 @@ export class SwrCache {
     // threw left no trace at all: no error, no warning, and its .tmp cleaned up behind it. Observed
     // live - a rebuild started, died, and the only evidence was a missing snapshot eleven minutes
     // later. A background job that fails invisibly cannot be operated.
-    const attempt = this.get(key, fetch);
-    void attempt.then(
-      () => {
-        this.warmFailures.delete(key);
-      },
-      (e) => {
-        // Count once per underlying FETCH, not per waiting caller. warm() coalesces onto one
-        // in-flight get(), but every caller attaches its own rejection handler - so a single
-        // failed scan with six SOAP logins waiting on it counted six consecutive failures and
-        // jumped straight to the 1h cap, pinning the Albums tile on a placeholder for an hour
-        // where the pre-backoff code recovered on the next request. Coalesced callers share one
-        // promise object, so its identity is the fetch's identity.
-        if (this.warmFailures.get(key)?.attempt === attempt) return;
-        const previous = this.warmFailures.get(key);
-        const count = (previous?.count ?? 0) + 1;
-        this.warmFailures.set(key, {
-          at: this.clock.now().valueOf(),
-          count,
-          attempt,
-        });
-        const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
-        const waitMs = Math.min(
-          WARM_BACKOFF_BASE_MS * Math.pow(2, count - 1),
-          WARM_BACKOFF_MAX_MS
-        );
-        logger.warn(
-          `Background warm of '${key}' failed (${count}x): ${reason}. Not retrying for ${Math.round(waitMs / 1000)}s.`
-        );
-      }
-    );
+    // Accounting lives in noteFetchOutcome, driven by the underlying fetch (cold OR refresh);
+    // warm() only reports. Swallowing the REJECTION is required - an unhandled rejection here
+    // would crash the process. Swallowing the INFORMATION is not: a background job that fails
+    // invisibly cannot be operated.
+    void this.get(key, fetch).catch((e) => {
+      const reason = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+      const count = this.warmFailures.get(key)?.count ?? 1;
+      const waitMs = Math.min(
+        WARM_BACKOFF_BASE_MS * Math.pow(2, count - 1),
+        WARM_BACKOFF_MAX_MS
+      );
+      logger.warn(
+        `Background warm of '${key}' failed (${count}x): ${reason}. Not retrying for ${Math.round(waitMs / 1000)}s.`
+      );
+    });
   }
 
   // Non-blocking read: return the entry's (already resolved) promise ONLY if a value has
@@ -266,6 +271,10 @@ export class SwrCache {
       .catch(() => {
         if (this.entries.get(key) === entry) this.entries.delete(key);
       });
+    value.then(
+      () => this.noteFetchOutcome(key, true, value),
+      () => this.noteFetchOutcome(key, false, value)
+    );
     return value;
   }
 
@@ -277,6 +286,12 @@ export class SwrCache {
     // theoretical: the album index fetch is a full catalog scan (~15 min at 107k albums) against a
     // 20-minute backstop, and each pile-on is another full scan aimed at Navidrome.
     const underlying = this.invoke(fetch);
+    // A refresh that fails is exactly the case warm()'s own handlers could not see: they were
+    // handed the stale value and called it a success.
+    underlying.then(
+      () => this.noteFetchOutcome(key, true, underlying),
+      () => this.noteFetchOutcome(key, false, underlying)
+    );
     underlying.then(
       () => {
         stale.inFlight = false;

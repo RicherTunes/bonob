@@ -685,3 +685,38 @@ describe("backoff after a failed background warm", () => {
     expect(attempts).toEqual(3);
   });
 });
+describe("backoff covers refreshes, not just cold fetches", () => {
+  // A stale-but-served entry is the loop the backoff was meant to stop and did not reach. warm()
+  // -> get() returns the STALE value, which counts as success and even cleared the failure count,
+  // while the background refresh it kicked fails silently. The next SOAP request repeats it, so a
+  // persistently failing rebuild becomes back-to-back ~230-request scans aimed at a backend that
+  // is failing because it is overloaded - for up to maxStale (24h at a 6h TTL).
+  it("backs off when a background refresh keeps failing", async () => {
+    const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+    const cache = new SwrCache(clock, 60_000);
+    let attempts = 0;
+    let healthy = true;
+    const fetch = () => {
+      attempts += 1;
+      return healthy
+        ? Promise.resolve("v")
+        : Promise.reject(new Error("backend overloaded"));
+    };
+
+    await cache.get("albumIndex", fetch); // populate
+    expect(attempts).toEqual(1);
+
+    // go stale, and let the refresh fail
+    healthy = false;
+    clock.time = dayjs("2026-08-06T10:02:00Z");
+    cache.warm("albumIndex", fetch);
+    await flush();
+    expect(attempts).toEqual(2);
+
+    // the failed REFRESH must arm the backoff, so the next warm does not start another scan
+    cache.warm("albumIndex", fetch);
+    cache.warm("albumIndex", fetch);
+    await flush();
+    expect(attempts).toEqual(2);
+  });
+});

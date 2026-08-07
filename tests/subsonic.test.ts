@@ -742,6 +742,49 @@ describe("asTrack", () => {
       });
     });
 
+    describe("when the server transcodes within the same container", () => {
+      // transcoded was computed as "delivered mime differs from source mime", which misses a
+      // profile that keeps the container and changes only the encoding - mp3 320 capped to mp3
+      // 128, flac downsampled to flac. Navidrome reports the SAME contentType and
+      // transcodedContentType, so the old test said "not transcoded" and canSeek advertised a
+      // scrubber over ffmpeg output with no linear byte-to-time mapping: exactly the failure the
+      // flag exists to prevent. The PRESENCE of transcodedContentType is the real signal -
+      // Navidrome only sets it when a profile applies (verified on the live server, where no
+      // player has one and the field is absent).
+      it("marks the track transcoded even though the mime type is unchanged", () => {
+        const result = asTrack(
+          album,
+          {
+            ...asSongJson(track),
+            contentType: "audio/mpeg",
+            transcodedContentType: "audio/mpeg",
+          },
+          NO_CUSTOM_PLAYERS
+        );
+
+        expect(result.encoding).toEqual({
+          player: "bonob",
+          mimeType: "audio/mpeg",
+          transcoded: true,
+        });
+      });
+
+      it("leaves a direct-played track seekable", () => {
+        const result = asTrack(
+          album,
+          {
+            ...asSongJson(track),
+            contentType: "audio/flac",
+            transcodedContentType: undefined,
+          },
+          NO_CUSTOM_PLAYERS
+        );
+
+        expect(result.encoding.transcoded).toEqual(false);
+      });
+    });
+
+
     describe("when there are custom players registered", () => {
       const streamClient = {
         encodingFor: jest.fn(),
@@ -3314,9 +3357,14 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
     // that worse rather than being neutral to it: a truncated index has a different total, so it
     // fires a false "the catalog changed" and orders Sonos to re-read the whole catalog, then
     // fires again when the next good rebuild restores the real total.
-    const albumScanHarness = (dir: string) => {
+    const albumScanHarness = (dir: string, sharedCache?: SwrCache) => {
       const artist = { id: "1", name: "AC/DC" };
       let albumsToServe = 0;
+      // After this many getAlbumList2 pages, behave as though one album earlier in the catalog
+      // was deleted: every later offset shifts by one, which is how a mid-scan delete skips
+      // records without ever producing a duplicate id.
+      let shiftAfterPages = Number.POSITIVE_INFINITY;
+      let pagesServed = 0;
       mockGET.mockImplementation((u: string, opts: any) => {
         if (String(u).includes("getAlbumList2")) {
           // params may be a plain object or URLSearchParams depending on the call path
@@ -3324,11 +3372,14 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
           const offset = Number(
             (typeof prm?.get === "function" ? prm.get("offset") : prm?.offset) || 0
           );
-          const remaining = Math.max(0, albumsToServe - offset);
+          const shift = pagesServed >= shiftAfterPages ? 1 : 0;
+          pagesServed += 1;
+          const base = offset + shift;
+          const remaining = Math.max(0, albumsToServe - base);
           const rows = Array.from({ length: Math.min(500, remaining) }, (_, i) =>
             asAlbumJson(artist, {
-              ...anAlbum({ name: `Album ${offset + i}`, genre: undefined }),
-              id: `al-${offset + i}`,
+              ...anAlbum({ name: `Album ${base + i}`, genre: undefined }),
+              id: `al-${base + i}`,
               tracks: [],
             } as any)
           );
@@ -3346,8 +3397,8 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         url,
         NO_CUSTOM_PLAYERS,
         undefined,
-        SwrCache.disabled(),
-        SwrCache.disabled(),
+        sharedCache ?? SwrCache.disabled(),
+        sharedCache ?? SwrCache.disabled(),
         false,
         {},
         undefined,
@@ -3357,6 +3408,10 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
         subsonic,
         serve: (n: number) => {
           albumsToServe = n;
+          pagesServed = 0;
+        },
+        deleteAfterPages: (n: number) => {
+          shiftAfterPages = n;
         },
       };
     };
@@ -3408,6 +3463,45 @@ describe("Subsonic: low-level error paths + warm/peek", () => {
 
         await subsonic.getAlbumIndex(credentials); // same total again: a real deletion
         expect(changes.length).toEqual(1);
+      } finally {
+        warn.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("scan-omission guard: does not bless a truncated scan when the baseline was lost to a restart", async () => {
+      // The guard's state is in-memory, so a restart reopens its window: the first scan seeded the
+      // trusted baseline unconditionally. A restart DURING a Navidrome rescan is exactly when a
+      // truncated scan happens, so the truncated total became the trusted baseline and the next
+      // good scan reported a change that never occurred. SWR still holds the previous index while
+      // rebuilding, and it carries the real total.
+      const dir = mkdtempSync(path.join(os.tmpdir(), "bnb-scan-restart-"));
+      const warn = jest.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const clock = new FixedClock(dayjs("2026-08-06T10:00:00Z"));
+        const cache = new SwrCache(clock, 60_000);
+
+        const first = albumScanHarness(dir, cache);
+        first.serve(1000);
+        await first.subsonic.getAlbumIndex(credentials);
+
+        // restart: a brand new client, no in-memory baseline, but the SAME warm index cache
+        const restarted = albumScanHarness(dir, cache);
+        const changes: number[] = [];
+        restarted.subsonic.onCatalogChanged = () => changes.push(1);
+        restarted.serve(200); // a rescan in progress truncates the walk
+
+        // Stale but still WITHIN maxStale (4x TTL), so SWR serves the old index and refreshes in
+        // the background - which is the state a restart lands in, and the only one where the
+        // previous total is still available to compare against.
+        clock.time = dayjs("2026-08-06T10:02:00Z");
+        await restarted.subsonic.getAlbumIndex(credentials);
+        await new Promise((r) => setTimeout(r, 200));
+
+        expect(changes.length).toEqual(0);
+        expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toMatch(
+          /looks truncated/i
+        );
       } finally {
         warn.mockRestore();
         rmSync(dir, { recursive: true, force: true });

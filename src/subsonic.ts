@@ -971,10 +971,19 @@ export const asTrackSummary = (
         ? song.transcodedContentType
         : song.contentType,
     })),
-    // Whether the delivered type differs from the source file's type, which is exactly when a
-    // transcoder sits in the path. Both branches above can produce one: a custom player's
-    // transcodedMimeType, or Navidrome's transcodedContentType for this player.
-    (e) => ({ ...e, transcoded: e.mimeType !== song.contentType })
+    // A transcoder sits in the path when EITHER the server has a transcode profile for this
+    // player (it reports transcodedContentType, and only then), OR a custom player asks for a
+    // different format than the source.
+    //
+    // Comparing mime types alone was not enough: a profile that keeps the container and changes
+    // only the encoding - mp3 320 capped to mp3 128, flac downsampled - reports the same type on
+    // both sides, so the track looked direct-played and advertised a scrubber over ffmpeg output.
+    (e) => ({
+      ...e,
+      transcoded:
+        song.transcodedContentType !== undefined ||
+        e.mimeType !== song.contentType,
+    })
   ),
   duration: song.duration || 0,
   number: song.track || 0,
@@ -1984,6 +1993,12 @@ export class Subsonic {
     credentials: Credentials
   ): Promise<AlbumIndex<AlbumSummary>> => {
     const cacheKey = `albumIndex:v3:${credentials.username}`;
+    // The index this rebuild replaces, if SWR is still holding it. Its total is what a truncated
+    // scan is measured against when the in-memory baseline was lost to a restart.
+    const cachedAlbumTotal = await this.indexCache
+      .peek<AlbumIndex<AlbumSummary>>(cacheKey)
+      ?.then((idx) => idx?.total)
+      .catch(() => undefined);
     const seen = new Set<string>();
     const builder = new BucketBuilder<AlbumSummary>();
     // Distinct release years, gathered during the same scan so the "Years" browse filter is O(1) and
@@ -2049,7 +2064,7 @@ export class Subsonic {
         if (probe.length === 0) complete = true;
       }
 
-    // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
+      // Hitting the safety cap is NOT a successful scan. Previously the loop simply ended and the
       // partial result was returned, cached and persisted as if it were the whole catalog: every
       // album past the cap vanished from the A-Z menu and `total` was wrong, with nothing logged.
       // Silent truncation at exactly the scale this cap exists for is worse than refusing - refusing
@@ -2068,7 +2083,11 @@ export class Subsonic {
         this.noteCatalogChanged(
           `albums:${credentials.username}`,
           `${builder.total}:${builder.buckets.length}:${years.length}:${contentHash}`,
-          this.scanLooksComplete(`albums:${credentials.username}`, builder.total)
+          this.scanLooksComplete(
+            `albums:${credentials.username}`,
+            builder.total,
+            cachedAlbumTotal
+          )
         );
         return {
           total: builder.total,
@@ -2084,7 +2103,11 @@ export class Subsonic {
     this.noteCatalogChanged(
       `albums:${credentials.username}`,
       `${builder.total}:${builder.buckets.length}:${years.length}:${contentHash}`,
-      this.scanLooksComplete(`albums:${credentials.username}`, builder.total)
+      this.scanLooksComplete(
+        `albums:${credentials.username}`,
+        builder.total,
+        cachedAlbumTotal
+      )
     );
     return { total: builder.total, buckets: builder.buckets, items: items!, years };
     } catch (e) {
@@ -2143,8 +2166,18 @@ export class Subsonic {
   // no cross-source drift, and real libraries do not lose a tenth of their catalog between scans.
   // Two strikes, so a genuine mass deletion is accepted on its second consecutive sighting rather
   // than being disbelieved forever.
-  private scanLooksComplete = (key: string, total: number): boolean => {
-    const previous = this.lastAcceptedTotal.get(key);
+  private scanLooksComplete = (
+    key: string,
+    total: number,
+    // Total of the index currently held in cache, if any. The guard's state is in-memory, so a
+    // restart reopens its window and the first scan would seed the trusted baseline
+    // unconditionally - and a restart DURING a Navidrome rescan is exactly when a truncated scan
+    // happens, so the truncated total became the baseline and the next good scan reported a
+    // change that never occurred. SWR still holds the previous index while rebuilding, and it
+    // carries the real total, so there is something to compare against after all.
+    cachedTotal?: number
+  ): boolean => {
+    const previous = this.lastAcceptedTotal.get(key) ?? cachedTotal;
     if (previous === undefined) {
       this.lastAcceptedTotal.set(key, total);
       return true; // nothing to compare against yet
